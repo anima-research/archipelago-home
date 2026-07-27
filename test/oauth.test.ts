@@ -37,6 +37,25 @@ test('not in guild → member null, not an error', async () => {
   assert.equal(displayNameOf(res.user, null), 'olena');
 });
 
+test('bot-token path reads roles bot-side', async () => {
+  let botAuthSeen = '';
+  const f = fakeFetch({
+    '/oauth2/token': { status: 200, body: { access_token: 't' } },
+    '/guilds/g1/members/123': { status: 200, body: { roles: ['r9'] } },
+    '/users/@me': { status: 200, body: { id: '123', username: 'olena' } },
+  });
+  const wrapped = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes('/guilds/g1/members/123')) {
+      botAuthSeen = String((init?.headers as Record<string, string>)?.authorization ?? '');
+    }
+    return f(input, init);
+  }) as typeof fetch;
+  const res = await completeOAuth({ ...OPTS, botToken: 'BOTTOK' }, wrapped);
+  assert.deepEqual(res.member?.roles, ['r9']);
+  assert.equal(botAuthSeen, 'Bot BOTTOK');
+});
+
 test('failed code exchange throws', async () => {
   await assert.rejects(
     completeOAuth(OPTS, fakeFetch({ '/oauth2/token': { status: 400, body: {} } })),

@@ -1,13 +1,21 @@
 /**
  * Discord OAuth2 (auth-code flow) — the human leg (docs/home-node.md §3).
- * Cribbed from portal-relay src/admin/oauth.ts, with one change: instead of
- * deriving admin guilds we fetch the user's member object in OUR guild
- * (`guilds.members.read` scope → GET /users/@me/guilds/<id>/member), which
- * carries their role ids. No bot needed. The user's Discord token is used
- * for the two lookups and discarded — never stored.
+ * Cribbed from portal-relay src/admin/oauth.ts. Role lookup has two paths:
+ *
+ *  - bot token configured (preferred): OAuth asks only `identify`; the
+ *    server reads the member's roles itself via
+ *    GET /guilds/<id>/members/<userId> with Bot auth. Smallest consent
+ *    screen.
+ *  - no bot token: OAuth asks `identify guilds.members.read` and reads
+ *    GET /users/@me/guilds/<id>/member with the user's own token.
+ *
+ * Either way the user's Discord token is used once and discarded — never
+ * stored.
  */
 
-export const OAUTH_SCOPES = 'identify guilds.members.read';
+export function oauthScopes(hasBotToken: boolean): string {
+  return hasBotToken ? 'identify' : 'identify guilds.members.read';
+}
 const AUTHORIZE_URL = 'https://discord.com/oauth2/authorize';
 const TOKEN_URL = 'https://discord.com/api/oauth2/token';
 const API_BASE = 'https://discord.com/api';
@@ -29,12 +37,12 @@ export interface OAuthResult {
   member: GuildMember | null;
 }
 
-export function authorizeUrl(clientId: string, redirectUri: string, state: string): string {
+export function authorizeUrl(clientId: string, redirectUri: string, state: string, scope: string): string {
   const q = new URLSearchParams({
     client_id: clientId,
     redirect_uri: redirectUri,
     response_type: 'code',
-    scope: OAUTH_SCOPES,
+    scope,
     state,
   });
   return `${AUTHORIZE_URL}?${q.toString()}`;
@@ -49,6 +57,8 @@ export async function completeOAuth(
     redirectUri: string;
     code: string;
     guildId: string;
+    /** When set, roles are read bot-side and OAuth needs only `identify`. */
+    botToken?: string;
   },
   fetchImpl: FetchLike = fetch,
 ): Promise<OAuthResult> {
@@ -75,9 +85,13 @@ export async function completeOAuth(
   // 404 here = authenticated fine but not in the guild — a policy outcome,
   // not an error.
   let member: GuildMember | null = null;
-  const memberRes = await fetchImpl(`${API_BASE}/users/@me/guilds/${opts.guildId}/member`, {
-    headers: { authorization: auth },
-  });
+  const memberRes = opts.botToken
+    ? await fetchImpl(`${API_BASE}/guilds/${opts.guildId}/members/${user.id}`, {
+        headers: { authorization: `Bot ${opts.botToken}` },
+      })
+    : await fetchImpl(`${API_BASE}/users/@me/guilds/${opts.guildId}/member`, {
+        headers: { authorization: auth },
+      });
   if (memberRes.ok) {
     const m = (await memberRes.json()) as GuildMember;
     if (Array.isArray(m?.roles)) member = m;

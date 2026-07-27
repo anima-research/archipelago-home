@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { mintToken, newJti, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
-import { authorizeUrl, completeOAuth, displayNameOf, OAUTH_SCOPES } from './oauth.js';
+import { authorizeUrl, completeOAuth, displayNameOf, oauthScopes } from './oauth.js';
 import {
   audiencesStore,
   grantForRoles,
@@ -31,6 +31,8 @@ export interface ServerConfig {
   configDir: string;
   discordClientId?: string;
   discordClientSecret?: string;
+  /** Bot token for server-side role lookup (shrinks OAuth to `identify`). */
+  discordBotToken?: string;
 }
 
 export function configFromEnv(env = process.env): ServerConfig {
@@ -44,6 +46,7 @@ export function configFromEnv(env = process.env): ServerConfig {
     configDir: env.HN_CONFIG_DIR ?? 'config',
     discordClientId: env.DISCORD_CLIENT_ID,
     discordClientSecret: env.DISCORD_CLIENT_SECRET,
+    discordBotToken: env.HN_BOT_TOKEN,
   };
 }
 
@@ -166,7 +169,15 @@ export class HomeNode {
     const now = Date.now();
     for (const [k, v] of this.states) if (v.exp <= now) this.states.delete(k);
     this.states.set(state, { audience, exp: now + STATE_TTL_MS });
-    redirect(res, authorizeUrl(this.cfg.discordClientId, `${this.cfg.publicUrl}/oauth/callback`, state));
+    redirect(
+      res,
+      authorizeUrl(
+        this.cfg.discordClientId,
+        `${this.cfg.publicUrl}/oauth/callback`,
+        state,
+        oauthScopes(Boolean(this.cfg.discordBotToken)),
+      ),
+    );
   }
 
   private async callback(url: URL, res: ServerResponse, ip: string): Promise<void> {
@@ -188,6 +199,7 @@ export class HomeNode {
       redirectUri: `${this.cfg.publicUrl}/oauth/callback`,
       code,
       guildId: this.roles.get().guildId,
+      botToken: this.cfg.discordBotToken,
     });
 
     const grant = member ? grantForRoles(member.roles, this.roles.get()) : null;
@@ -281,4 +293,3 @@ function readJson(req: IncomingMessage): Promise<unknown> {
   });
 }
 
-export { OAUTH_SCOPES };
