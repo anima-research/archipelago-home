@@ -1,0 +1,31 @@
+{
+  "name": "@animalabs/archipelago-home",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Connectome home node v0 — identity issuance for humans (Discord OAuth) and agents (ed25519 key-proof). See connectome docs/home-node.md.",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./verifier": "./dist/src/verifier.js"
+  },
+  "bin": {
+    "hn": "./bin/hn.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anima-research/archipelago-home.git"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node --import tsx src/cli.ts serve",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  }
+}

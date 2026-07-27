@@ -1,0 +1,13 @@
+{
+  "guildId": "YOUR_GUILD_SNOWFLAKE",
+  "map": {
+    "ROLE_SNOWFLAKE_SONNET_EVENT": {
+      "scopes": ["worlds:join"],
+      "claims": { "tier": "sonnet-event" }
+    },
+    "ROLE_SNOWFLAKE_RESIDENT_FRIEND": {
+      "scopes": ["worlds:join", "worlds:build"],
+      "claims": { "tier": "resident-friend" }
+    }
+  }
+}

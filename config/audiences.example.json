@@ -1,0 +1,4 @@
+{
+  "eidoverse": { "redirect": "https://worlds.animalabs.ai/auth" },
+  "orrery": { "redirect": "https://orrery.animalabs.ai/auth" }
+}
