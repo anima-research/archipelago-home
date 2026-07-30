@@ -203,10 +203,13 @@ export class HomeNode {
     });
 
     const grant = member ? grantForRoles(member.roles, this.roles.get()) : null;
-    if (!grant) {
-      console.error(`[hn] login refused: discord:${user.id} (${user.username}) — ${member ? 'no qualifying role' : 'not in guild'}`);
+    const needed = this.audiences.get()[st.audience]?.requiredScopes ?? [];
+    const missing = grant ? needed.filter((s) => !grant.scopes.includes(s)) : needed;
+    if (!grant || missing.length) {
+      const why = !member ? 'not in guild' : !grant ? 'no qualifying role' : `missing ${missing.join(', ')} for ${st.audience}`;
+      console.error(`[hn] login refused: discord:${user.id} (${user.username}) — ${why}`);
       return html(res, 403, page('no access', `<p>Hi <b>${esc(displayNameOf(user, member))}</b> — your Discord account
-doesn't have a qualifying role${member ? '' : ' (you are not in the guild)'}. Ask an operator for access, then try again.</p>`));
+doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. Ask an operator for access, then try again.</p>`));
     }
 
     const nowMs = Date.now();

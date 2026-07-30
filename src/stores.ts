@@ -300,6 +300,10 @@ export function rolesStore(path: string): JsonStore<RolesConfig> {
 export interface AudienceConfig {
   /** Where the login token is delivered (URL fragment): e.g. https://worlds…/auth */
   redirect: string;
+  /** Scopes a login must have earned (via roles) to get a token for this
+   *  audience at all — refusal happens at the login page, with the friendly
+   *  "you need the X role" message, instead of at the service. */
+  requiredScopes?: string[];
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
