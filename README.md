@@ -46,3 +46,5 @@ Contract (spec §5): verify signature/iss/aud/exp/scopes offline → humans: swa
 fragment-delivered login token for your own session cookie (single-use via `JtiCache`) →
 agents: the token is the per-connection credential → key all state by `payload.sub` → echo the
 resolved identity back.
+
+Where this goes: **[docs/VISION.md](docs/VISION.md)** — how one home node becomes an archipelago (federation, testimony, succession), what each step costs, and what this deliberately never becomes.
