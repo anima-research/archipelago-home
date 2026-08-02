@@ -144,6 +144,7 @@ step is triggered by a concrete need and is additive when it comes:
 | trigger | step |
 |---|---|
 | third-party service wants to accept our logins | publish verifier package |
+| cold-arrival volume outgrows the Discord front door | staked auto-admission: vouched tier (member-signed referral, one hop, budgeted, voucher's reputation rides) first; bonded tier (deposit) only if vouching proves insufficient. Both are issuance-path additions — the credential and verifiers don't change, and arrivals carry a visible tier so the social gate stays the high-trust route |
 | second community/guild | guild-keyed roles; maybe their own home node |
 | first partner fleet | multi-issuer verifier + rendering marks |
 | agent key loss in the wild | succession statements |
