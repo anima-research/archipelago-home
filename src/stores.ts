@@ -200,6 +200,8 @@ export interface Invite {
   maxUses?: number;
   uses?: number;
   expiresAt?: string;
+  /** Sub of the human who minted this via the console — their vouch. */
+  sponsor?: string;
 }
 
 export interface InvitesFile {

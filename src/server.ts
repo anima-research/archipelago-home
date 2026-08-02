@@ -9,9 +9,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
-import { mintToken, newJti, type Aid1Payload } from './token.js';
+import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
 import { authorizeUrl, completeOAuth, displayNameOf, oauthScopes } from './oauth.js';
+import { consolePage, delegableScopes, mintSponsoredInvite, sponsorInviteView } from './console.js';
 import {
   audiencesStore,
   grantForRoles,
@@ -140,6 +141,10 @@ export class HomeNode {
       }
       if (req.method === 'GET' && url.pathname === '/login') return this.login(url, res, ip);
       if (req.method === 'GET' && url.pathname === '/oauth/callback') return await this.callback(url, res, ip);
+      if (url.pathname.startsWith('/console')) {
+        if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
+        if (await this.consoleRoute(req, url, res)) return;
+      }
       if (req.method === 'POST' && (url.pathname === '/token' || url.pathname === '/enroll')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
         const body = await readJson(req);
@@ -164,10 +169,17 @@ export class HomeNode {
 
   // ── human leg ──
 
+  /** The console is a built-in audience of this very node — no config entry,
+   *  no server-side session: the login token IS the console credential. */
+  private audienceRedirect(audience: string): string | null {
+    if (audience === 'console') return `${this.cfg.publicUrl}/console`;
+    return this.audiences.get()[audience]?.redirect ?? null;
+  }
+
   private login(url: URL, res: ServerResponse, ip: string): void {
     if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
     const audience = url.searchParams.get('audience') ?? '';
-    if (!this.audiences.get()[audience]) {
+    if (!this.audienceRedirect(audience)) {
       return html(res, 400, page('unknown audience', `<p>Unknown audience <code>${esc(audience)}</code>.</p>`));
     }
     if (!this.cfg.discordClientId) {
@@ -211,7 +223,9 @@ export class HomeNode {
     });
 
     const grant = member ? grantForRoles(member.roles, this.roles.get()) : null;
-    const needed = this.audiences.get()[st.audience]?.requiredScopes ?? [];
+    const needed = st.audience === 'console'
+      ? ['worlds:join'] // minting for your agent requires having the access yourself
+      : (this.audiences.get()[st.audience]?.requiredScopes ?? []);
     const missing = grant ? needed.filter((s) => !grant.scopes.includes(s)) : needed;
     if (!grant || missing.length) {
       const why = !member ? 'not in guild' : !grant ? 'no qualifying role' : `missing ${missing.join(', ')} for ${st.audience}`;
@@ -246,7 +260,58 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     });
     console.error(`[hn] login: ${payload.sub} (${payload.name}) → ${payload.aud} [${payload.scopes.join(' ')}]`);
     // Token rides the fragment — never hits logs or Referer headers (§8).
-    redirect(res, `${this.audiences.get()[st.audience]!.redirect}#token=${token}`);
+    redirect(res, `${this.audienceRedirect(st.audience)!}#token=${token}`);
+  }
+
+  // ── sponsor console (see console.ts header for the design) ──
+
+  /** Offline-verify a Bearer console token; null (+401 written) on failure. */
+  private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
+    const v = m
+      ? verifyToken(m[1]!, { issuerId: this.issuer.id, iss: this.cfg.iss, aud: 'console', requireScopes: ['worlds:join'] })
+      : ({ ok: false, reason: 'no bearer token' } as const);
+    if (!v.ok) {
+      json(res, 401, { error: v.reason });
+      return null;
+    }
+    return v.payload;
+  }
+
+  private async consoleRoute(req: IncomingMessage, url: URL, res: ServerResponse): Promise<boolean> {
+    if (url.pathname === '/console' && req.method === 'GET') {
+      html(res, 200, consolePage(this.cfg.iss));
+      return true;
+    }
+    if (url.pathname === '/console/me' && req.method === 'GET') {
+      const who = this.consoleAuth(req, res);
+      if (who) json(res, 200, { sub: who.sub, name: who.name, delegable: delegableScopes(who.scopes) });
+      return true;
+    }
+    if (url.pathname === '/console/invites' && req.method === 'GET') {
+      const who = this.consoleAuth(req, res);
+      if (who) json(res, 200, { invites: sponsorInviteView(this.invites, this.principals, who.sub) });
+      return true;
+    }
+    if (url.pathname === '/console/invites' && req.method === 'POST') {
+      const who = this.consoleAuth(req, res);
+      if (!who) return true;
+      const body = (await readJson(req)) as { label?: unknown } | null;
+      const r = mintSponsoredInvite(this.invites, { sub: who.sub, name: who.name, scopes: who.scopes },
+        typeof body?.label === 'string' ? body.label : undefined);
+      if (!r.ok) {
+        json(res, r.status, { error: r.error });
+        return true;
+      }
+      this.mintLog.append({
+        at: new Date().toISOString(), sub: who.sub, aud: 'console',
+        scopes: r.invite.scopes, exp: Math.floor(Date.parse(r.invite.expiresAt!) / 1000), by: 'cli',
+      });
+      console.error(`[hn] console: ${who.sub} (${who.name}) minted invite ${r.invite.code} [${r.invite.scopes.join(' ')}]`);
+      json(res, 200, { invite: r.invite });
+      return true;
+    }
+    return false;
   }
 }
 
