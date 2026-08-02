@@ -5,7 +5,9 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { mintToken, newJti, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
@@ -131,6 +133,11 @@ export class HomeNode {
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return json(res, 200, { ok: true, principals: this.principals.all().length });
       }
+      if (req.method === 'GET' && url.pathname === '/agents.md') {
+        // The door explains itself: everything a non-Connectome agent (or its
+        // operator) needs to enroll and connect, without a human walkthrough.
+        return markdown(res, agentsGuide());
+      }
       if (req.method === 'GET' && url.pathname === '/login') return this.login(url, res, ip);
       if (req.method === 'GET' && url.pathname === '/oauth/callback') return await this.callback(url, res, ip);
       if (req.method === 'POST' && (url.pathname === '/token' || url.pathname === '/enroll')) {
@@ -145,7 +152,8 @@ export class HomeNode {
       if (req.method === 'GET' && url.pathname === '/') {
         return html(res, 200, page('archipelago home', `<p>Identity home node for <b>${esc(this.cfg.iss)}</b>.</p>
 <p>Issuer key: <code>${esc(this.issuer.id)}</code></p>
-<p>Services log you in via <code>/login?audience=…</code>; agents exchange key proofs at <code>/token</code>.</p>`));
+<p>Services log you in via <code>/login?audience=…</code>; agents exchange key proofs at <code>/token</code>.</p>
+<p>An agent arriving from outside? Start with <a href="/agents.md">/agents.md</a>.</p>`));
       }
       json(res, 404, { error: 'not found' });
     } catch (err) {
@@ -252,6 +260,32 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 function html(res: ServerResponse, status: number, body: string): void {
   res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' });
   res.end(body);
+}
+
+function markdown(res: ServerResponse, body: string): void {
+  res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'public, max-age=300' });
+  res.end(body);
+}
+
+/** docs/AGENTS.md, loaded once per process (fresh on restart, cheap always).
+ *  Ships in the repo so the served guide is versioned with the endpoints it
+ *  documents. */
+let agentsGuideCache: string | null = null;
+function agentsGuide(): string {
+  if (agentsGuideCache === null) {
+    const here = dirname(fileURLToPath(import.meta.url));
+    // src/ layout in dev (tsx/bun), dist/src/ when built — walk up to repo root.
+    for (const rel of ['../docs/AGENTS.md', '../../docs/AGENTS.md']) {
+      try {
+        agentsGuideCache = readFileSync(join(here, rel), 'utf8');
+        break;
+      } catch {
+        /* try next */
+      }
+    }
+    agentsGuideCache ??= '# agents.md\n\nGuide missing from this deployment — ask the operator.\n';
+  }
+  return agentsGuideCache;
 }
 
 function redirect(res: ServerResponse, to: string): void {
