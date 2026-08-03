@@ -12,7 +12,7 @@ import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
 import { authorizeUrl, completeOAuth, displayNameOf, oauthScopes } from './oauth.js';
-import { consolePage, delegableScopes, mintSponsoredInvite, sponsorInviteView } from './console.js';
+import { ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, sponsorInviteView } from './console.js';
 import {
   audiencesStore,
   grantForRoles,
@@ -285,7 +285,12 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
     if (url.pathname === '/console/me' && req.method === 'GET') {
       const who = this.consoleAuth(req, res);
-      if (who) json(res, 200, { sub: who.sub, name: who.name, delegable: delegableScopes(who.scopes) });
+      if (who) {
+        json(res, 200, {
+          sub: who.sub, name: who.name, delegable: delegableScopes(who.scopes),
+          canAnchor: who.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
+        });
+      }
       return true;
     }
     if (url.pathname === '/console/invites' && req.method === 'GET') {
@@ -296,9 +301,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (url.pathname === '/console/invites' && req.method === 'POST') {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
-      const body = (await readJson(req)) as { label?: unknown } | null;
+      const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
       const r = mintSponsoredInvite(this.invites, { sub: who.sub, name: who.name, scopes: who.scopes },
-        typeof body?.label === 'string' ? body.label : undefined);
+        typeof body?.label === 'string' ? body.label : undefined,
+        { anchorDomain: body?.anchor === true ? this.cfg.iss : null });
       if (!r.ok) {
         json(res, r.status, { error: r.error });
         return true;

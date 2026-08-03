@@ -44,6 +44,11 @@ export function activeSponsorInvites(invites: InviteStore, sponsorSub: string, n
   );
 }
 
+/** Authority to anchor identities at the home domain (`agent:<n>@<home>`
+ *  instead of `@guest`) — the home vouching maximally, so it is its own
+ *  scope, granted via the role map like everything else. */
+export const ANCHOR_SCOPE = 'id:anchor';
+
 export type ConsoleMintResult =
   | { ok: true; invite: Invite }
   | { ok: false; status: 403 | 429; error: string };
@@ -52,11 +57,15 @@ export function mintSponsoredInvite(
   invites: InviteStore,
   sponsor: SponsorIdentity,
   label: string | undefined,
+  opts?: { anchorDomain?: string | null },
   nowMs = Date.now(),
 ): ConsoleMintResult {
   const scopes = delegableScopes(sponsor.scopes);
   if (!scopes.includes('worlds:join')) {
     return { ok: false, status: 403, error: 'minting requires eidoverse access (worlds:join)' };
+  }
+  if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
+    return { ok: false, status: 403, error: 'anchoring at the home domain requires the id:anchor grant' };
   }
   const active = activeSponsorInvites(invites, sponsor.sub, nowMs);
   if (active.length >= SPONSOR_BUDGET) {
@@ -66,6 +75,7 @@ export function mintSponsoredInvite(
       error: `you already have ${active.length} unclaimed invites — revoke one or wait for a claim/expiry`,
     };
   }
+  const anchored = Boolean(opts?.anchorDomain);
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
@@ -74,9 +84,10 @@ export function mintSponsoredInvite(
     audiences: scopes.includes('orrery:use') ? ['eidoverse', 'orrery'] : ['eidoverse'],
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
+    ...(anchored ? { domain: opts!.anchorDomain! } : {}),
     // Rides into the enrolled principal and thence into every token it is
     // ever issued: audiences can see (and render) who vouched.
-    claims: { tier: 'sponsored', sponsor: sponsor.sub, sponsorName: sponsor.name },
+    claims: { tier: anchored ? 'resident' : 'sponsored', sponsor: sponsor.sub, sponsorName: sponsor.name },
   });
   return { ok: true, invite };
 }
@@ -154,6 +165,10 @@ async function render(me) {
     '<p>Signed in as <b>' + me.name + '</b> <span class="dim">(' + me.sub + ')</span>. ' +
     'You can delegate: <code>' + me.delegable.join(' ') + '</code></p>' +
     '<div id="mint-row"><input id="label" placeholder="agent name / note (optional)" maxlength="60">' +
+    (me.canAnchor
+      ? '<label style="display:flex;align-items:center;gap:.4em"><input type="checkbox" id="anchor">' +
+        'anchor at <code>' + me.home + '</code> <span class="dim">(a resident this home stands behind — not a guest)</span></label>'
+      : '') +
     '<button id="mint">mint invite</button></div><div id="minted"></div>' +
     (rows ? '<table><tr><th>code</th><th>label</th><th>status</th><th>expires</th></tr>' + rows + '</table>'
           : '<p class="dim">No invites yet.</p>') +
@@ -162,7 +177,8 @@ async function render(me) {
     'The agent\\u2019s registration carries your name as sponsor.</p>';
   document.getElementById('mint').onclick = async () => {
     const r = await api('/console/invites', { method: 'POST',
-      body: JSON.stringify({ label: document.getElementById('label').value }) });
+      body: JSON.stringify({ label: document.getElementById('label').value,
+        anchor: Boolean(document.getElementById('anchor')?.checked) }) });
     document.getElementById('minted').innerHTML = r.status === 200
       ? '<p>New invite: <code>' + r.body.invite.code + '</code> — copy it now, then see the table below.</p>'
       : '<p style="color:#f88">' + (r.body.error || 'mint failed') + '</p>';

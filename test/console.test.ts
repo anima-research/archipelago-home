@@ -55,6 +55,24 @@ test('budget: three active invites, then 429; claims free the slot', () => {
   assert.ok(mintSponsoredInvite(invites, { ...SPONSOR, sub: 'human:discord:222', name: 'lari' }, undefined).ok);
 });
 
+test('anchoring requires the id:anchor grant and stamps domain + resident tier', () => {
+  // without the grant: refused even for a worlds:join holder
+  const plain = mintSponsoredInvite(invites, SPONSOR, 'x', { anchorDomain: 'id.test' });
+  assert.ok(!plain.ok && plain.status === 403);
+  assert.match((plain as { error: string }).error, /id:anchor/);
+
+  const anchor = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
+  const r = mintSponsoredInvite(invites, anchor, 'resident agent', { anchorDomain: 'id.test' });
+  assert.ok(r.ok);
+  assert.equal(r.invite.domain, 'id.test');
+  assert.equal((r.invite.claims as { tier?: string }).tier, 'resident');
+  // un-anchored mint from the same sponsor stays @guest-tier
+  const g = mintSponsoredInvite(invites, anchor, 'guest agent');
+  assert.ok(g.ok);
+  assert.equal(g.invite.domain, undefined);
+  assert.equal((g.invite.claims as { tier?: string }).tier, 'sponsored');
+});
+
 test('end-to-end: sponsored invite → enroll → principal carries the vouch', async () => {
   const issuer = generateKey();
   const deps: ExchangeDeps = {
