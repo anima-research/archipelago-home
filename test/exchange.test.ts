@@ -100,6 +100,16 @@ test('enroll: invite + key → new principal + token; invite consumed', () => {
   assert.equal(handleEnroll(req2, deps).status, 403);
 });
 
+
+test('domain-bearing invite anchors the principal at the home domain', () => {
+  invites.mint({ code: 'inv_home', scopes: ['worlds:join'], domain: 'animalabs.ai' });
+  const guest = generateKey();
+  const req = makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_home', 'Mythos');
+  const res = handleEnroll(req, deps);
+  assert.equal(res.status, 200);
+  assert.equal((res.body as { sub: string }).sub, 'agent:mythos@animalabs.ai');
+});
+
 test('enroll: name collision refused (case-insensitive)', () => {
   invites.mint({ code: 'inv_y', scopes: ['worlds:join'] });
   const guest = generateKey();

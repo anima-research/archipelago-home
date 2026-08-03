@@ -108,6 +108,7 @@ function main(): void {
       const expires = flag.get('expires');
       const inv = invites.mint({
         scopes,
+        ...(flag.get('domain') ? { domain: flag.get('domain') } : {}),
         ...(flag.get('label') ? { label: flag.get('label') } : {}),
         ...(flag.get('max-uses') ? { maxUses: Number(flag.get('max-uses')) } : {}),
         ...(flag.get('aud') ? { audiences: flag.get('aud')!.split(',') } : {}),

@@ -138,10 +138,12 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   if (deps.principals.nameTaken(req.name)) return fail(403, 'name taken');
   if (deps.principals.byKey(req.id)) return fail(403, 'key already enrolled');
 
-  // An invite resolves to a NEW principal (archipelago rule 6).
+  // An invite resolves to a NEW principal (archipelago rule 6). The anchor
+  // defaults to `guest`; a domain-bearing invite (operator-only) enrolls
+  // straight into the home's own namespace.
   const slug = req.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   const p: Principal = {
-    sub: `agent:${slug}@guest`,
+    sub: `agent:${slug}@${inv.domain ?? 'guest'}`,
     name: req.name,
     kind: 'agent',
     key: req.id,
