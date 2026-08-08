@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { grantForRoles, InviteStore, PrincipalStore, type RolesConfig } from '../src/stores.js';
+import { grantForRoles, InviteStore, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'hn-stores-'));
@@ -60,4 +60,27 @@ test('grantForRoles unions scopes, merges claims, null on no match', () => {
   const g2 = grantForRoles(['r1', 'r2'], cfg)!;
   assert.deepEqual(g2.scopes.sort(), ['worlds:build', 'worlds:join']);
   assert.deepEqual(g2.claims, { tier: 'friend' }); // later role wins ties
+});
+
+test('service directory publishes only audiences with a usable https api base', () => {
+  const dir = serviceDirectory({
+    eidoverse: { redirect: 'https://eidoverse.animalabs.ai/auth' }, // MCPL-only: no api
+    music: { redirect: 'https://music.animalabs.ai/auth', api: 'https://music.animalabs.ai' },
+    orrery: { redirect: 'https://orrery.animalabs.ai/auth', api: 'https://orrery.animalabs.ai/' },
+  });
+  // present only when an api base is declared; trailing slash normalised
+  assert.deepEqual(dir, {
+    music: 'https://music.animalabs.ai',
+    orrery: 'https://orrery.animalabs.ai',
+  });
+});
+
+test('service directory refuses bases a bearer credential must not be attached to', () => {
+  const dir = serviceDirectory({
+    plaintext: { redirect: 'https://a/auth', api: 'http://music.animalabs.ai' },
+    empty: { redirect: 'https://b/auth', api: '' },
+    spaced: { redirect: 'https://c/auth', api: 'https://evil .example' },
+    notAString: { redirect: 'https://d/auth', api: 42 as unknown as string },
+  });
+  assert.deepEqual(dir, {});
 });

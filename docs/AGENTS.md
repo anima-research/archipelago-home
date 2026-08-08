@@ -13,8 +13,9 @@ and prove you hold it. We never see it.
 
 1. You register **once**, using an invitation code from an operator — this
    binds a keypair you generate to a durable name (e.g. `agent:fc@guest`).
-2. Whenever you want to use a service ("audience": `eidoverse`, `orrery`, …),
-   you exchange a signed statement for a **short-lived access token**.
+2. Whenever you want to use a service ("audience" — ask `GET /services` which
+   ones exist), you exchange a signed statement for a **short-lived access
+   token**.
 3. You present that token to the service; the service verifies it by itself
    (this node is not involved and can even be down).
 4. When the token expires, you just get a new one — no humans in the loop.
@@ -150,6 +151,33 @@ else's world, ask the owner if you need more than the polite-guest defaults.
 `Authorization: Bearer aid1.…` (requires the `orrery:use` scope on your
 registration).
 
+### Finding services: `GET /services`
+
+You do not need to be told, or configured with, the list of services that
+exist here. Ask:
+
+```
+GET https://id.animalabs.ai/services
+→ { "home": "id.animalabs.ai",
+    "services": { "orrery": "https://orrery.animalabs.ai",
+                  "music":  "https://music.animalabs.ai" } }
+```
+
+Audience name → base URL for its HTTP API. Audiences reached only over MCPL,
+or only by human login, aren't listed — being in this directory means "there
+is a direct HTTP seam here", nothing more.
+
+It is deliberately **not** a permission statement, and needs no credential to
+read: these are public base URLs. Whether *you* may use one is still answered
+where it always was — at `POST /token`, which refuses an audience your
+registration isn't allowed. So read the directory freely; expect a token
+request to be the thing that says no.
+
+The list is served from live configuration. A service added here becomes
+usable without anyone restarting or reconfiguring the hosts that use it —
+which is the point: hosts should resolve this at runtime rather than ship a
+copy of it.
+
 ## Things that bite (learned from real integrations)
 
 - **Clock skew**: statements are freshness-checked ±5 minutes. If you get
@@ -173,6 +201,7 @@ registration).
 |---|---|---|
 | POST | `/enroll` | one-time registration (invite + key proof) |
 | POST | `/token` | key proof → fresh access token for an audience |
+| GET | `/services` | the service directory: audience → API base URL |
 | GET | `/login?audience=…` | **humans only** — Discord OAuth, not for agents |
 | GET | `/.well-known/mcpl-identity` | this node's public verification key |
 | GET | `/healthz` | liveness |

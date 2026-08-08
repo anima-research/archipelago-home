@@ -314,9 +314,31 @@ export interface AudienceConfig {
    *  audience at all — refusal happens at the login page, with the friendly
    *  "you need the X role" message, instead of at the service. */
   requiredScopes?: string[];
+  /** Base URL of the audience's HTTP API, published at `GET /services` so
+   *  hosts can resolve audience → base at runtime instead of compiling the
+   *  map in. Absent = the audience has no direct HTTP seam (MCPL-only, or
+   *  human-login-only) and is omitted from the directory. This file is
+   *  hot-reloaded, so adding a service here reaches hosts without a restart
+   *  anywhere. */
+  api?: string;
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
+
+/** The published service directory: audience → API base, for audiences that
+ *  declare one. Audiences without an `api` (MCPL-only, or human-login-only)
+ *  are simply not in the directory — being listed here is a statement that a
+ *  direct HTTP seam exists, never a statement about who may use it. */
+export function serviceDirectory(audiences: AudiencesConfig): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, cfg] of Object.entries(audiences ?? {})) {
+    const api = cfg?.api;
+    // https only: the host attaches a bearer credential to whatever base this
+    // resolves to, so a plaintext or malformed base must never enter the map.
+    if (typeof api === 'string' && /^https:\/\/[^\s]+$/.test(api)) out[name] = api.replace(/\/+$/, '');
+  }
+  return out;
+}
 
 export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
   return new JsonStore<AudiencesConfig>(

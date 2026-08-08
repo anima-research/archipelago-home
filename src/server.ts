@@ -20,6 +20,7 @@ import {
   MintLog,
   PrincipalStore,
   rolesStore,
+  serviceDirectory,
   type AudiencesConfig,
   type RolesConfig,
 } from './stores.js';
@@ -133,6 +134,18 @@ export class HomeNode {
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {
         return json(res, 200, { ok: true, principals: this.principals.all().length });
+      }
+      if (req.method === 'GET' && url.pathname === '/services') {
+        // The service directory. Hosts resolve audience → API base from here
+        // at runtime, so a new archipelago service is reachable as soon as it
+        // lands in audiences.json (hot-reloaded) — no host restart, no recipe
+        // edit, nothing compiled in.
+        //
+        // Deliberately unauthenticated and NOT a permission statement: these
+        // are public base URLs. Whether a given principal may actually use one
+        // is still decided where it was always decided — at POST /token, which
+        // refuses an audience the principal isn't allowed.
+        return json(res, 200, { home: this.cfg.iss, services: serviceDirectory(this.audiences.get()) });
       }
       if (req.method === 'GET' && url.pathname === '/agents.md') {
         // The door explains itself: everything a non-Connectome agent (or its
