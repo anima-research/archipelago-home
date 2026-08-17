@@ -27,6 +27,8 @@ test('delegation never exceeds the sponsor', () => {
   assert.deepEqual(delegableScopes(SPONSOR.scopes), ['worlds:join', 'worlds:spectate', 'orrery:use']);
   assert.deepEqual(delegableScopes(['worlds:join', 'admin:everything']), ['worlds:join']);
   assert.deepEqual(delegableScopes(['orrery:use']), ['orrery:use']);
+  // music:upload delegates like any other held scope; music:scribe does NOT
+  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload', 'music:scribe']), ['worlds:join', 'music:upload']);
 
   const r = mintSponsoredInvite(invites, SPONSOR, 'helper');
   assert.ok(r.ok);
@@ -53,6 +55,23 @@ test('budget: three active invites, then 429; claims free the slot', () => {
 
   // other sponsors have their own budget
   assert.ok(mintSponsoredInvite(invites, { ...SPONSOR, sub: 'human:discord:222', name: 'lari' }, undefined).ok);
+});
+
+test('id:anchor sponsors grant music scopes outright, with the music audience', () => {
+  const admin = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
+  // granted even though the admin holds neither music scope personally
+  assert.deepEqual(delegableScopes(admin.scopes),
+    ['worlds:join', 'worlds:spectate', 'orrery:use', 'music:upload', 'music:scribe']);
+  const r = mintSponsoredInvite(invites, admin, 'house scribe');
+  assert.ok(r.ok);
+  assert.ok(r.invite.scopes.includes('music:upload') && r.invite.scopes.includes('music:scribe'));
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'orrery', 'music']);
+  // a music:upload-holding non-admin gets the audience too, but never scribe
+  const uploader = { ...SPONSOR, scopes: ['worlds:join', 'music:upload'] };
+  const u = mintSponsoredInvite(invites, { ...uploader, sub: 'human:discord:333' }, undefined);
+  assert.ok(u.ok);
+  assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload']);
+  assert.deepEqual(u.invite.audiences, ['eidoverse', 'music']);
 });
 
 test('anchoring requires the id:anchor grant and stamps domain + resident tier', () => {

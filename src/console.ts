@@ -10,7 +10,8 @@
  *    home node consuming its own credential format.
  *  - Delegation never exceeds the sponsor: invite scopes = sponsor's scopes
  *    ∩ the delegable set. You cannot mint your agent into rooms you can't
- *    enter yourself.
+ *    enter yourself. (One bounded exception: `id:anchor` holders also grant
+ *    ADMIN_GRANTABLE outright — see its comment.)
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
@@ -18,7 +19,13 @@ import type { Invite, InviteStore, PrincipalStore } from './stores.js';
 
 /** Scopes a sponsor may pass down (∩ their own). Everything else — admin-ish
  *  scopes, future surprises — is deliberately not delegable. */
-const DELEGABLE = ['worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use'];
+const DELEGABLE = ['worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload'];
+
+/** Scopes an `id:anchor` holder may grant OUTRIGHT (no ∩ — the home's own
+ *  authority stands behind these, the same authority that anchors residents
+ *  at the home domain). The one carve-out from delegation-never-exceeds-
+ *  the-sponsor, and it is bounded by this list, not open-ended. */
+const ADMIN_GRANTABLE = ['music:upload', 'music:scribe'];
 
 /** Active = still claimable. The budget counts these, not lifetime mints. */
 const SPONSOR_BUDGET = 3;
@@ -26,7 +33,11 @@ const INVITE_LIFETIME_MS = 14 * 24 * 3_600_000;
 const AGENT_TOKEN_TTL = '7d';
 
 export function delegableScopes(sponsorScopes: string[]): string[] {
-  return DELEGABLE.filter((s) => sponsorScopes.includes(s));
+  const scopes = DELEGABLE.filter((s) => sponsorScopes.includes(s));
+  if (sponsorScopes.includes(ANCHOR_SCOPE)) {
+    for (const s of ADMIN_GRANTABLE) if (!scopes.includes(s)) scopes.push(s);
+  }
+  return scopes;
 }
 
 export interface SponsorIdentity {
@@ -81,7 +92,11 @@ export function mintSponsoredInvite(
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
-    audiences: scopes.includes('orrery:use') ? ['eidoverse', 'orrery'] : ['eidoverse'],
+    audiences: [
+      'eidoverse',
+      ...(scopes.includes('orrery:use') ? ['orrery'] : []),
+      ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
+    ],
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
     ...(anchored ? { domain: opts!.anchorDomain! } : {}),
