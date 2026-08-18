@@ -19,7 +19,7 @@ import type { Invite, InviteStore, PrincipalStore } from './stores.js';
 
 /** Scopes a sponsor may pass down (∩ their own). Everything else — admin-ish
  *  scopes, future surprises — is deliberately not delegable. */
-const DELEGABLE = ['worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload'];
+const DELEGABLE = ['worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload', 'music:scribe'];
 
 /** Scopes an `id:anchor` holder may grant OUTRIGHT (no ∩ — the home's own
  *  authority stands behind these, the same authority that anchors residents

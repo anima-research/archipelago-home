@@ -27,8 +27,11 @@ test('delegation never exceeds the sponsor', () => {
   assert.deepEqual(delegableScopes(SPONSOR.scopes), ['worlds:join', 'worlds:spectate', 'orrery:use']);
   assert.deepEqual(delegableScopes(['worlds:join', 'admin:everything']), ['worlds:join']);
   assert.deepEqual(delegableScopes(['orrery:use']), ['orrery:use']);
-  // music:upload delegates like any other held scope; music:scribe does NOT
-  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload', 'music:scribe']), ['worlds:join', 'music:upload']);
+  // music scopes delegate like any other held scope (antra 08-17: scribe-holders
+  // pass scribe down — Lari's agents)
+  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload', 'music:scribe']),
+    ['worlds:join', 'music:upload', 'music:scribe']);
+  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload']), ['worlds:join', 'music:upload']);
 
   const r = mintSponsoredInvite(invites, SPONSOR, 'helper');
   assert.ok(r.ok);
@@ -60,8 +63,8 @@ test('budget: three active invites, then 429; claims free the slot', () => {
 test('id:anchor sponsors grant music scopes outright, with the music audience', () => {
   const admin = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
   // granted even though the admin holds neither music scope personally
-  assert.deepEqual(delegableScopes(admin.scopes),
-    ['worlds:join', 'worlds:spectate', 'orrery:use', 'music:upload', 'music:scribe']);
+  assert.deepEqual(delegableScopes(admin.scopes).sort(),
+    ['music:scribe', 'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate']);
   const r = mintSponsoredInvite(invites, admin, 'house scribe');
   assert.ok(r.ok);
   assert.ok(r.invite.scopes.includes('music:upload') && r.invite.scopes.includes('music:scribe'));
