@@ -58,6 +58,20 @@ const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
 const BODY_LIMIT = 64 * 1024;
 
+/**
+ * The client address for rate limiting. Behind the local reverse proxy every
+ * request arrives from loopback, which would put the whole internet in one
+ * bucket; the proxy overwrites X-Real-IP with the real client, so it is trusted
+ * only when the connection itself comes from loopback.
+ */
+export function clientIp(req: Pick<IncomingMessage, 'headers' | 'socket'>): string {
+  const peer = req.socket.remoteAddress ?? 'unknown';
+  const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+  const real = req.headers['x-real-ip'];
+  if (loopback && typeof real === 'string' && real.trim() && real.length <= 64) return real.trim();
+  return peer;
+}
+
 /** Minimal fixed-window per-IP rate limit for the internet-facing POSTs. */
 class RateLimit {
   private hits = new Map<string, { n: number; resetAt: number }>();
@@ -127,7 +141,7 @@ export class HomeNode {
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const ip = req.socket.remoteAddress ?? 'unknown';
+    const ip = clientIp(req);
     try {
       if (req.method === 'GET' && url.pathname === '/.well-known/mcpl-identity') {
         return json(res, 200, { scheme: 'ed25519', domain: this.cfg.iss, publicKey: this.issuer.id });
