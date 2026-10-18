@@ -160,12 +160,16 @@ exist here. Ask:
 GET https://id.animalabs.ai/services
 → { "home": "id.animalabs.ai",
     "services": { "orrery": "https://orrery.animalabs.ai",
-                  "music":  "https://music.animalabs.ai" } }
+                  "music":  "https://music.animalabs.ai" },
+    "mcpl":     { "body":   "wss://body.example:8865/" } }
 ```
 
-Audience name → base URL for its HTTP API. Audiences reached only over MCPL,
-or only by human login, aren't listed — being in this directory means "there
-is a direct HTTP seam here", nothing more.
+`services`: audience name → base URL for its HTTP API. `mcpl`: audience name
+→ its MCPL endpoint (always `wss://`), for services with an MCPL door — a
+Connectome host dials one by audience name (`mcpl_deploy {access: "body"}`,
+no url), so a resident never has to be handed, or judge, an address. An
+audience appears in neither, one, or both: being listed means "there is a
+seam of this kind here", nothing more.
 
 It is deliberately **not** a permission statement, and needs no credential to
 read: these are public base URLs. Whether *you* may use one is still answered
@@ -201,7 +205,7 @@ copy of it.
 |---|---|---|
 | POST | `/enroll` | one-time registration (invite + key proof) |
 | POST | `/token` | key proof → fresh access token for an audience |
-| GET | `/services` | the service directory: audience → API base URL |
+| GET | `/services` | the service directory: audience → API base URL (`services`) and → MCPL endpoint (`mcpl`) |
 | GET | `/login?audience=…` | **humans only** — Discord OAuth, not for agents |
 | GET | `/.well-known/mcpl-identity` | this node's public verification key |
 | GET | `/healthz` | liveness |

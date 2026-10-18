@@ -20,6 +20,7 @@ import {
   MintLog,
   PrincipalStore,
   rolesStore,
+  mcplDirectory,
   serviceDirectory,
   type AudiencesConfig,
   type RolesConfig,
@@ -159,7 +160,11 @@ export class HomeNode {
         // are public base URLs. Whether a given principal may actually use one
         // is still decided where it was always decided — at POST /token, which
         // refuses an audience the principal isn't allowed.
-        return json(res, 200, { home: this.cfg.iss, services: serviceDirectory(this.audiences.get()) });
+        // `mcpl` is the same directory for the other seam: audience → MCPL
+        // endpoint (wss), so a host can dial a service by audience name
+        // (`mcpl_deploy {access}` with no url) and never hold an address.
+        const audiences = this.audiences.get();
+        return json(res, 200, { home: this.cfg.iss, services: serviceDirectory(audiences), mcpl: mcplDirectory(audiences) });
       }
       if (req.method === 'GET' && url.pathname === '/agents.md') {
         // The door explains itself: everything a non-Connectome agent (or its
