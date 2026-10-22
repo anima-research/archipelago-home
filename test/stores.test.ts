@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { grantForRoles, InviteStore, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
+import { grantForRoles, InviteStore, mcplDirectory, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'hn-stores-'));
@@ -73,6 +73,21 @@ test('service directory publishes only audiences with a usable https api base', 
     music: 'https://music.animalabs.ai',
     orrery: 'https://orrery.animalabs.ai',
   });
+});
+
+test('mcpl directory publishes only audiences with a wss endpoint, and the endpoint as given', () => {
+  const dir = mcplDirectory({
+    body: { redirect: 'https://body.example/health', mcpl: 'wss://body.example:8865/' },
+    docs: { redirect: 'https://docs.example/auth', api: 'https://docs.example' }, // HTTP seam only
+    plaintext: { redirect: 'https://a/auth', mcpl: 'ws://10.0.0.7:8765/' }, // a host must not send a credential there
+    https: { redirect: 'https://b/auth', mcpl: 'https://b.example/mcpl' }, // not an MCPL scheme
+    empty: { redirect: 'https://c/auth', mcpl: '' },
+    spaced: { redirect: 'https://d/auth', mcpl: 'wss://evil .example' },
+    notAString: { redirect: 'https://e/auth', mcpl: 42 as unknown as string },
+  });
+  assert.deepEqual(dir, { body: 'wss://body.example:8865/' });
+  // an api base says nothing about an MCPL door, and the reverse
+  assert.deepEqual(serviceDirectory({ body: { redirect: 'https://body.example/health', mcpl: 'wss://body.example:8865/' } }), {});
 });
 
 test('service directory refuses bases a bearer credential must not be attached to', () => {

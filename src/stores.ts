@@ -321,6 +321,13 @@ export interface AudienceConfig {
    *  hot-reloaded, so adding a service here reaches hosts without a restart
    *  anywhere. */
   api?: string;
+  /** The audience's MCPL endpoint (`wss://…`), published at `GET /services`
+   *  under `mcpl` so a host can dial the service by audience name — a
+   *  resident says `mcpl_deploy {access: "body"}` and the host finds the
+   *  address here. Absent = the audience has no MCPL door, or its operator
+   *  hasn't published one. wss only, for the same reason as `api`: the host
+   *  puts the resident's credential on this dial. */
+  mcpl?: string;
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
@@ -336,6 +343,22 @@ export function serviceDirectory(audiences: AudiencesConfig): Record<string, str
     // https only: the host attaches a bearer credential to whatever base this
     // resolves to, so a plaintext or malformed base must never enter the map.
     if (typeof api === 'string' && /^https:\/\/[^\s]+$/.test(api)) out[name] = api.replace(/\/+$/, '');
+  }
+  return out;
+}
+
+/** The published MCPL directory: audience → MCPL endpoint, for audiences that
+ *  declare one. The same statement as serviceDirectory's, for the other seam:
+ *  listed = "an MCPL door exists at this address", never "you may enter".
+ *  wss only — a host attaches the resident's credential to this dial, so a
+ *  plaintext or malformed endpoint must never enter the map; a host refuses
+ *  to send a credential over ws:// to another machine, and this directory is
+ *  the operator's word that an endpoint is safe to dial by name. */
+export function mcplDirectory(audiences: AudiencesConfig): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, cfg] of Object.entries(audiences ?? {})) {
+    const mcpl = cfg?.mcpl;
+    if (typeof mcpl === 'string' && /^wss:\/\/[^\s]+$/.test(mcpl)) out[name] = mcpl;
   }
   return out;
 }
