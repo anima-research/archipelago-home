@@ -26,6 +26,14 @@ export interface TokenRequest {
   timestamp: string;
   /** base64url sig over tokenStatement(iss, audience, timestamp). */
   proof: string;
+  /**
+   * Optional lifetime (`15m`, `2h`) for this token. It can only shorten: the
+   * principal's own `tokenTtl` stays the ceiling. Used by hosts that hand a
+   * credential to a server acting for the agent (MCPL RFC-015), which want it
+   * to expire in minutes. Not part of the signed statement: it cannot widen
+   * anything, so there is nothing to forge.
+   */
+  ttl?: string;
 }
 
 /** POST /enroll body. */

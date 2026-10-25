@@ -124,3 +124,29 @@ test('enroll: bad invite refused', () => {
   const req = makeEnrollRequest(guest.privateKey, guest.id, ISS, 'nope', 'Ferro');
   assert.equal(handleEnroll(req, deps).status, 403);
 });
+
+test('a requested ttl shortens the token and is reported as exp', () => {
+  const req = { ...makeTokenRequest(agentKey.privateKey, agentKey.id, ISS, 'eidoverse'), ttl: '15m' };
+  const res = handleTokenRequest(req, deps);
+  assert.equal(res.status, 200);
+  const body = res.body as { token: string; exp: number };
+  const v = verifyToken(body.token, { issuerId: issuer.id, iss: ISS, aud: 'eidoverse' });
+  assert.ok(v.ok);
+  assert.equal(v.payload.exp, body.exp);
+  const left = v.payload.exp - Math.floor(Date.now() / 1000);
+  assert.ok(left > 14 * 60 && left <= 15 * 60, `about 15 minutes left, got ${left}s`);
+});
+
+test('a requested ttl cannot exceed the principal ceiling', () => {
+  const req = { ...makeTokenRequest(agentKey.privateKey, agentKey.id, ISS, 'eidoverse'), ttl: '90d' };
+  const res = handleTokenRequest(req, deps);
+  assert.equal(res.status, 200);
+  const left = (res.body as { exp: number }).exp - Math.floor(Date.now() / 1000);
+  assert.ok(left <= 14 * 86400 && left > 13 * 86400, 'capped at the principal tokenTtl (14d)');
+});
+
+test('a malformed ttl is refused before the proof is checked', () => {
+  const req = { ...makeTokenRequest(agentKey.privateKey, agentKey.id, ISS, 'eidoverse'), ttl: 'forever' };
+  const res = handleTokenRequest(req, deps);
+  assert.equal(res.status, 400);
+});
