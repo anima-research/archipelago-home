@@ -62,8 +62,10 @@ function mintFor(
   aud: string,
   by: 'exchange' | 'enroll',
   nowMs: number,
-): string {
-  const ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL);
+  requestedTtlMs?: number,
+): { token: string; exp: number } {
+  const ceiling = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL);
+  const ttlMs = requestedTtlMs !== undefined ? Math.min(requestedTtlMs, ceiling) : ceiling;
   const payload: Aid1Payload = {
     v: 1,
     iss: deps.iss,
@@ -85,7 +87,7 @@ function mintFor(
     exp: payload.exp,
     by,
   });
-  return token;
+  return { token, exp: payload.exp };
 }
 
 /** POST /token — key-proof → fresh aid1 token for an enrolled principal. */
@@ -108,10 +110,18 @@ export function handleTokenRequest(body: unknown, deps: ExchangeDeps): ExchangeR
   if (!deps.principals.isLive(p, nowMs)) return fail(403, 'principal expired');
   if (p.audiences && !p.audiences.includes(req.audience)) return fail(403, 'audience not allowed');
 
+  let requestedTtlMs: number | undefined;
+  if (req.ttl !== undefined) {
+    if (typeof req.ttl !== 'string') return fail(400, 'bad ttl');
+    try { requestedTtlMs = parseTtl(req.ttl); } catch { return fail(400, 'bad ttl (expected e.g. 15m, 2h)'); }
+    if (requestedTtlMs <= 0) return fail(400, 'bad ttl');
+  }
+
   const proofErr = checkProof(req.proof, req.id, tokenStatement(deps.iss, req.audience, req.timestamp));
   if (proofErr) return fail(403, proofErr);
 
-  return { status: 200, body: { token: mintFor(deps, p, req.audience, 'exchange', nowMs), sub: p.sub } };
+  const minted = mintFor(deps, p, req.audience, 'exchange', nowMs, requestedTtlMs);
+  return { status: 200, body: { token: minted.token, sub: p.sub, exp: minted.exp } };
 }
 
 /** POST /enroll — invite + pubkey → new principal + first token. */
@@ -160,6 +170,6 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   if (!aud) return fail(400, 'no audience configured');
   return {
     status: 200,
-    body: { sub: p.sub, token: mintFor(deps, p, aud, 'enroll', nowMs) },
+    body: { sub: p.sub, token: mintFor(deps, p, aud, 'enroll', nowMs).token },
   };
 }
