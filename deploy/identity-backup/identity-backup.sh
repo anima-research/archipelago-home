@@ -67,29 +67,30 @@ live_hashes() {
       | sort -z | xargs -0 sha256sum )
 }
 
-# 1a. A stable snapshot of the state files. The service keeps running and
-# writing: an enrollment rewrites principals.json and invites.json together,
-# sign-ins update accounts.json. So: hash the live files, copy them into RAM,
-# hash again. Equal hashes mean nothing changed while the copy was made, so
-# the snapshot is one moment's view — never half an enrollment. These files
-# are small and rarely written, so the window is milliseconds; a retry backs
-# off (1, 2, 4, 8 s) to outlast a burst. GNU tar exits 1 when a file changes
-# under it ("file changed as we read it"): the same retry case. Any other
-# copy failure (e.g. /run full) fails the run.
+# 1a. A stable snapshot of the state files, as a tar in RAM. A tar records
+# each file's owner, group and mode as metadata, so nothing has to chown
+# anything — the unit holds only CAP_DAC_READ_SEARCH — and a restore puts
+# them back exactly as they were. The service keeps running and writing (an
+# enrollment rewrites principals.json and invites.json together; sign-ins
+# update accounts.json), so: hash the live files, take the tar, hash again.
+# Equal hashes mean nothing changed while the snapshot was taken, so it is
+# one moment's view — never half an enrollment. These files are small and
+# rarely written, so the window is milliseconds; a retry backs off (1, 2, 4,
+# 8 s) to outlast a burst. GNU tar exits 1 when a file changes under it
+# ("file changed as we read it"): the same retry case. Any other failure
+# (e.g. /run full) fails the run.
+snap_tar="$snap/snapshot.tar"
 stable=
 for attempt in 1 2 3 4 5; do
   rm -rf "$snap"
   mkdir -p "$snap"
   if before=$(live_hashes); then
-    set +e
-    tar --numeric-owner "${skip[@]}" -cf - -C / "${paths[@]}" | tar --numeric-owner -xpf - -C "$snap"
-    st=("${PIPESTATUS[@]}")
-    set -e
-    [ "${st[1]}" -eq 0 ] || { log "snapshot copy failed (tar -x exit ${st[1]}) — is $ram full?"; exit 1; }
-    case "${st[0]}" in
+    st=0
+    tar --numeric-owner "${skip[@]}" -cf "$snap_tar" -C / "${paths[@]}" || st=$?
+    case "$st" in
       0) [ "$(live_hashes 2>/dev/null)" = "$before" ] && { stable=1; break; } ;;
       1) ;; # a file changed while tar read it
-      *) log "snapshot read failed (tar exit ${st[0]})"; exit 1 ;;
+      *) log "snapshot failed (tar exit $st) — is $ram full?"; exit 1 ;;
     esac
   fi
   [ "$attempt" -lt 5 ] || break
@@ -100,22 +101,31 @@ done
 
 # 1b. The mint log is append-only and never read at runtime (an audit
 # trail), so it needs no agreement with the state files, only whole lines:
-# take the lines complete at one instant. Lines already written never
-# change, so `head -n` of that count is exact even while appends go on.
+# the lines complete at one instant. Lines already written never change, so
+# `head -n` of that count is exact even while appends go on. It joins the
+# snapshot under its own path with the live file's owner, group and mode,
+# so a restored log is still the service's to append to.
 if [ -f "/$MINT_LOG" ]; then
+  read -r uid gid mode < <(stat -c '%u %g %a' "/$MINT_LOG")
   size=$(stat -c %s "/$MINT_LOG")
   lines=0
   [ "$size" -gt 0 ] && lines=$(head -c "$size" "/$MINT_LOG" | LC_ALL=C tr -dc '\n' | wc -c)
-  if [ "$lines" -gt 0 ]; then head -n "$lines" "/$MINT_LOG" > "$snap/$MINT_LOG"; else : > "$snap/$MINT_LOG"; fi
+  if [ "$lines" -gt 0 ]; then head -n "$lines" "/$MINT_LOG" > "$snap/minted.jsonl"; else : > "$snap/minted.jsonl"; fi
+  tar --numeric-owner --owner=":$uid" --group=":$gid" --mode="$mode" \
+    --transform="s|^minted\\.jsonl\$|$MINT_LOG|" -rf "$snap_tar" -C "$snap" minted.jsonl
+  rm -f "$snap/minted.jsonl"
 fi
 
-# 2. Hash and archive that same view. Nothing writes to the snapshot, so the
-# manifest inside the archive is exactly what the archive holds.
-( cd "$snap" && find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum ) > "$work/MANIFEST.sha256"
+# 2. Checksums of exactly what the snapshot holds, read back out of it (no
+# files written: --to-command streams each member to sha256sum), then the
+# manifest joins the snapshot and the whole of it is compressed and
+# encrypted. Nothing writes to the snapshot meanwhile, so the manifest is
+# exactly what the archive holds.
+tar -xf "$snap_tar" --to-command='printf "%s  %s\n" "$(sha256sum | cut -d" " -f1)" "$TAR_FILENAME"' \
+  | LC_ALL=C sort -k2 > "$work/MANIFEST.sha256"
 files=$(wc -l < "$work/MANIFEST.sha256")
-tar --numeric-owner -cf - -C "$snap" "${paths[@]}" -C "$work" MANIFEST.sha256 \
-  | zstd -q -19 \
-  | age -R "$CONF/recipients.txt" -o "$work/$name"
+tar -rf "$snap_tar" -C "$work" MANIFEST.sha256
+zstd -q -19 < "$snap_tar" | age -R "$CONF/recipients.txt" -o "$work/$name"
 rm -rf "$snap" "$work/MANIFEST.sha256"
 
 size=$(stat -c %s "$work/$name")

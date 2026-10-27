@@ -10,7 +10,8 @@ install -d -m 0700 /etc/identity-backup
 chmod 0600 /etc/identity-backup/rclone.conf
 # Every tool the job pipes through — without one, each nightly run would fail
 # while this install looked fine.
-for tool in age rclone zstd tar sha256sum cmp; do
+tar --version 2>/dev/null | grep -q 'GNU tar' || { echo "needs GNU tar (--to-command, --transform)"; exit 1; }
+for tool in age rclone zstd sha256sum; do
   command -v "$tool" >/dev/null || { echo "missing $tool — apt-get install -y $tool (zstd, age, rclone are packages of those names)"; exit 1; }
 done
 install -m 0755 identity-backup.sh /usr/local/sbin/identity-backup.sh
