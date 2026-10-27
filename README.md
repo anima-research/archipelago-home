@@ -1,7 +1,8 @@
 # archipelago-home
 
-Connectome home node v0 — identity issuance for humans (Discord OAuth + guild-role→scope) and
-agents (ed25519 key-proof or operator-minted tokens). Design: **connectome `docs/home-node.md`**
+Connectome home node v0 — identity issuance for humans (Discord OAuth + guild-role→scope, or the
+home's own login: username + password + TOTP, and passkeys) and agents (ed25519 key-proof or
+operator-minted tokens). Design: **connectome `docs/home-node.md`**
 (the authoritative spec); doctrine: connectome `docs/archipelago.md`.
 
 One credential everywhere: the `aid1` ed25519-signed token. Audiences (eidoverse-worlds,
@@ -19,11 +20,42 @@ DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… npm start   # binds 127.0.0.1:73
 ```
 
 Env: `HN_DOMAIN` (default `id.animalabs.ai`), `HN_PUBLIC_URL`, `HN_BIND`, `HN_PORT`,
-`HN_DATA_DIR`, `HN_CONFIG_DIR`. First run generates `data/issuer-key.pem` (0600) — **the**
-issuer key; guard it, never commit it.
+`HN_DATA_DIR`, `HN_CONFIG_DIR`, `HN_BOT_TOKEN` (optional; also re-checks Discord roles live
+when a Discord-linked person signs in another way). First run generates `data/issuer-key.pem`
+(0600) — **the** issuer key; guard it, never commit it. `data/accounts.json` (0600) holds
+password hashes, TOTP secrets and passkey keys — back it up with the issuer key, and guard it
+the same way.
 
 Discord app setup: dev portal → OAuth2 → redirect URI `https://<HN_DOMAIN>/oauth/callback`.
 Scopes requested at login: `identify guilds.members.read` (no bot).
+
+## Human sign-in
+
+`/login?audience=…` is a chooser: **Continue with Discord**, **username + password** (then a
+TOTP code if they turned one on), or **passkey** (also offered as autofill in the username
+field). Every path ends the same way — a 10-minute aid1 token in the audience's URL fragment —
+so audiences change nothing. `?via=discord` skips the chooser.
+
+People manage their own sign-in at **`/account`**: set a username + password (a Discord person
+keeps their `human:discord:` sub), turn TOTP on (QR + ten single-use recovery codes), add or
+remove passkeys, link Discord to a local account. The page's credential is its own login token,
+so it is always a recent sign-in.
+
+Accounts for people without Discord come from the operator — there is no open sign-up. Run
+`hn user` as the service user (`sudo -u hn …` on the identity box; it refuses to run as root,
+since a root-owned 0600 `accounts.json` would lock the service out):
+
+```sh
+hn user add alice --scopes worlds:join,worlds:spectate   # → one-time setup link (72h)
+hn user ls                                                # who has what (no secrets)
+hn user reset alice [--clear-2fa] [--clear-passkeys]      # → new setup link
+hn user set alice --scopes worlds:join,orrery:use         # operator grant (Discord roles add on top)
+hn user disable alice    hn user enable alice
+```
+
+Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes lock its second
+factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
+these, so they remain a way in during a lockout.
 
 ## Operator CLI
 

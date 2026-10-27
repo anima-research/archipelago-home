@@ -1,21 +1,22 @@
 /**
- * The home node HTTP service (docs/home-node.md §3). Plain node:http —
- * five routes, no framework. TLS is the fronting proxy's job
- * (caddy/tailscale-serve); default bind is loopback.
+ * The home node HTTP service (docs/home-node.md §3). Plain node:http, no
+ * framework. TLS is the fronting proxy's job (caddy/tailscale-serve);
+ * default bind is loopback. The human sign-in routes live in human.ts.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
-import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
+import { verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
-import { authorizeUrl, completeOAuth, displayNameOf, oauthScopes } from './oauth.js';
 import { ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, sponsorInviteView } from './console.js';
+import { AccountStore } from './accounts.js';
+import { HumanAuth } from './human.js';
+import type { FetchLike } from './oauth.js';
+import { esc, html, json, page, readJson } from './http.js';
 import {
   audiencesStore,
-  grantForRoles,
   InviteStore,
   MintLog,
   PrincipalStore,
@@ -55,10 +56,6 @@ export function configFromEnv(env = process.env): ServerConfig {
   };
 }
 
-const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
-const STATE_TTL_MS = 10 * 60_000;
-const BODY_LIMIT = 64 * 1024;
-
 /**
  * The client address for rate limiting. Behind the local reverse proxy every
  * request arrives from loopback, which would put the whole internet in one
@@ -96,17 +93,30 @@ export class HomeNode {
   readonly roles: JsonStore<RolesConfig>;
   readonly audiences: JsonStore<AudiencesConfig>;
   readonly mintLog: MintLog;
-  private states = new Map<string, { audience: string; exp: number }>();
+  readonly accounts: AccountStore;
+  readonly human: HumanAuth;
   private limiter = new RateLimit();
   private server = createServer((req, res) => void this.route(req, res));
 
-  constructor(readonly cfg: ServerConfig) {
+  constructor(readonly cfg: ServerConfig, opts: { fetchImpl?: FetchLike } = {}) {
     this.issuer = loadOrCreateIssuerKey(join(cfg.dataDir, 'issuer-key.pem'));
     this.principals = new PrincipalStore(join(cfg.dataDir, 'principals.json'));
     this.invites = new InviteStore(join(cfg.dataDir, 'invites.json'));
     this.roles = rolesStore(join(cfg.configDir, 'roles.json'));
     this.audiences = audiencesStore(join(cfg.configDir, 'audiences.json'));
     this.mintLog = new MintLog(join(cfg.dataDir, 'minted.jsonl'));
+    this.accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
+    this.human = new HumanAuth({
+      cfg,
+      issuer: this.issuer,
+      accounts: this.accounts,
+      principals: this.principals,
+      roles: this.roles,
+      audiences: this.audiences,
+      mintLog: this.mintLog,
+      allow: (ip) => this.limiter.allow(ip),
+      fetchImpl: opts.fetchImpl,
+    });
   }
 
   private exchangeDeps(): ExchangeDeps {
@@ -117,17 +127,22 @@ export class HomeNode {
       invites: this.invites,
       mintLog: this.mintLog,
       knownAudiences: () => Object.keys(this.audiences.get()),
+      nameTaken: (n) => this.accounts.nameTaken(n),
     };
   }
 
-  start(): void {
-    for (const s of [this.principals, this.invites, this.roles, this.audiences]) s.startWatching();
-    this.server.listen(this.cfg.port, this.cfg.bind, () => {
-      console.error(
-        `[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${this.cfg.port} — issuer ${this.issuer.id}`,
-      );
-      if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — human login disabled');
-    });
+  /** Resolves with the bound port (useful with port 0 in tests). */
+  start(): Promise<number> {
+    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.accounts]) s.startWatching();
+    return new Promise((resolve) =>
+      this.server.listen(this.cfg.port, this.cfg.bind, () => {
+        const addr = this.server.address();
+        const port = typeof addr === 'object' && addr ? addr.port : this.cfg.port;
+        console.error(`[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${port} — issuer ${this.issuer.id}`);
+        if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
+        resolve(port);
+      }),
+    );
   }
 
   stop(): void {
@@ -136,6 +151,7 @@ export class HomeNode {
     this.invites.stopWatching();
     this.roles.stopWatching();
     this.audiences.stopWatching();
+    this.accounts.stopWatching();
   }
 
   // ── routing ──
@@ -171,8 +187,7 @@ export class HomeNode {
         // operator) needs to enroll and connect, without a human walkthrough.
         return markdown(res, agentsGuide());
       }
-      if (req.method === 'GET' && url.pathname === '/login') return this.login(url, res, ip);
-      if (req.method === 'GET' && url.pathname === '/oauth/callback') return await this.callback(url, res, ip);
+      if (await this.human.route(req, url, res, ip)) return;
       if (url.pathname.startsWith('/console')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
         if (await this.consoleRoute(req, url, res)) return;
@@ -190,6 +205,7 @@ export class HomeNode {
         return html(res, 200, page('archipelago home', `<p>Identity home node for <b>${esc(this.cfg.iss)}</b>.</p>
 <p>Issuer key: <code>${esc(this.issuer.id)}</code></p>
 <p>Services log you in via <code>/login?audience=…</code>; agents exchange key proofs at <code>/token</code>.</p>
+<p>People: manage your username, password, two-factor code and passkeys at <a href="/account">/account</a>.</p>
 <p>An agent arriving from outside? Start with <a href="/agents.md">/agents.md</a>.</p>`));
       }
       json(res, 404, { error: 'not found' });
@@ -197,102 +213,6 @@ export class HomeNode {
       console.error(`[hn] ${req.method} ${url.pathname} error: ${(err as Error).message}`);
       json(res, 500, { error: 'internal error' });
     }
-  }
-
-  // ── human leg ──
-
-  /** The console is a built-in audience of this very node — no config entry,
-   *  no server-side session: the login token IS the console credential. */
-  private audienceRedirect(audience: string): string | null {
-    if (audience === 'console') return `${this.cfg.publicUrl}/console`;
-    return this.audiences.get()[audience]?.redirect ?? null;
-  }
-
-  private login(url: URL, res: ServerResponse, ip: string): void {
-    if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
-    const audience = url.searchParams.get('audience') ?? '';
-    if (!this.audienceRedirect(audience)) {
-      return html(res, 400, page('unknown audience', `<p>Unknown audience <code>${esc(audience)}</code>.</p>`));
-    }
-    if (!this.cfg.discordClientId) {
-      return html(res, 503, page('login unavailable', '<p>Discord login is not configured on this node.</p>'));
-    }
-    const state = randomBytes(24).toString('base64url');
-    const now = Date.now();
-    for (const [k, v] of this.states) if (v.exp <= now) this.states.delete(k);
-    this.states.set(state, { audience, exp: now + STATE_TTL_MS });
-    redirect(
-      res,
-      authorizeUrl(
-        this.cfg.discordClientId,
-        `${this.cfg.publicUrl}/oauth/callback`,
-        state,
-        oauthScopes(Boolean(this.cfg.discordBotToken)),
-      ),
-    );
-  }
-
-  private async callback(url: URL, res: ServerResponse, ip: string): Promise<void> {
-    if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
-    const state = url.searchParams.get('state') ?? '';
-    const code = url.searchParams.get('code') ?? '';
-    const st = this.states.get(state);
-    this.states.delete(state); // single-use, success or not
-    if (!st || st.exp <= Date.now()) {
-      return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
-    }
-    if (!code || !this.cfg.discordClientId || !this.cfg.discordClientSecret) {
-      return html(res, 400, page('login failed', '<p>Discord did not complete the login.</p>'));
-    }
-
-    const { user, member } = await completeOAuth({
-      clientId: this.cfg.discordClientId,
-      clientSecret: this.cfg.discordClientSecret,
-      redirectUri: `${this.cfg.publicUrl}/oauth/callback`,
-      code,
-      guildId: this.roles.get().guildId,
-      botToken: this.cfg.discordBotToken,
-    });
-
-    const grant = member ? grantForRoles(member.roles, this.roles.get()) : null;
-    const needed = st.audience === 'console'
-      ? ['worlds:join'] // minting for your agent requires having the access yourself
-      : (this.audiences.get()[st.audience]?.requiredScopes ?? []);
-    const missing = grant ? needed.filter((s) => !grant.scopes.includes(s)) : needed;
-    if (!grant || missing.length) {
-      const why = !member ? 'not in guild' : !grant ? 'no qualifying role' : `missing ${missing.join(', ')} for ${st.audience}`;
-      console.error(`[hn] login refused: discord:${user.id} (${user.username}) — ${why}`);
-      return html(res, 403, page('no access', `<p>Hi <b>${esc(displayNameOf(user, member))}</b> — your Discord account
-doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. Ask an operator for access, then try again.</p>`));
-    }
-
-    const nowMs = Date.now();
-    const payload: Aid1Payload = {
-      v: 1,
-      iss: this.cfg.iss,
-      sub: `human:discord:${user.id}`,
-      kind: 'human',
-      name: displayNameOf(user, member),
-      aud: st.audience,
-      scopes: grant.scopes,
-      ...(grant.claims ? { claims: grant.claims } : {}),
-      iat: Math.floor(nowMs / 1000),
-      exp: Math.floor((nowMs + LOGIN_TOKEN_TTL_MS) / 1000),
-      jti: newJti(),
-    };
-    const token = mintToken(this.issuer.privateKey, payload);
-    this.mintLog.append({
-      at: new Date(nowMs).toISOString(),
-      jti: payload.jti,
-      sub: payload.sub,
-      aud: payload.aud,
-      scopes: payload.scopes,
-      exp: payload.exp,
-      by: 'oauth',
-    });
-    console.error(`[hn] login: ${payload.sub} (${payload.name}) → ${payload.aud} [${payload.scopes.join(' ')}]`);
-    // Token rides the fragment — never hits logs or Referer headers (§8).
-    redirect(res, `${this.audienceRedirect(st.audience)!}#token=${token}`);
   }
 
   // ── sponsor console (see console.ts header for the design) ──
@@ -353,17 +273,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   }
 }
 
-// ── tiny http helpers ──
-
-function json(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'content-type': 'application/json' });
-  res.end(JSON.stringify(body));
-}
-
-function html(res: ServerResponse, status: number, body: string): void {
-  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(body);
-}
+// ── helpers ──
 
 function markdown(res: ServerResponse, body: string): void {
   res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'public, max-age=300' });
@@ -390,46 +300,3 @@ function agentsGuide(): string {
   }
   return agentsGuideCache;
 }
-
-function redirect(res: ServerResponse, to: string): void {
-  res.writeHead(302, { location: to });
-  res.end();
-}
-
-function page(title: string, body: string): string {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title>
-<style>body{font:16px/1.5 system-ui;max-width:36rem;margin:15vh auto;padding:0 1rem;color:#222}
-code{background:#f2f2f2;padding:.1em .3em;border-radius:4px;word-break:break-all}
-@media(prefers-color-scheme:dark){body{background:#111;color:#ddd}code{background:#222}}</style>
-<h2>${esc(title)}</h2>${body}`;
-}
-
-function esc(s: string): string {
-  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
-}
-
-function readJson(req: IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    req.on('data', (c: Buffer) => {
-      size += c.length;
-      if (size > BODY_LIMIT) {
-        reject(new Error('body too large'));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        resolve(null); // handlers reject malformed bodies with a reason
-      }
-    });
-    req.on('error', reject);
-  });
-}
-

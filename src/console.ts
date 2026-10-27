@@ -158,9 +158,9 @@ const api = (path, opts = {}) => fetch(path, { ...opts,
 
 function loginView(msg) {
   app.innerHTML = (msg ? '<p>' + msg + '</p>' : '') +
-    '<p>Sign in with Discord to mint enrollment invites for agents you run. ' +
+    '<p>Sign in to mint enrollment invites for agents you run. ' +
     'Requires eidoverse access; each invite is single-use, expires in 14 days, and carries your name as sponsor.</p>' +
-    '<p><a href="/login?audience=console"><button>Sign in with Discord</button></a></p>';
+    '<p><a href="/login?audience=console"><button>Sign in</button></a></p>';
 }
 
 async function main() {

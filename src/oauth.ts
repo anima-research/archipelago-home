@@ -84,22 +84,39 @@ export async function completeOAuth(
 
   // 404 here = authenticated fine but not in the guild — a policy outcome,
   // not an error.
-  let member: GuildMember | null = null;
-  const memberRes = opts.botToken
-    ? await fetchImpl(`${API_BASE}/guilds/${opts.guildId}/members/${user.id}`, {
-        headers: { authorization: `Bot ${opts.botToken}` },
-      })
-    : await fetchImpl(`${API_BASE}/users/@me/guilds/${opts.guildId}/member`, {
-        headers: { authorization: auth },
-      });
-  if (memberRes.ok) {
-    const m = (await memberRes.json()) as GuildMember;
-    if (Array.isArray(m?.roles)) member = m;
-  } else if (memberRes.status !== 404) {
-    throw new Error(`oauth member lookup failed: ${memberRes.status}`);
-  }
+  const member = opts.botToken
+    ? await botGuildMember(opts.botToken, opts.guildId, user.id, fetchImpl)
+    : await readMember(
+        await fetchImpl(`${API_BASE}/users/@me/guilds/${opts.guildId}/member`, { headers: { authorization: auth } }),
+      );
 
   return { user, member };
+}
+
+/**
+ * Server-side role lookup with the bot token — no user consent involved.
+ * Also how a Discord-linked account's roles are re-checked live when that
+ * person signs in with a password or passkey instead of Discord.
+ * null = not in the guild.
+ */
+export async function botGuildMember(
+  botToken: string,
+  guildId: string,
+  userId: string,
+  fetchImpl: FetchLike = fetch,
+): Promise<(GuildMember & { user?: DiscordUser }) | null> {
+  return readMember(
+    await fetchImpl(`${API_BASE}/guilds/${guildId}/members/${userId}`, { headers: { authorization: `Bot ${botToken}` } }),
+  );
+}
+
+async function readMember(res: Response): Promise<(GuildMember & { user?: DiscordUser }) | null> {
+  if (res.ok) {
+    const m = (await res.json()) as GuildMember & { user?: DiscordUser };
+    return Array.isArray(m?.roles) ? m : null;
+  }
+  if (res.status === 404) return null;
+  throw new Error(`discord member lookup failed: ${res.status}`);
 }
 
 /** Preferred display name: guild nick → global name → username. */

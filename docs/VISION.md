@@ -47,10 +47,12 @@ can accept our identities without reading this repo.
 
 ### 2. More humans (no step needed, by construction)
 
-Humans are never rows in our storage — they're derived from Discord at
-login. Ten or ten thousand guild members cost us nothing; membership and
+Discord humans are not rows in our storage — they're derived from Discord
+at login. Ten or ten thousand guild members cost us nothing; membership and
 role administration stay in Discord where communities already do that
-work. The `minted.jsonl` audit log grows linearly and is never consulted
+work. A row (`data/accounts.json`) exists only for someone who asked for
+another way in — a password, a passkey, a TOTP code — or whom the operator
+created with no Discord at all; see "the home's own login" below. The `minted.jsonl` audit log grows linearly and is never consulted
 at runtime.
 
 **Steps when needed:** multiple guilds (key `roles.json` by guild id —
@@ -127,14 +129,41 @@ other OIDC) account, with that ecosystem's recovery machinery.
 
 ## What this never becomes
 
-- **Not an account system.** No passwords, no emails, no profiles, no
-  sessions at the home node beyond the seconds an OAuth round-trip takes.
+- **Not an account system beyond sign-in.** Since 2026-10 the home keeps
+  credentials for people who want them (scrypt password hashes, TOTP
+  secrets, passkey public keys — `data/accounts.json`, 0600), so a full
+  data leak is no longer only public keys and an audit log; that file is
+  now as sensitive as the issuer key. Still: no emails, no profiles, no
+  password-reset-by-email (resets are operator-issued setup links), and no
+  sessions at the home node beyond a 10-minute login token.
 - **Not a runtime dependency.** If every home node on earth is down,
   every existing session and credential keeps working until expiry.
 - **Not a reputation score.** Testimony with issuers attached, or nothing.
 - **Not a walled garden.** The endgame is many small homes trusting each
   other by explicit, revocable, per-audience choice — an archipelago, not
   a continent.
+
+## The home's own login (added 2026-10)
+
+Discord stays the front door for the community; the home's own login is
+for people who can't or won't route their identity through Discord, and
+for Discord people who want a passkey or a password in reserve.
+
+- **One person, one sub.** A row made from a Discord login keeps
+  `human:discord:<id>`; a row the operator makes is `human:local:<username>`.
+  Methods (Discord link, password, TOTP, passkeys) attach to the row and
+  can change; the sub never does. A Discord-anchored row can't unlink
+  Discord — that link *is* its sub. Linking Discord to a local row means
+  Continue with Discord opens the local row from then on.
+- **Scopes keep their source.** Discord roles still decide what a
+  Discord-linked person holds: live at Discord login, by bot lookup on
+  other logins when `HN_BOT_TOKEN` is set, else from the last Discord
+  check if it's under 7 days old (so a removed role reaches password
+  logins within a week without a bot token). The row's own `scopes` are an
+  operator grant on top — and the only grant a local-only person has.
+- **Passkeys are the strong path** (WebAuthn, user verification required,
+  usernameless, attestation `none`); TOTP guards password logins only;
+  recovery codes are single-use; resets go through the operator.
 
 ## Sequencing (earn each step)
 
