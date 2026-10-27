@@ -10,6 +10,10 @@ Environment=HOME=/var/lib/identity-backup
 Environment=RCLONE_CACHE_DIR=/var/lib/identity-backup/cache
 StateDirectory=identity-backup
 StateDirectoryMode=0700
+# The plaintext snapshot lives here: /run is tmpfs (RAM), and systemd removes
+# the directory when the run ends. Exposed to the script as $RUNTIME_DIRECTORY.
+RuntimeDirectory=identity-backup
+RuntimeDirectoryMode=0700
 # Reads everything it backs up; can write only its state and private /tmp.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 NoNewPrivileges=true

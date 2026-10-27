@@ -5,7 +5,8 @@
 # TOTP secrets, passkey keys — and the mint log), config/, .env,
 # history/ and the nginx vhost into one tar, compresses it and encrypts it with
 # age to the public keys in $CONF/recipients.txt, then uploads it to S3.
-# Plaintext exists only inside the pipe; nothing unencrypted is written to disk.
+# Plaintext exists only in RAM (a snapshot under /run, removed on exit) and
+# inside the pipe; nothing unencrypted is written to disk.
 # This box holds only public keys, so it cannot read its own backups.
 #
 #   $CONF/recipients.txt   age or ssh-ed25519 public keys, one per line
@@ -37,7 +38,7 @@ stamp=${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}   # STAMP: tests only
 month=${stamp:0:6}
 name="identity-$stamp.tar.zst.age"
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work"' EXIT   # widened to the snapshot below
 
 # Paths relative to / so a restore lands where the service expects them.
 paths=(
@@ -48,51 +49,74 @@ paths=(
 [ -d "$APP/history" ] && paths+=("${APP#/}/history")
 [ -f /etc/nginx/sites-available/id.animalabs.ai ] && paths+=(etc/nginx/sites-available/id.animalabs.ai)
 
-# Checksums travel inside the encrypted tar, so a restore can be verified.
-# Writers' tmp files (renamed into place) and lock files are in-flight
-# scaffolding, never state: neither hashed nor archived, so one vanishing
-# mid-run can't fail the backup.
-manifest() { ( cd / && find "${paths[@]}" -type f ! -name '*.tmp' ! -name '*.lock' -print0 | sort -z | xargs -0 sha256sum ); }
+# Plaintext lives only in RAM: a snapshot under the unit's RuntimeDirectory
+# (/run/identity-backup, tmpfs), removed on exit; SNAPSHOT_DIR names another
+# RAM-backed directory for a manual run. /run must hold one copy of data/.
+ram=${SNAPSHOT_DIR:-${RUNTIME_DIRECTORY:-}}
+[ -n "$ram" ] && [ -d "$ram" ] || { log "no RAM directory for the snapshot — run via the systemd unit, or set SNAPSHOT_DIR"; exit 1; }
+snap="$ram/snap.$$"
+trap 'rm -rf "$work" "$snap"' EXIT
 
-# The service keeps running (and writing: logins append to minted.jsonl, an
-# enrollment rewrites invites.json and principals.json together). So: hash,
-# archive, hash again. If nothing changed while tar read, the archive is one
-# consistent view and the manifest inside it describes exactly what it holds;
-# if something did, take it again. Plaintext still never touches the disk.
-#
-# Enrollment writes principals.json and invites.json in one synchronous step
-# (microseconds apart), and a pair can't change between the two hash passes
-# without one of them differing, so an archive kept here never holds half an
-# enrollment.
-#
-# GNU tar exits 1 when a file changes under it ("file changed as we read
-# it") — that is the same "take it again" case, not a failure, so each
-# stage's status is read on its own: tar 1 retries; anything else from tar,
-# zstd or age fails the run.
+# Writers' tmp files (renamed into place) and lock files are in-flight
+# scaffolding, never state: neither copied nor archived. The mint log is
+# copied apart (step 1b), so it isn't in the state check either.
+MINT_LOG="${APP#/}/data/minted.jsonl"
+skip=(--exclude='*.tmp' --exclude='*.lock' --exclude="$MINT_LOG")
+live_hashes() {
+  ( cd / && find "${paths[@]}" -type f ! -name '*.tmp' ! -name '*.lock' ! -path "$MINT_LOG" -print0 \
+      | sort -z | xargs -0 sha256sum )
+}
+
+# 1a. A stable snapshot of the state files. The service keeps running and
+# writing: an enrollment rewrites principals.json and invites.json together,
+# sign-ins update accounts.json. So: hash the live files, copy them into RAM,
+# hash again. Equal hashes mean nothing changed while the copy was made, so
+# the snapshot is one moment's view — never half an enrollment. These files
+# are small and rarely written, so the window is milliseconds; a retry backs
+# off (1, 2, 4, 8 s) to outlast a burst. GNU tar exits 1 when a file changes
+# under it ("file changed as we read it"): the same retry case. Any other
+# copy failure (e.g. /run full) fails the run.
 stable=
 for attempt in 1 2 3 4 5; do
-  rm -f "$work/$name"
-  if ! manifest > "$work/MANIFEST.sha256"; then
-    log "a file moved while hashing (attempt $attempt) — taking it again"; sleep 3; continue
+  rm -rf "$snap"
+  mkdir -p "$snap"
+  if before=$(live_hashes); then
+    set +e
+    tar --numeric-owner "${skip[@]}" -cf - -C / "${paths[@]}" | tar --numeric-owner -xpf - -C "$snap"
+    st=("${PIPESTATUS[@]}")
+    set -e
+    [ "${st[1]}" -eq 0 ] || { log "snapshot copy failed (tar -x exit ${st[1]}) — is $ram full?"; exit 1; }
+    case "${st[0]}" in
+      0) [ "$(live_hashes 2>/dev/null)" = "$before" ] && { stable=1; break; } ;;
+      1) ;; # a file changed while tar read it
+      *) log "snapshot read failed (tar exit ${st[0]})"; exit 1 ;;
+    esac
   fi
-  set +e
-  tar --numeric-owner --exclude='*.tmp' --exclude='*.lock' -cf - -C / "${paths[@]}" -C "$work" MANIFEST.sha256 \
-    | zstd -q -19 \
-    | age -R "$CONF/recipients.txt" -o "$work/$name"
-  st=("${PIPESTATUS[@]}")
-  set -e
-  [ "${st[1]}" -eq 0 ] && [ "${st[2]}" -eq 0 ] || { log "compression/encryption failed (zstd ${st[1]}, age ${st[2]})"; exit 1; }
-  case "${st[0]}" in
-    0) manifest | cmp -s - "$work/MANIFEST.sha256" && { stable=1; break; } ;;
-    1) ;; # a file changed while tar read it
-    *) log "tar failed (exit ${st[0]})"; exit 1 ;;
-  esac
-  log "files changed while archiving (attempt $attempt) — taking it again"
-  sleep 3
+  [ "$attempt" -lt 5 ] || break
+  log "state files changed while taking the snapshot (attempt $attempt) — again in $((1 << (attempt - 1)))s"
+  sleep $((1 << (attempt - 1)))
 done
-[ -n "$stable" ] || { log "files kept changing across 5 attempts — no consistent archive, nothing uploaded"; exit 1; }
+[ -n "$stable" ] || { log "state files kept changing across 5 attempts — no consistent snapshot, nothing uploaded"; exit 1; }
+
+# 1b. The mint log is append-only and never read at runtime (an audit
+# trail), so it needs no agreement with the state files, only whole lines:
+# take the lines complete at one instant. Lines already written never
+# change, so `head -n` of that count is exact even while appends go on.
+if [ -f "/$MINT_LOG" ]; then
+  size=$(stat -c %s "/$MINT_LOG")
+  lines=0
+  [ "$size" -gt 0 ] && lines=$(head -c "$size" "/$MINT_LOG" | LC_ALL=C tr -dc '\n' | wc -c)
+  if [ "$lines" -gt 0 ]; then head -n "$lines" "/$MINT_LOG" > "$snap/$MINT_LOG"; else : > "$snap/$MINT_LOG"; fi
+fi
+
+# 2. Hash and archive that same view. Nothing writes to the snapshot, so the
+# manifest inside the archive is exactly what the archive holds.
+( cd "$snap" && find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum ) > "$work/MANIFEST.sha256"
 files=$(wc -l < "$work/MANIFEST.sha256")
-rm -f "$work/MANIFEST.sha256"
+tar --numeric-owner -cf - -C "$snap" "${paths[@]}" -C "$work" MANIFEST.sha256 \
+  | zstd -q -19 \
+  | age -R "$CONF/recipients.txt" -o "$work/$name"
+rm -rf "$snap" "$work/MANIFEST.sha256"
 
 size=$(stat -c %s "$work/$name")
 head -c 21 "$work/$name" | grep -q '^age-encryption.org/v1' || { log "output is not an age file"; exit 1; }
