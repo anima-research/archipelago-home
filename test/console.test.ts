@@ -14,8 +14,8 @@ import {
 import { audiencesFor, invitePolicyStore } from '../src/policy.js';
 
 // Anima's policy, exactly as shipped: these tests are also the proof that
-// config/invites.example.json reproduces the console's behaviour.
-const POLICY = invitePolicyStore(join(import.meta.dirname, '..', 'config', 'invites.example.json')).get();
+// config/invite-policy.example.json reproduces the console's behaviour.
+const POLICY = invitePolicyStore(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json')).get();
 const inviteAudiences = (scopes: string[], anchored: boolean, known: string[] = []) => audiencesFor(POLICY, scopes, anchored, known);
 
 const SPONSOR = { sub: 'human:discord:111', name: 'antra', scopes: ['worlds:join', 'worlds:spectate', 'orrery:use'] };

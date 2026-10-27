@@ -1,8 +1,8 @@
 /**
  * The invite policy — what a sponsor's console invite carries — as part of a
- * deployment, not of the code: `config/invites.json`, hot-reloaded like
+ * deployment, not of the code: `config/invite-policy.json`, hot-reloaded like
  * audiences.json and roles.json. A home with other services writes its own;
- * Anima's is config/invites.example.json.
+ * Anima's is config/invite-policy.example.json.
  *
  *   {
  *     "console":         { "requiredScopes": ["worlds:join"] },
@@ -36,9 +36,11 @@
  * audience leads the list: enrollment's first token is for audiences[0].
  *
  * The console gate: `console.requiredScopes` are what a person must hold to
- * open the console and mint at all. With no invites.json at all (or one
+ * open the console and mint at all. It is required — `[]` deliberately opens
+ * the console to anyone signed in. With no invite-policy.json at all (or one
  * that has never parsed), the console is off and says so; nothing else on
- * the node depends on this file. Keys starting with "_" are comments.
+ * the node depends on this file. An invite the rules would give no audience
+ * is refused, not minted. Keys starting with "_" are comments.
  */
 import { JsonStore } from './stores.js';
 
@@ -55,7 +57,8 @@ export interface AudienceRule {
 export interface InvitePolicy {
   /** False only for the built-in "no file" value: the console is off. */
   configured: boolean;
-  console?: { requiredScopes?: string[] };
+  /** Required in the file (the validator refuses one without it). */
+  console?: { requiredScopes: string[] };
   primaryAudience?: string;
   scopes: Record<string, ScopeRole[]>;
   audiences: AudienceRule[];
@@ -73,17 +76,21 @@ export function invitePolicyProblem(raw: unknown): string | null {
   for (const k of Object.keys(f)) {
     if (!k.startsWith('_') && !['console', 'primaryAudience', 'scopes', 'audiences'].includes(k)) return `unknown key "${k}"`;
   }
-  if (f.console !== undefined) {
-    const c = f.console as Record<string, unknown>;
-    if (!c || typeof c !== 'object') return 'console must be an object';
-    for (const k of Object.keys(c)) if (!k.startsWith('_') && k !== 'requiredScopes') return `unknown key "console.${k}"`;
-    if (c.requiredScopes !== undefined && !isStrings(c.requiredScopes)) return 'console.requiredScopes must be a list of scopes';
+  // The console gate is never implied: a file must say who may mint, and an
+  // open console takes an explicit `"requiredScopes": []`. So a bad edit
+  // (a missing or mistyped gate) is refused, keeping the last good gate.
+  const c = f.console as Record<string, unknown>;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return 'console must be an object: { "requiredScopes": [...] }';
+  for (const k of Object.keys(c)) if (!k.startsWith('_') && k !== 'requiredScopes') return `unknown key "console.${k}"`;
+  if (!Array.isArray(c.requiredScopes) || !(c.requiredScopes.length === 0 || isStrings(c.requiredScopes))) {
+    return 'console.requiredScopes must be a list of scopes ([] for a console anyone signed in may use)';
   }
   if (f.primaryAudience !== undefined && (typeof f.primaryAudience !== 'string' || !f.primaryAudience)) {
     return 'primaryAudience must be an audience name';
   }
   const scopes = f.scopes as Record<string, unknown>;
   if (!scopes || typeof scopes !== 'object' || Array.isArray(scopes)) return 'scopes must be an object';
+  // (isStrings([]) is true, so emptiness is checked where it matters)
   for (const [s, roles] of Object.entries(scopes)) {
     if (s.startsWith('_')) continue;
     if (!Array.isArray(roles)) return `scopes["${s}"] must be a list of roles`;
@@ -99,7 +106,9 @@ export function invitePolicyProblem(raw: unknown): string | null {
     if (typeof r.audience !== 'string' || !r.audience) return `audiences[${i}].audience must be a name`;
     if (r.always !== undefined && typeof r.always !== 'boolean') return `audiences[${i}].always must be true/false`;
     if (r.anchored !== undefined && typeof r.anchored !== 'boolean') return `audiences[${i}].anchored must be true/false`;
-    if (r.when !== undefined && !isStrings(r.when)) return `audiences[${i}].when must be a list of scope patterns`;
+    if (r.when !== undefined && (!isStrings(r.when) || (r.when as unknown[]).length === 0)) {
+      return `audiences[${i}].when must be a non-empty list of scope patterns`;
+    }
     if (!r.always && !r.anchored && !r.when) return `audiences[${i}] ("${r.audience}") never applies — give it always, anchored or when`;
   }
   return null;

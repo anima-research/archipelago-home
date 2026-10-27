@@ -30,8 +30,8 @@ const GARDEN = {
 
 test('another home brings its own policy: scopes, baseline, anchoring and audiences all come from it', () => {
   const dir = fresh();
-  writeFileSync(join(dir, 'invites.json'), JSON.stringify(GARDEN));
-  const policy = invitePolicyStore(join(dir, 'invites.json')).get();
+  writeFileSync(join(dir, 'invite-policy.json'), JSON.stringify(GARDEN));
+  const policy = invitePolicyStore(join(dir, 'invite-policy.json')).get();
   assert.equal(policy.configured, true);
   const invites = new InviteStore(join(dir, 'store.json'));
   const gardener = { sub: 'human:local:ann', name: 'ann', scopes: ['garden:tend', 'library:read', 'worlds:join'] };
@@ -54,6 +54,18 @@ test('another home brings its own policy: scopes, baseline, anchoring and audien
   assert.ok(!outsider.ok && /garden:tend/.test(outsider.error));
 });
 
+test('an invite the rules give no audience is refused, not minted', () => {
+  const dir = fresh();
+  writeFileSync(join(dir, 'p.json'), JSON.stringify({
+    console: { requiredScopes: [] }, scopes: { 'a:use': ['delegable'] }, audiences: [{ audience: 'vault', anchored: true }],
+  }));
+  const policy = invitePolicyStore(join(dir, 'p.json')).get();
+  const invites = new InviteStore(join(dir, 'store.json'));
+  const r = mintSponsoredInvite(invites, policy, { sub: 'human:local:a', name: 'a', scopes: ['a:use'] }, undefined);
+  assert.ok(!r.ok && /no audience/.test(r.error));
+  assert.equal(invites.all().length, 0);
+});
+
 test('no policy: the console mints nothing and says why', () => {
   assert.equal(consoleRequiredScopes(NO_POLICY), null);
   const dir = fresh();
@@ -64,14 +76,19 @@ test('no policy: the console mints nothing and says why', () => {
 });
 
 test('a typo refuses the whole file; a hot reload keeps the last good policy', async () => {
-  assert.match(invitePolicyProblem({ scopes: { 'a:b': ['delegible'] }, audiences: [] })!, /unknown role "delegible"/);
-  assert.match(invitePolicyProblem({ scopes: {}, audiences: [{ audience: 'x', whne: ['a:b'] }] })!, /unknown key "whne"/);
-  assert.match(invitePolicyProblem({ scopes: {}, audiences: [{ audience: 'x' }] })!, /never applies/);
-  assert.match(invitePolicyProblem({ scopes: {}, audiences: [], consoel: {} })!, /unknown key "consoel"/);
-  assert.equal(invitePolicyProblem({ _: 'comment', scopes: { _note: 'x' }, audiences: [] }), null);
+  const gate = { console: { requiredScopes: ['a:b'] } };
+  assert.match(invitePolicyProblem({ ...gate, scopes: { 'a:b': ['delegible'] }, audiences: [] })!, /unknown role "delegible"/);
+  assert.match(invitePolicyProblem({ ...gate, scopes: {}, audiences: [{ audience: 'x', whne: ['a:b'] }] })!, /unknown key "whne"/);
+  assert.match(invitePolicyProblem({ ...gate, scopes: {}, audiences: [{ audience: 'x' }] })!, /never applies/);
+  assert.match(invitePolicyProblem({ ...gate, scopes: {}, audiences: [], consoel: {} })!, /unknown key "consoel"/);
+  assert.match(invitePolicyProblem({ console: { requiredScopes: [] }, scopes: {}, audiences: [{ audience: 'x', when: [] }] })!, /non-empty/);
+  assert.match(invitePolicyProblem({ console: [], scopes: {}, audiences: [] })!, /console must be an object/);
+  assert.match(invitePolicyProblem({ scopes: {}, audiences: [] })!, /console must be an object/); // the gate is never implied
+  assert.match(invitePolicyProblem({ console: {}, scopes: {}, audiences: [] })!, /requiredScopes/);
+  assert.equal(invitePolicyProblem({ _: 'comment', console: { requiredScopes: [] }, scopes: { _note: 'x' }, audiences: [] }), null);
 
   const dir = fresh();
-  const path = join(dir, 'invites.json');
+  const path = join(dir, 'invite-policy.json');
   writeFileSync(path, JSON.stringify(GARDEN));
   const store = invitePolicyStore(path);
   store.startWatching(20);
@@ -79,6 +96,9 @@ test('a typo refuses the whole file; a hot reload keeps the last good policy', a
     writeFileSync(path, JSON.stringify({ ...GARDEN, scopes: { 'garden:tend': ['delegible'] } }));
     await new Promise((r) => setTimeout(r, 120));
     assert.deepEqual(store.get().scopes, GARDEN.scopes); // the broken file was refused
+    writeFileSync(path, JSON.stringify({ ...GARDEN, console: [] }));
+    await new Promise((r) => setTimeout(r, 120));
+    assert.deepEqual(consoleRequiredScopes(store.get()), ['garden:tend']); // a gate can't be dropped by a bad edit
     writeFileSync(path, JSON.stringify({ ...GARDEN, console: { requiredScopes: ['library:read'] } }));
     await new Promise((r) => setTimeout(r, 120));
     assert.deepEqual(consoleRequiredScopes(store.get()), ['library:read']); // a good edit lands without a restart
@@ -99,7 +119,7 @@ test('audience rules: always, anchored, when (exact and prefix), primary first, 
   assert.deepEqual(audiencesFor(p, ['y:gone'], false, ['w-1']), ['a']); // exact match only without :*
 });
 
-test('end to end: a node without invites.json has no console; adding the file turns it on, no restart', async () => {
+test('end to end: a node without invite-policy.json has no console; adding the file turns it on, no restart', async () => {
   const dir = fresh();
   writeFileSync(join(dir, 'audiences.json'), '{}');
   const node = new HomeNode({ iss: 'id.test', publicUrl: 'https://id.test', bind: '127.0.0.1', port: 0, dataDir: dir, configDir: dir });
@@ -108,11 +128,14 @@ test('end to end: a node without invites.json has no console; adding the file tu
     const me = await fetch(`${base}/console/me`, { headers: { authorization: 'Bearer x' } });
     assert.equal(me.status, 503);
     assert.match((await me.json()).error, /no invite policy/);
-    writeFileSync(join(dir, 'invites.json'), JSON.stringify(GARDEN));
-    node.invitePolicy.refresh();
-    assert.equal(node.invitePolicy.get().configured, true);
-    const me2 = await fetch(`${base}/console/me`, { headers: { authorization: 'Bearer x' } });
-    assert.equal(me2.status, 401); // the console is on now: it's the token that's wrong
+    writeFileSync(join(dir, 'invite-policy.json'), JSON.stringify(GARDEN));
+    // the node's own watcher (3 s poll) picks it up — no restart, no nudge
+    let status = 503;
+    for (const end = Date.now() + 8000; status === 503 && Date.now() < end; ) {
+      await new Promise((r) => setTimeout(r, 250));
+      status = (await fetch(`${base}/console/me`, { headers: { authorization: 'Bearer x' } })).status;
+    }
+    assert.equal(status, 401); // the console is on now: it's the token that's wrong
   } finally {
     node.stop();
     rmSync(dir, { recursive: true, force: true });

@@ -46,7 +46,7 @@ function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
   writeFileSync(join(dir, 'principals.json'), JSON.stringify({
     principals: [{ sub: 'agent:fable@id.test', name: 'Fable', kind: 'agent', key: null, scopes: [] }],
   }));
-  copyFileSync(join(import.meta.dirname, '..', 'config', 'invites.example.json'), join(dir, 'invites.json'));
+  copyFileSync(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json'), join(dir, 'invite-policy.json'));
   writeFileSync(join(dir, 'audiences.json'), JSON.stringify({
     eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
     orrery: { redirect: 'https://orrery.test/auth', requiredScopes: ['orrery:use'] },

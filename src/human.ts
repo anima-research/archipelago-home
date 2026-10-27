@@ -540,7 +540,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     } else {
       const gate = audience === 'console' ? consoleRequiredScopes(this.d.invitePolicy.get()) : null;
       if (audience === 'console' && gate === null) {
-        return { ok: false, status: 403, error: 'this home has no sponsor console (no config/invites.json)' };
+        return { ok: false, status: 403, error: 'this home has no sponsor console (no config/invite-policy.json)' };
       }
       const needed = audience === 'console' ? gate! : (this.d.audiences.get()[audience]?.requiredScopes ?? []);
       if (!grant) return { ok: false, status: 403, error: who.note ?? 'no qualifying role' };

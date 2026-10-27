@@ -6,7 +6,7 @@
  * What an invite carries — which scopes a sponsor may pass on, what every
  * invite or every anchored invite gets, which audiences follow from which
  * scopes, who may open the console — is the deployment's invite policy
- * (config/invites.json, see policy.ts), not code. This file is the rules
+ * (config/invite-policy.json, see policy.ts), not code. This file is the rules
  * that hold whatever the policy says.
  *
  * Design constraints, in order:
@@ -81,7 +81,7 @@ export function mintSponsoredInvite(
 ): ConsoleMintResult {
   const gate = consoleRequiredScopes(policy);
   if (gate === null) {
-    return { ok: false, status: 403, error: 'this home has no invite policy (config/invites.json), so the console mints nothing' };
+    return { ok: false, status: 403, error: 'this home has no invite policy (config/invite-policy.json), so the console mints nothing' };
   }
   const missing = gate.filter((s) => !sponsor.scopes.includes(s));
   if (missing.length) return { ok: false, status: 403, error: `minting requires ${missing.join(', ')}` };
@@ -104,12 +104,18 @@ export function mintSponsoredInvite(
   const union = (...lists: string[][]) => [...new Set(lists.flat())];
   const baseline = scopesWithRole(policy, 'baseline');
   const scopes = anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline);
+  const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences);
+  // An empty list would be saved as "no audience allowed": enrollment would
+  // consume the invite and every token request after it would fail.
+  if (!audiences.length) {
+    return { ok: false, status: 403, error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match' };
+  }
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
-    audiences: audiencesFor(policy, scopes, anchored, opts?.knownAudiences),
+    audiences,
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
     ...(anchored ? { domain: opts!.anchorDomain! } : {}),

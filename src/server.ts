@@ -109,7 +109,7 @@ export class HomeNode {
     this.invites = new InviteStore(join(cfg.dataDir, 'invites.json'));
     this.roles = rolesStore(join(cfg.configDir, 'roles.json'));
     this.audiences = audiencesStore(join(cfg.configDir, 'audiences.json'));
-    this.invitePolicy = invitePolicyStore(join(cfg.configDir, 'invites.json'));
+    this.invitePolicy = invitePolicyStore(join(cfg.configDir, 'invite-policy.json'));
     this.mintLog = new MintLog(join(cfg.dataDir, 'minted.jsonl'));
     this.accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
     this.human = new HumanAuth({
@@ -147,7 +147,7 @@ export class HomeNode {
         const port = typeof addr === 'object' && addr ? addr.port : this.cfg.port;
         console.error(`[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${port} — issuer ${this.issuer.id}`);
         if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
-        if (!this.invitePolicy.get().configured) console.error('[hn] no config/invites.json — the sponsor console is off');
+        if (!this.invitePolicy.get().configured) console.error('[hn] no config/invite-policy.json — the sponsor console is off');
         resolve(port);
       }),
     );
@@ -231,7 +231,7 @@ export class HomeNode {
   private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
     const gate = consoleRequiredScopes(this.invitePolicy.get());
     if (gate === null) {
-      json(res, 503, { error: 'this home has no invite policy (config/invites.json), so the console is off' });
+      json(res, 503, { error: 'this home has no invite policy (config/invite-policy.json), so the console is off' });
       return null;
     }
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
