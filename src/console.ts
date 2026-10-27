@@ -10,22 +10,57 @@
  *    home node consuming its own credential format.
  *  - Delegation never exceeds the sponsor: invite scopes = sponsor's scopes
  *    ∩ the delegable set. You cannot mint your agent into rooms you can't
- *    enter yourself. (One bounded exception: `id:anchor` holders also grant
- *    ADMIN_GRANTABLE outright — see its comment.)
+ *    enter yourself. (Bounded exceptions, both resting on the home's own
+ *    `id:anchor` authority: anchor holders grant ADMIN_GRANTABLE outright,
+ *    and an anchored invite carries the full RESIDENT grant — see each.)
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
 import type { Invite, InviteStore, PrincipalStore } from './stores.js';
 
 /** Scopes a sponsor may pass down (∩ their own). Everything else — admin-ish
- *  scopes, future surprises — is deliberately not delegable. */
-const DELEGABLE = ['worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload', 'music:scribe'];
+ *  scopes, future surprises — is deliberately not delegable. `board:*` stays
+ *  out on purpose: guest board access is granted by hand (antra, 10-08). */
+const DELEGABLE = [
+  'worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload', 'music:scribe',
+  'docs:use', 'clawblox:play',
+];
 
 /** Scopes an `id:anchor` holder may grant OUTRIGHT (no ∩ — the home's own
  *  authority stands behind these, the same authority that anchors residents
- *  at the home domain). The one carve-out from delegation-never-exceeds-
- *  the-sponsor, and it is bounded by this list, not open-ended. */
+ *  at the home domain). Bounded by this list, not open-ended. */
 const ADMIN_GRANTABLE = ['music:upload', 'music:scribe'];
+
+/** The standard resident grant — what every agent anchored at the home
+ *  holds (the fleet's anchored principals as of 2026-10-08). An anchored
+ *  invite carries all of it, whatever the sponsor personally holds: anchoring
+ *  is the home vouching maximally, and only `id:anchor` holders can do it.
+ *  This is the second bounded carve-out from ∩, and the only console path to
+ *  `board:*`. */
+const RESIDENT_SCOPES = [
+  'board:read', 'board:write', 'clawblox:play', 'docs:use', 'music:scribe',
+  'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate',
+];
+/** Fixed resident audiences; every registered `clawblox-*` world joins them
+ *  at mint time (clawblox audiences are per-world). */
+const RESIDENT_AUDIENCES = ['board', 'body', 'canon', 'docs', 'eidoverse', 'music', 'orrery'];
+const CLAWBLOX_AUDIENCE_PREFIX = 'clawblox-';
+
+/** Audiences an invite's principal may request tokens for, derived from its
+ *  scopes. `known` = the home's registered audiences (for per-world ids). */
+export function inviteAudiences(scopes: string[], anchored: boolean, known: string[] = []): string[] {
+  const clawblox = scopes.includes('clawblox:play')
+    ? known.filter((a) => a.startsWith(CLAWBLOX_AUDIENCE_PREFIX)).sort()
+    : [];
+  if (anchored) return [...RESIDENT_AUDIENCES, ...clawblox].sort();
+  return [
+    'eidoverse',
+    ...(scopes.includes('orrery:use') ? ['orrery'] : []),
+    ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
+    ...(scopes.includes('docs:use') ? ['docs'] : []),
+    ...clawblox,
+  ];
+}
 
 /** Active = still claimable. The budget counts these, not lifetime mints. */
 const SPONSOR_BUDGET = 3;
@@ -60,6 +95,11 @@ export function activeSponsorInvites(invites: InviteStore, sponsorSub: string, n
  *  scope, granted via the role map like everything else. */
 export const ANCHOR_SCOPE = 'id:anchor';
 
+/** What an anchored invite grants (shown on the console's anchor option). */
+export function residentScopes(): string[] {
+  return [...RESIDENT_SCOPES];
+}
+
 export type ConsoleMintResult =
   | { ok: true; invite: Invite }
   | { ok: false; status: 403 | 429; error: string };
@@ -68,11 +108,11 @@ export function mintSponsoredInvite(
   invites: InviteStore,
   sponsor: SponsorIdentity,
   label: string | undefined,
-  opts?: { anchorDomain?: string | null },
+  opts?: { anchorDomain?: string | null; knownAudiences?: string[] },
   nowMs = Date.now(),
 ): ConsoleMintResult {
-  const scopes = delegableScopes(sponsor.scopes);
-  if (!scopes.includes('worlds:join')) {
+  const delegable = delegableScopes(sponsor.scopes);
+  if (!delegable.includes('worlds:join')) {
     return { ok: false, status: 403, error: 'minting requires eidoverse access (worlds:join)' };
   }
   if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
@@ -87,16 +127,17 @@ export function mintSponsoredInvite(
     };
   }
   const anchored = Boolean(opts?.anchorDomain);
+  // Anchored: the resident grant, plus anything else the sponsor could pass
+  // down anyway (e.g. worlds:build) — never less than a plain invite.
+  const scopes = anchored
+    ? [...RESIDENT_SCOPES, ...delegable.filter((s) => !RESIDENT_SCOPES.includes(s))]
+    : delegable;
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
-    audiences: [
-      'eidoverse',
-      ...(scopes.includes('orrery:use') ? ['orrery'] : []),
-      ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
-    ],
+    audiences: inviteAudiences(scopes, anchored, opts?.knownAudiences),
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
     ...(anchored ? { domain: opts!.anchorDomain! } : {}),
@@ -182,7 +223,8 @@ async function render(me) {
     '<div id="mint-row"><input id="label" placeholder="agent name / note (optional)" maxlength="60">' +
     (me.canAnchor
       ? '<label style="display:flex;align-items:center;gap:.4em"><input type="checkbox" id="anchor">' +
-        'anchor at <code>' + me.home + '</code> <span class="dim">(a resident this home stands behind — not a guest)</span></label>'
+        'anchor at <code>' + me.home + '</code> <span class="dim">(a resident this home stands behind — not a guest; ' +
+        'gets the full resident set: <code>' + (me.residentScopes || []).join(' ') + '</code>)</span></label>'
       : '') +
     '<button id="mint">mint invite</button></div><div id="minted"></div>' +
     (rows ? '<table><tr><th>code</th><th>label</th><th>status</th><th>expires</th></tr>' + rows + '</table>'
