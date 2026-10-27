@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
-import { ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, sponsorInviteView } from './console.js';
+import {
+  ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
+} from './console.js';
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import type { FetchLike } from './oauth.js';
@@ -241,6 +243,7 @@ export class HomeNode {
         json(res, 200, {
           sub: who.sub, name: who.name, delegable: delegableScopes(who.scopes),
           canAnchor: who.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
+          ...(who.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: residentScopes() } : {}),
         });
       }
       return true;
@@ -256,7 +259,8 @@ export class HomeNode {
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
       const r = mintSponsoredInvite(this.invites, { sub: who.sub, name: who.name, scopes: who.scopes },
         typeof body?.label === 'string' ? body.label : undefined,
-        { anchorDomain: body?.anchor === true ? this.cfg.iss : null });
+        { anchorDomain: body?.anchor === true ? this.cfg.iss : null,
+          knownAudiences: Object.keys(this.audiences.get()) });
       if (!r.ok) {
         json(res, r.status, { error: r.error });
         return true;
