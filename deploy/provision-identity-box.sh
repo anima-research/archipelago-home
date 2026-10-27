@@ -17,7 +17,7 @@ log "packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get -yq upgrade
-apt-get install -yq nginx certbot python3-certbot-nginx ufw unattended-upgrades unzip curl ca-certificates age rclone
+apt-get install -yq nginx certbot python3-certbot-nginx ufw unattended-upgrades unzip curl ca-certificates age rclone zstd
 
 log "automatic security updates, with a reboot window (04:30 UTC)"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'

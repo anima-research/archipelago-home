@@ -286,8 +286,8 @@ export interface Invite {
    * Domain the enrolled principal is anchored to: `agent:<name>@<domain>`.
    * Absent = `guest` (invited, anchored nowhere). Setting it is the home
    * vouching maximally — "we host or directly stand behind this agent" —
-   * so it is operator-only (hn CLI), deliberately absent from the sponsor
-   * console.
+   * so it takes the operator (hn CLI) or an `id:anchor` holder in the
+   * sponsor console, and carries the full resident grant there.
    */
   domain?: string;
 }

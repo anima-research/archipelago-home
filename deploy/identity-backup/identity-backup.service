@@ -1,0 +1,30 @@
+[Unit]
+Description=Encrypted offsite backup of the identity node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/identity-backup.sh
+Environment=HOME=/var/lib/identity-backup
+Environment=RCLONE_CACHE_DIR=/var/lib/identity-backup/cache
+StateDirectory=identity-backup
+StateDirectoryMode=0700
+# The plaintext snapshot lives here: /run is tmpfs (RAM), and systemd removes
+# the directory when the run ends. Exposed to the script as $RUNTIME_DIRECTORY.
+RuntimeDirectory=identity-backup
+RuntimeDirectoryMode=0700
+# Reads everything it backs up; can write only its state and private /tmp.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# RestrictSUIDSGID is left out: on Ubuntu 26.04 its seccomp filter makes tar's stat fail with ENOSYS.
+LockPersonality=true
+UMask=0077
+Nice=10
