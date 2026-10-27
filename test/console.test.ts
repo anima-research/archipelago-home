@@ -35,9 +35,8 @@ test('delegation never exceeds the sponsor', () => {
 
   const r = mintSponsoredInvite(invites, SPONSOR, 'helper');
   assert.ok(r.ok);
-  assert.deepEqual(r.invite.scopes, ['worlds:join', 'worlds:spectate', 'orrery:use']);
+  assert.deepEqual(r.invite.scopes, ['worlds:join', 'worlds:spectate', 'orrery:use', 'docs:use']); // docs:use rides on every invite
   assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery']);
-  assert.ok(r.invite.scopes.includes('docs:use'), 'every invite carries docs:use');
   assert.equal(r.invite.sponsor, SPONSOR.sub);
   assert.equal(r.invite.maxUses, 1);
   assert.equal((r.invite.claims as { sponsor?: string }).sponsor, SPONSOR.sub);
@@ -74,7 +73,7 @@ test('id:anchor sponsors grant music scopes outright, with the music audience', 
   const uploader = { ...SPONSOR, scopes: ['worlds:join', 'music:upload'] };
   const u = mintSponsoredInvite(invites, { ...uploader, sub: 'human:discord:333' }, undefined);
   assert.ok(u.ok);
-  assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload']);
+  assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload', 'docs:use']);
   assert.deepEqual(u.invite.audiences, ['eidoverse', 'docs', 'music']);
 });
 
