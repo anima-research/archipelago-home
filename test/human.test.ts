@@ -9,9 +9,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HomeNode, type ServerConfig } from '../src/server.js';
 import { verifyToken, type Aid1Payload } from '../src/token.js';
-import { hashPassword, newSetupCode } from '../src/accounts.js';
+import { hashPassword, newSetupCode, normalizeRecovery, sha256hex } from '../src/accounts.js';
 import { base32Decode, hotp, totpStep } from '../src/totp.js';
 import { SoftAuthenticator } from './helpers/authenticator.js';
+import { generateKey } from '../src/keys.js';
+import { makeEnrollRequest } from '../src/statements.js';
 
 const ORIGIN = 'https://id.test';
 let node: HomeNode;
@@ -63,8 +65,8 @@ after(() => node.stop());
 // Each request from its own address so the per-IP limiter stays out of the way.
 const hdrs = (extra: Record<string, string> = {}) => ({ 'x-real-ip': `10.0.${ipSeq >> 8 & 255}.${ipSeq++ & 255}`, ...extra });
 
-async function get(path: string, b = base) {
-  const r = await fetch(b + path, { headers: hdrs(), redirect: 'manual' });
+async function get(path: string, b = base, extra: Record<string, string> = {}) {
+  const r = await fetch(b + path, { headers: hdrs(extra), redirect: 'manual' });
   return { status: r.status, text: await r.text(), location: r.headers.get('location'), headers: r.headers };
 }
 async function post(path: string, body: unknown, token?: string, b = base) {
@@ -72,7 +74,7 @@ async function post(path: string, body: unknown, token?: string, b = base) {
     method: 'POST', body: JSON.stringify(body),
     headers: hdrs({ 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }),
   });
-  return { status: r.status, body: (await r.json()) as Record<string, any> };
+  return { status: r.status, body: (await r.json()) as Record<string, any>, cookie: (r.headers.get('set-cookie') ?? '').split(';')[0]! };
 }
 
 async function loginState(audience: string, b = base): Promise<string> {
@@ -265,6 +267,7 @@ test('a local account links Discord: Continue with Discord then opens it; one Di
   const tok = await accountToken('erin', 'erin password 1'); // no scopes: the account page still opens
   const link = await post('/account/discord/link', {}, tok);
   assert.equal(link.status, 200);
+  assert.match(link.cookie, /^hn_link=/);
   const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
   assert.equal(start.status, 302);
   assert.match(start.location!, /^https:\/\/discord\.com\/oauth2\/authorize/);
@@ -272,7 +275,7 @@ test('a local account links Discord: Continue with Discord then opens it; one Di
 
   discordUser = { id: '77', username: 'erin_dc', global_name: null as unknown as string };
   discordRoles = ['r-member', 'r-orrery'];
-  const cb = await get(`/oauth/callback?state=${state}&code=x`);
+  const cb = await get(`/oauth/callback?state=${state}&code=x`, base, { cookie: link.cookie });
   assert.equal(cb.status, 302);
   assert.equal(tokenFrom(cb.location!, 'account').sub, 'human:local:erin');
   assert.equal(node.accounts.byUsername('erin')!.discord!.id, '77');
@@ -289,7 +292,26 @@ test('a local account links Discord: Continue with Discord then opens it; one Di
   const link2 = await post('/account/discord/link', {}, tok2);
   const st2 = new URL(link2.body.url).searchParams.get('state')!;
   discordUser = { id: '42', username: 'dee', global_name: 'Dee' };
-  assert.equal((await get(`/oauth/callback?state=${st2}&code=x`)).status, 409);
+  assert.equal((await get(`/oauth/callback?state=${st2}&code=x`, base, { cookie: link2.cookie })).status, 409);
+});
+
+test('a Discord-link URL handed to someone else links nothing (bound to the browser that asked)', async () => {
+  await node.accounts.add({ sub: 'human:local:mallory', username: 'mallory', password: await hashPassword('mallory password 1'), createdAt: '' });
+  const tok = await accountToken('mallory', 'mallory password 1');
+  const link = await post('/account/discord/link', {}, tok);
+  const state = new URL(link.body.url).searchParams.get('state')!;
+  // the victim opens the URL and completes Discord in THEIR browser (no hn_link cookie)
+  discordUser = { id: '999', username: 'victim', global_name: 'Victim' };
+  discordRoles = ['r-member', 'r-orrery'];
+  const cb = await get(`/oauth/callback?state=${state}&code=x`);
+  assert.equal(cb.status, 403);
+  assert.match(cb.text, /same browser/);
+  assert.equal(node.accounts.byUsername('mallory')!.discord, undefined);
+  assert.equal(node.accounts.byDiscord('999'), undefined);
+  // a wrong cookie is no better
+  const link2 = await post('/account/discord/link', {}, tok);
+  const st2 = new URL(link2.body.url).searchParams.get('state')!;
+  assert.equal((await get(`/oauth/callback?state=${st2}&code=x`, base, { cookie: 'hn_link=guess' })).status, 403);
 });
 
 test('setup link: sets the password once, lands on the account page; 2FA still guards a reset', async () => {
@@ -309,6 +331,74 @@ test('setup link: sets the password once, lands on the account page; 2FA still g
   node.accounts.update('human:local:alice', (a) => ({ ...a, setup: r.setup }));
   assert.equal((await post('/account/setup/info', { code: r.code })).body.needsTotp, true);
   assert.equal((await post('/account/setup', { code: r.code, password: 'alice password 2' })).status, 401);
+});
+
+test('disabling an account mid-sign-in stops a pending TOTP step', async () => {
+  const totpAcct = node.accounts.byUsername('alice')!;
+  const step1 = await passwordLogin('alice', 'alice password 1', 'eidoverse');
+  assert.equal(step1.body.next, 'totp');
+  node.accounts.update(totpAcct.sub, (a) => ({ ...a, disabled: true }));
+  const r = await post('/login/totp', { ticket: step1.body.ticket, code: recoveryCodes[2] });
+  assert.equal(r.status, 403);
+  assert.equal(r.body.redirect, undefined);
+  node.accounts.update(totpAcct.sub, (a) => ({ ...a, disabled: false }));
+  // refused before the code was checked, so the recovery code is still unused
+  assert.ok(node.accounts.byUsername('alice')!.recovery!.includes(sha256hex(normalizeRecovery(recoveryCodes[2]!))));
+});
+
+test('the 2FA lockout covers turning 2FA off and setup links, not just sign-in', async () => {
+  const { code, setup } = newSetupCode();
+  await node.accounts.add({ sub: 'human:local:ivan', username: 'ivan', scopes: ['worlds:join'], setup, createdAt: '' });
+  const tok = rawToken((await post('/account/setup', { code, password: 'ivan password 1' })).body.redirect);
+  const begin = await post('/account/totp/begin', {}, tok);
+  const secret = base32Decode(begin.body.secret)!;
+  await post('/account/totp/confirm', { code: hotp(secret, totpStep()) }, tok);
+  for (let i = 0; i < 10; i++) assert.equal((await post('/account/totp/disable', { code: '000000' }, tok)).status, 400);
+  // locked now — even the right code is refused, on every path
+  assert.equal((await post('/account/totp/disable', { code: hotp(secret, totpStep() + 1) }, tok)).status, 429);
+  const r = newSetupCode();
+  node.accounts.update('human:local:ivan', (a) => ({ ...a, setup: r.setup }));
+  assert.equal((await post('/account/setup', { code: r.code, password: 'ivan password 2', totp: hotp(secret, totpStep() + 1) })).status, 429);
+  const t = await passwordLogin('ivan', 'ivan password 1', 'eidoverse');
+  assert.equal((await post('/login/totp', { ticket: t.body.ticket, code: hotp(secret, totpStep() + 1) })).status, 429);
+});
+
+test('a setup link redeemed twice at once works once', async () => {
+  const { code, setup } = newSetupCode();
+  await node.accounts.add({ sub: 'human:local:judy', username: 'judy', scopes: ['worlds:join'], setup, createdAt: '' });
+  const [a, b] = await Promise.all([
+    post('/account/setup', { code, password: 'judy password one' }),
+    post('/account/setup', { code, password: 'judy password two' }),
+  ]);
+  assert.deepEqual([a.status, b.status].sort(), [200, 404]);
+  const winner = a.status === 200 ? 'judy password one' : 'judy password two';
+  assert.equal((await passwordLogin('judy', winner, 'eidoverse')).status, 200);
+});
+
+test('two tabs registering passkeys at once: both passkeys sign in', async () => {
+  const { code, setup } = newSetupCode();
+  await node.accounts.add({ sub: 'human:local:kim', username: 'kim', scopes: ['worlds:join'], setup, createdAt: '' });
+  const tok = rawToken((await post('/account/setup', { code, password: 'kim password 1' })).body.redirect);
+  const [b1, b2] = await Promise.all([post('/account/passkeys/begin', {}, tok), post('/account/passkeys/begin', {}, tok)]);
+  assert.equal(b1.body.publicKey.user.id, b2.body.publicKey.user.id);
+  const k1 = new SoftAuthenticator(-7, ORIGIN, 'id.test');
+  const k2 = new SoftAuthenticator(-257, ORIGIN, 'id.test');
+  assert.equal((await post('/account/passkeys/finish', { credential: k1.create(b1.body.publicKey) }, tok)).status, 200);
+  assert.equal((await post('/account/passkeys/finish', { credential: k2.create(b2.body.publicKey) }, tok)).status, 200);
+  for (const k of [k1, k2]) {
+    const state = await loginState('eidoverse');
+    const opts = await post('/login/passkey/begin', { state });
+    const done = await post('/login/passkey/finish', { state, credential: k.get(opts.body.publicKey) });
+    assert.equal(done.status, 200, JSON.stringify(done.body));
+  }
+});
+
+test('an agent can’t enroll under a person’s username', async () => {
+  const inv = node.invites.mint({ scopes: ['worlds:join'], maxUses: 1 });
+  const key = generateKey();
+  const r = await post('/enroll', makeEnrollRequest(key.privateKey, key.id, 'id.test', inv.code, 'Alice'));
+  assert.equal(r.status, 403);
+  assert.match(r.body.error, /name taken/);
 });
 
 test('disabled accounts get nothing, by any method; account API refuses foreign tokens', async () => {

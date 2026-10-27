@@ -22,7 +22,7 @@
  * starting the sign-in again.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
@@ -88,7 +88,12 @@ export interface HumanDeps {
   fetchImpl?: FetchLike;
 }
 
-type LoginState = { audience: string; exp: number } & ({ intent: 'login' } | { intent: 'link'; sub: string });
+/** A link state is bound to the browser that asked for it (`nonce`, also in
+ *  an HttpOnly cookie): a link URL handed to someone else can't attach
+ *  THEIR Discord to the sender's account. */
+type LoginState = { audience: string; exp: number } & ({ intent: 'login' } | { intent: 'link'; sub: string; nonce: string });
+type FactorCheck = 'ok' | 'bad' | 'locked';
+const LINK_COOKIE = 'hn_link';
 type Who = { sub: string; name: string; grant: RoleGrant | null; account?: HumanAccount; note?: string };
 type Outcome = { ok: true; redirect: string } | { ok: false; status: number; error: string };
 
@@ -183,7 +188,7 @@ export class HumanAuth {
       else if (!this.d.allow(ip)) json(res, 429, { error: 'too many requests — wait a minute' });
       else if (p === '/login') this.loginPage(url, res);
       else if (p === '/login/discord') this.discordStart(url, res);
-      else if (p === '/oauth/callback') await this.callback(url, res);
+      else if (p === '/oauth/callback') await this.callback(req, url, res);
       else return false;
       return true;
     }
@@ -258,12 +263,19 @@ export class HumanAuth {
     );
   }
 
-  private async callback(url: URL, res: ServerResponse): Promise<void> {
+  private async callback(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     const state = url.searchParams.get('state') ?? '';
     const code = url.searchParams.get('code') ?? '';
     const st = this.states.take(state); // single-use, success or not
     if (!st) {
       return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
+    }
+    if (st.intent === 'link') {
+      res.setHeader('set-cookie', this.linkCookie('', 0)); // spent either way
+      if (!safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
+        console.error(`[hn] link refused for ${st.sub}: finished in a browser that didn't start it`);
+        return html(res, 403, page('link refused', '<p>Linking Discord has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
+      }
     }
     if (!code || !this.discordOn) {
       return html(res, 400, page('login failed', '<p>Discord did not complete the login.</p>'));
@@ -288,8 +300,16 @@ export class HumanAuth {
       if (other && other.sub !== st.sub) {
         return html(res, 409, page('already linked', `<p>That Discord account (<b>${esc(discordName)}</b>) is already linked to another account here.</p>`));
       }
-      const acct = this.d.accounts.update(st.sub, (a) => ({ ...a, discord: snapshot }));
-      if (!acct || acct.disabled) return html(res, 400, page('link failed', '<p>Account not found.</p>'));
+      let acct: HumanAccount | undefined;
+      try {
+        acct = this.d.accounts.update(st.sub, (a) => {
+          if (a.disabled || a.discord) throw new Error('account changed');
+          return { ...a, discord: snapshot };
+        });
+      } catch {
+        acct = undefined;
+      }
+      if (!acct) return html(res, 400, page('link failed', '<p>That account can’t take a Discord link right now. Start again from your sign-in settings.</p>'));
       console.error(`[hn] account: ${acct.sub} linked discord:${user.id} (${discordName})`);
       const out = this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'oauth');
       return out.ok ? redirect(res, out.redirect) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
@@ -343,12 +363,16 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (!t) return json(res, 400, { error: 'that step expired — sign in again' });
     const acct = this.d.accounts.bySub(t.sub);
     if (!acct?.totp) return json(res, 400, { error: 'that step expired — sign in again' });
-    if (this.totpFailures.locked(acct.sub)) {
+    if (acct.disabled) {
+      this.tickets.take(ticketId);
+      return json(res, 403, { error: 'this account is disabled' });
+    }
+    const check = this.checkSecondFactor(acct, String(b.code ?? ''));
+    if (check === 'locked') {
       this.tickets.take(ticketId);
       return json(res, 429, { error: 'too many wrong codes — wait 15 minutes, or use a passkey' });
     }
-    if (!this.checkSecondFactor(acct, String(b.code ?? ''))) {
-      this.totpFailures.fail(acct.sub);
+    if (check === 'bad') {
       t.tries += 1;
       if (t.tries >= 5) {
         this.tickets.take(ticketId);
@@ -357,25 +381,51 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       return json(res, 401, { error: 'wrong code' });
     }
     this.tickets.take(ticketId);
-    this.totpFailures.clear(acct.sub);
     return this.respond(res, await this.finishLogin(t.state, this.d.accounts.bySub(acct.sub)!, 'password'));
   }
 
-  /** A current TOTP code (each usable once) or an unused recovery code.
-   *  Consumes what it accepts. */
-  private checkSecondFactor(acct: HumanAccount, code: string): boolean {
-    if (!acct.totp) return false;
-    if (looksLikeRecoveryCode(code)) {
-      const h = sha256hex(normalizeRecovery(code));
-      if (!acct.recovery?.includes(h)) return false;
-      this.d.accounts.update(acct.sub, (a) => ({ ...a, recovery: (a.recovery ?? []).filter((x) => x !== h) }));
-      console.error(`[hn] account: ${acct.sub} used a recovery code (${acct.recovery.length - 1} left)`);
-      return true;
+  /**
+   * A current TOTP code (each usable once) or an unused recovery code —
+   * EVERY second-factor check goes through here, so the per-account lockout
+   * (10 wrong codes / 15 min) covers sign-in, setup links, turning 2FA off
+   * and new recovery codes alike. Consumes what it accepts.
+   */
+  private checkSecondFactor(acct: HumanAccount, code: string, opts: { recovery?: boolean } = {}): FactorCheck {
+    if (!acct.totp) return 'bad';
+    if (this.totpFailures.locked(acct.sub)) return 'locked';
+    const ok = looksLikeRecoveryCode(code) ? opts.recovery !== false && this.useRecoveryCode(acct, code) : this.useTotp(acct, code);
+    if (!ok) {
+      this.totpFailures.fail(acct.sub);
+      return 'bad';
     }
-    const step = verifyTotp(acct.totp.secret, code, { lastStep: acct.totp.lastStep });
-    if (step === null) return false;
-    this.d.accounts.update(acct.sub, (a) => (a.totp ? { ...a, totp: { ...a.totp, lastStep: step } } : a));
+    this.totpFailures.clear(acct.sub);
+    return 'ok';
+  }
+
+  private useRecoveryCode(acct: HumanAccount, code: string): boolean {
+    const h = sha256hex(normalizeRecovery(code));
+    let left = -1;
+    this.d.accounts.update(acct.sub, (a) => {
+      if (!a.recovery?.includes(h)) return a;
+      const recovery = a.recovery.filter((x) => x !== h);
+      left = recovery.length;
+      return { ...a, recovery };
+    });
+    if (left < 0) return false;
+    console.error(`[hn] account: ${acct.sub} used a recovery code (${left} left)`);
     return true;
+  }
+
+  private useTotp(acct: HumanAccount, code: string): boolean {
+    let ok = false;
+    this.d.accounts.update(acct.sub, (a) => {
+      // against the stored lastStep as it is now: a code is good once
+      const step = a.totp ? verifyTotp(a.totp.secret, code, { lastStep: a.totp.lastStep }) : null;
+      if (step === null || !a.totp) return a;
+      ok = true;
+      return { ...a, totp: { ...a.totp, lastStep: step } };
+    });
+    return ok;
   }
 
   private passkeyLoginBegin(res: ServerResponse, b: Record<string, unknown>): void {
@@ -420,7 +470,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private async finishLogin(state: string, acct: HumanAccount, by: MintRecord['by']): Promise<Outcome> {
     const st = this.states.get(state);
     if (!st || st.intent !== 'login') return { ok: false, status: 400, error: 'this sign-in page expired — reload it' };
-    const who = await this.resolve(acct);
+    const live = this.d.accounts.bySub(acct.sub);
+    if (!live || live.disabled) return { ok: false, status: 403, error: 'this account is disabled' };
+    const who = await this.resolve(live);
+    if (this.d.accounts.bySub(acct.sub)?.disabled) return { ok: false, status: 403, error: 'this account is disabled' };
     const out = this.issue(st.audience, who, by);
     if (out.ok) this.states.take(state);
     else console.error(`[hn] login refused: ${acct.sub} via ${by} — ${out.error}`);
@@ -510,7 +563,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
 
   private respond(res: ServerResponse, out: Outcome): void {
     if (out.ok) json(res, 200, { redirect: out.redirect });
-    else json(res, out.status, { error: out.status === 403 ? `signed in, but no access: ${out.error}` : out.error });
+    else json(res, out.status, { error: out.status === 403 && !/disabled/.test(out.error) ? `signed in, but no access: ${out.error}` : out.error });
   }
 
   // ── account page API (Bearer = an aud:"account" login token; 401 here
@@ -544,16 +597,20 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (existing) return existing;
     const m = /^human:discord:(\d+)$/.exec(t.sub);
     if (!m || this.d.accounts.byDiscord(m[1]!)) return null; // linked to another row since this token was minted
-    return this.d.accounts.add({
+    try {
+      return this.d.accounts.add({
       sub: t.sub,
       discord: {
         id: m[1]!,
         name: t.name,
         grant: t.scopes.length ? { scopes: t.scopes, ...(t.claims ? { claims: t.claims } : {}) } : null,
-        checkedAt: new Date(t.iat * 1000).toISOString(),
-      },
-      createdAt: new Date().toISOString(),
-    });
+          checkedAt: new Date(t.iat * 1000).toISOString(),
+        },
+        createdAt: new Date().toISOString(),
+      });
+    } catch {
+      return this.d.accounts.bySub(t.sub) ?? null; // another tab made it a moment ago
+    }
   }
 
   private view(t: Aid1Payload): Record<string, unknown> {
@@ -605,7 +662,11 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (!acct.username && usernameProblem(username, this.d.accounts, (n) => this.d.principals.nameTaken(n))) {
       return json(res, 409, { error: 'that username was just taken' });
     }
-    this.d.accounts.update(acct.sub, (a) => ({ ...a, username, password: hash }));
+    try {
+      this.d.accounts.update(acct.sub, (a) => ({ ...a, username: a.username ?? username, password: hash }));
+    } catch (err) {
+      return json(res, 409, { error: (err as Error).message });
+    }
     console.error(`[hn] account: ${acct.sub} ${cur?.password ? 'changed' : 'set'} password (username ${username})`);
     json(res, 200, this.view(t));
   }
@@ -639,7 +700,9 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private totpDisable(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
     const a = this.d.accounts.bySub(t.sub);
     if (!a?.totp) return json(res, 400, { error: 'two-factor is not on' });
-    if (!this.checkSecondFactor(a, String(b.code ?? ''))) return json(res, 400, { error: 'wrong code' });
+    const check = this.checkSecondFactor(a, String(b.code ?? ''));
+    if (check === 'locked') return json(res, 429, { error: 'too many wrong codes — wait 15 minutes' });
+    if (check === 'bad') return json(res, 400, { error: 'wrong code' });
     this.d.accounts.update(t.sub, (x) => {
       const { totp: _t, recovery: _r, ...rest } = x;
       return rest;
@@ -651,19 +714,25 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private recoveryRegenerate(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
     const a = this.d.accounts.bySub(t.sub);
     if (!a?.totp) return json(res, 400, { error: 'two-factor is not on' });
-    const code = String(b.code ?? '');
-    if (looksLikeRecoveryCode(code) || !this.checkSecondFactor(a, code)) {
-      return json(res, 400, { error: 'enter a current code from your authenticator app' });
-    }
+    const check = this.checkSecondFactor(a, String(b.code ?? ''), { recovery: false });
+    if (check === 'locked') return json(res, 429, { error: 'too many wrong codes — wait 15 minutes' });
+    if (check === 'bad') return json(res, 400, { error: 'enter a current code from your authenticator app' });
     const { codes, hashes } = newRecoveryCodes();
     this.d.accounts.update(t.sub, (x) => ({ ...x, recovery: hashes }));
     json(res, 200, { ...this.view(t), recoveryCodes: codes });
   }
 
   private passkeyAddBegin(res: ServerResponse, t: Aid1Payload): void {
-    const a = this.d.accounts.bySub(t.sub);
+    let a = this.d.accounts.bySub(t.sub);
     if ((a?.passkeys?.length ?? 0) >= 20) return json(res, 400, { error: 'that’s plenty of passkeys — remove one first' });
-    const userId = a?.webauthnUserId ?? randomBytes(16).toString('base64url');
+    // The WebAuthn user handle is saved BEFORE any options go out, so two
+    // tabs registering at once both use the one stored handle.
+    if (!a?.webauthnUserId) {
+      const row = this.ensureAccount(t);
+      if (!row) return json(res, 404, { error: 'no account' });
+      a = this.d.accounts.update(row.sub, (x) => (x.webauthnUserId ? x : { ...x, webauthnUserId: randomBytes(16).toString('base64url') }));
+    }
+    const userId = a!.webauthnUserId!;
     const challenge = randomBytes(32).toString('base64url');
     this.challenges.set(challenge, { kind: 'register', sub: t.sub, userId, exp: Date.now() + CHALLENGE_TTL_MS });
     const label = a?.username ?? (a ? displayName(a) : t.name);
@@ -689,15 +758,18 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     const v = verifyRegistration(cred, challenge, this.rp);
     if (!v.ok) return json(res, 400, { error: `passkey not accepted: ${v.reason}` });
     if (this.d.accounts.byPasskey(v.credentialId)) return json(res, 409, { error: 'that passkey is already registered' });
-    const acct = this.ensureAccount(t);
-    if (!acct) return json(res, 404, { error: 'no account' });
+    const acct = this.d.accounts.bySub(t.sub);
+    if (!acct || acct.webauthnUserId !== ch.userId) return json(res, 400, { error: 'passkey setup expired — try again' });
     const name = String(b.name ?? '').trim().slice(0, 40) || `passkey ${(acct.passkeys?.length ?? 0) + 1}`;
     const now = new Date().toISOString();
-    this.d.accounts.update(acct.sub, (a) => ({
-      ...a,
-      webauthnUserId: a.webauthnUserId ?? ch.userId,
-      passkeys: [...(a.passkeys ?? []), { id: v.credentialId, jwk: v.jwk, alg: v.alg, signCount: v.signCount, name, createdAt: now }],
-    }));
+    try {
+      this.d.accounts.update(acct.sub, (a) => ({
+        ...a,
+        passkeys: [...(a.passkeys ?? []), { id: v.credentialId, jwk: v.jwk, alg: v.alg, signCount: v.signCount, name, createdAt: now }],
+      }));
+    } catch (err) {
+      return json(res, 409, { error: (err as Error).message });
+    }
     console.error(`[hn] account: ${acct.sub} added passkey "${name}" (alg ${v.alg})`);
     json(res, 200, this.view(t));
   }
@@ -716,8 +788,17 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     const a = this.d.accounts.bySub(t.sub);
     if (!this.discordOn) return json(res, 400, { error: 'Discord login is not configured on this node' });
     if (!a || t.sub.startsWith('human:discord:') || a.discord) return json(res, 400, { error: 'nothing to link' });
-    const state = this.newState({ intent: 'link', sub: t.sub, audience: 'account', exp: Date.now() + STATE_TTL_MS });
+    const nonce = randomBytes(24).toString('base64url');
+    const state = this.newState({ intent: 'link', sub: t.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
+    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000));
     json(res, 200, { url: `${this.d.cfg.publicUrl}/login/discord?state=${state}` });
+  }
+
+  /** HttpOnly, scoped to the callback; Lax so Discord's redirect back (a
+   *  top-level GET) carries it. */
+  private linkCookie(value: string, maxAgeS: number): string {
+    const secure = this.d.cfg.publicUrl.startsWith('https:') ? '; Secure' : '';
+    return `${LINK_COOKIE}=${value}; Path=/oauth/callback; Max-Age=${maxAgeS}; HttpOnly; SameSite=Lax${secure}`;
   }
 
   private discordUnlink(res: ServerResponse, t: Aid1Payload): void {
@@ -764,15 +845,43 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     const bad = passwordProblem(b.password, username);
     if (bad) return json(res, 400, { error: bad });
     // A reset link doesn't get around two-factor that's still on.
-    if (a.totp && !this.checkSecondFactor(a, String(b.totp ?? ''))) {
-      return json(res, 401, { error: 'enter the code from your authenticator app (or a recovery code)' });
+    if (a.totp) {
+      const check = this.checkSecondFactor(a, String(b.totp ?? ''));
+      if (check === 'locked') return json(res, 429, { error: 'too many wrong codes — wait 15 minutes' });
+      if (check === 'bad') return json(res, 401, { error: 'enter the code from your authenticator app (or a recovery code)' });
     }
     const hash = await hashPassword(String(b.password));
-    const acct = this.d.accounts.update(a.sub, (x) => {
-      const { setup: _s, ...rest } = x;
-      return { ...rest, username, password: hash };
-    })!;
+    // Consumed under the store lock, against the file as it is now: a link
+    // raced by two requests (or reset by the CLI meanwhile) works once.
+    let acct: HumanAccount | undefined;
+    try {
+      acct = this.d.accounts.update(a.sub, (x) => {
+        if (x.setup?.hash !== a.setup!.hash || Date.parse(x.setup.exp) <= Date.now() || x.disabled) throw new Error('used');
+        const { setup: _s, ...rest } = x;
+        return { ...rest, username: x.username ?? username, password: hash };
+      });
+    } catch (err) {
+      const msg = (err as Error).message;
+      return msg === 'used'
+        ? json(res, 404, { error: 'this setup link is invalid, used, or expired — ask the operator for a new one' })
+        : json(res, 409, { error: msg }); // e.g. the username was just taken
+    }
+    if (!acct) return json(res, 404, { error: 'this setup link is invalid, used, or expired — ask the operator for a new one' });
     console.error(`[hn] account: ${acct.sub} completed setup link (username ${username})`);
     this.respond(res, this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'setup'));
   }
+}
+
+function cookie(req: IncomingMessage, name: string): string {
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return '';
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
 }

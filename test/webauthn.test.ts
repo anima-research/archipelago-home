@@ -6,15 +6,22 @@ import { cbor, SoftAuthenticator } from './helpers/authenticator.js';
 const RP = { rpId: 'id.test', origin: 'https://id.test' };
 const CH = 'Y2hhbGxlbmdlLWNoYWxsZW5nZS1jaGFsbGVuZ2UtMzI';
 
-for (const alg of [-7, -8] as const) {
-  test(`register + assert round trip (alg ${alg})`, () => {
+for (const alg of [-7, -8, -257] as const) {
+  test(`register + assert round trip, forged signature refused (alg ${alg})`, () => {
     const a = new SoftAuthenticator(alg, RP.origin, RP.rpId, { counting: alg === -7 });
     const reg = verifyRegistration(a.create({ challenge: CH, user: { id: 'dXNlcg' } }), CH, RP);
     assert.ok(reg.ok, !reg.ok ? reg.reason : '');
     assert.equal(reg.alg, alg);
     const cred = { jwk: reg.jwk, alg: reg.alg, signCount: reg.signCount };
-    const v = verifyAssertion(a.get({ challenge: 'c2Vjb25k' }), 'c2Vjb25k', RP, cred);
+    const good = a.get({ challenge: 'c2Vjb25k' });
+    const v = verifyAssertion(good, 'c2Vjb25k', RP, cred);
     assert.ok(v.ok, !v.ok ? v.reason : '');
+    const sig = Buffer.from(good.response.signature, 'base64url');
+    sig[sig.length - 1]! ^= 0x01;
+    const forged = { ...good, response: { ...good.response, signature: sig.toString('base64url') } };
+    assert.ok(!verifyAssertion(forged, 'c2Vjb25k', RP, { ...cred, signCount: 0 }).ok);
+    const other = new SoftAuthenticator(alg, RP.origin, RP.rpId);
+    assert.ok(!verifyAssertion(other.get({ challenge: CH }), CH, RP, { ...cred, signCount: 0 }).ok);
   });
 }
 

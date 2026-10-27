@@ -45,9 +45,14 @@ export class SoftAuthenticator {
   userHandle: string | null = null;
   /** Flags to put in authData (UP|UV by default). */
   flags = 0x05;
-  constructor(readonly alg: -7 | -8, readonly origin: string, readonly rpId: string, opts: { counting?: boolean } = {}) {
+  constructor(readonly alg: -7 | -8 | -257, readonly origin: string, readonly rpId: string, opts: { counting?: boolean } = {}) {
     this.counting = opts.counting ?? false;
-    if (alg === -7) {
+    if (alg === -257) {
+      const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+      const jwk = publicKey.export({ format: 'jwk' });
+      this.priv = privateKey;
+      this.cose = new Map<number, unknown>([[1, 3], [3, -257], [-1, Buffer.from(jwk.n!, 'base64url')], [-2, Buffer.from(jwk.e!, 'base64url')]]);
+    } else if (alg === -7) {
       const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
       const jwk = publicKey.export({ format: 'jwk' });
       this.priv = privateKey;
@@ -94,7 +99,10 @@ export class SoftAuthenticator {
     const ad = this.authData(false, override.rpId);
     const cd = this.clientData('webauthn.get', opts.challenge, override.origin);
     const signed = Buffer.concat([ad, createHash('sha256').update(cd).digest()]);
-    const signature = this.alg === -7 ? sign('sha256', signed, { key: this.priv, dsaEncoding: 'der' }) : sign(null, signed, this.priv);
+    const signature =
+      this.alg === -7 ? sign('sha256', signed, { key: this.priv, dsaEncoding: 'der' })
+        : this.alg === -257 ? sign('sha256', signed, this.priv) // RSASSA-PKCS1-v1_5
+          : sign(null, signed, this.priv);
     return {
       id: b64u(this.credentialId),
       type: 'public-key',

@@ -76,6 +76,9 @@ function main(): void {
       const ttl = flag.get('ttl') ?? '72h';
       const kind = (flag.get('kind') ?? 'agent') as PrincipalKind;
       let p = principals.all().find((x) => x.name.toLowerCase() === name.toLowerCase());
+      if (!p && new AccountStore(join(cfg.dataDir, 'accounts.json')).nameTaken(name)) {
+        die(`"${name}" is a person's username or display name here — pick another name`);
+      }
       if (p) {
         if (!principals.isLive(p)) die(`principal ${p.sub} is revoked/expired — un-revoke by editing principals.json`);
         console.error(`[hn] minting for existing principal ${p.sub}`);
@@ -259,6 +262,12 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     case 'set': {
       const a = find();
       const tier = flag.get('tier');
+      const newName = flag.get('name');
+      if (newName) {
+        const n = newName.trim().toLowerCase();
+        const clash = accounts.all().some((x) => x.sub !== a.sub && (x.username === n || x.name?.toLowerCase() === n));
+        if (clash || principals.nameTaken(n)) die(`the name "${newName}" is already in use here`);
+      }
       const next = accounts.update(a.sub, (x) => ({
         ...x,
         ...(scopesFlag ? { scopes: scopesFlag } : {}),

@@ -73,20 +73,38 @@ export interface AccountsFile {
 }
 
 function validateAccounts(raw: unknown): AccountsFile | null {
+  return accountsProblem(raw) ? null : (raw as AccountsFile);
+}
+
+/** Why a file can't be loaded (or written), or null. Writes are checked
+ *  too, so a race can't leave a file the next start would refuse. */
+function accountsProblem(raw: unknown): string | null {
   const f = raw as AccountsFile;
-  if (!f || !Array.isArray(f.accounts)) return null;
+  if (!f || !Array.isArray(f.accounts)) return 'not an accounts file';
   const subs = new Set<string>();
   const names = new Set<string>();
+  const discords = new Set<string>();
+  const passkeys = new Set<string>();
   for (const a of f.accounts) {
-    if (typeof a.sub !== 'string' || !a.sub.startsWith('human:') || subs.has(a.sub)) return null;
+    if (typeof a.sub !== 'string' || !a.sub.startsWith('human:')) return 'bad sub';
+    if (subs.has(a.sub)) return `duplicate sub ${a.sub}`;
     subs.add(a.sub);
     if (a.username !== undefined) {
-      if (typeof a.username !== 'string' || names.has(a.username)) return null;
+      if (typeof a.username !== 'string') return 'bad username';
+      if (names.has(a.username)) return `username "${a.username}" is taken`;
       names.add(a.username);
     }
-    if (a.scopes !== undefined && (!Array.isArray(a.scopes) || !a.scopes.every((s) => typeof s === 'string'))) return null;
+    if (a.discord) {
+      if (discords.has(a.discord.id)) return 'that Discord account is linked elsewhere';
+      discords.add(a.discord.id);
+    }
+    for (const p of a.passkeys ?? []) {
+      if (passkeys.has(p.id)) return 'that passkey is already registered';
+      passkeys.add(p.id);
+    }
+    if (a.scopes !== undefined && (!Array.isArray(a.scopes) || !a.scopes.every((s) => typeof s === 'string'))) return 'bad scopes';
   }
-  return f;
+  return null;
 }
 
 // ── store ──
@@ -130,23 +148,43 @@ export class AccountStore {
     return undefined;
   }
 
+  /** A username or display-name override already in use (case-insensitive). */
+  nameTaken(name: string): boolean {
+    const n = name.trim().toLowerCase();
+    return this.all().some((a) => a.username === n || a.name?.toLowerCase() === n);
+  }
+
+  /** Throws (writing nothing) on a duplicate sub, username, Discord link or passkey. */
   add(a: HumanAccount): HumanAccount {
-    if (this.bySub(a.sub)) throw new Error(`account ${a.sub} exists`);
-    if (a.username && this.byUsername(a.username)) throw new Error(`username "${a.username}" is taken`);
-    if (a.discord && this.byDiscord(a.discord.id)) throw new Error('that Discord account is linked elsewhere');
-    this.store.set({ accounts: [...this.all(), a] });
+    this.store.update((f) => {
+      if (f.accounts.some((x) => x.sub === a.sub)) throw new Error(`account ${a.sub} exists`);
+      return checked({ accounts: [...f.accounts, a] });
+    });
     return a;
   }
 
-  /** Read-modify-write against the freshest file. `fn` returns the new record. */
+  /**
+   * Read-modify-write of one account against the file as it is now, under a
+   * lock the hn CLI shares, so neither side drops the other's change. `fn`
+   * returns the new record, or throws to abort (nothing written). Throws if
+   * the result would duplicate a username, Discord link or passkey.
+   */
   update(sub: string, fn: (a: HumanAccount) => HumanAccount): HumanAccount | undefined {
-    const list = this.all();
-    const cur = list.find((a) => a.sub === sub);
-    if (!cur) return undefined;
-    const next = fn(structuredClone(cur));
-    this.store.set({ accounts: list.map((a) => (a.sub === sub ? next : a)) });
+    let next: HumanAccount | undefined;
+    this.store.update((f) => {
+      const cur = f.accounts.find((a) => a.sub === sub);
+      if (!cur) return f;
+      next = fn(structuredClone(cur));
+      return checked({ accounts: f.accounts.map((a) => (a.sub === sub ? next! : a)) });
+    });
     return next;
   }
+}
+
+function checked(f: AccountsFile): AccountsFile {
+  const bad = accountsProblem(f);
+  if (bad) throw new Error(bad);
+  return f;
 }
 
 // ── usernames ──
@@ -168,7 +206,7 @@ export function usernameProblem(raw: string, accounts: AccountStore, takenElsewh
   const u = normalizeUsername(raw);
   if (!USERNAME_RE.test(u)) return 'usernames are 3–32 characters: a–z, 0–9, and . _ - (not at the ends)';
   if (RESERVED.has(u)) return 'that username is reserved';
-  if (accounts.byUsername(u) || takenElsewhere(u)) return 'that username is taken';
+  if (accounts.nameTaken(u) || takenElsewhere(u)) return 'that username is taken';
   return null;
 }
 
@@ -243,8 +281,10 @@ export function normalizeRecovery(code: string): string {
   return code.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+/** Ten characters once spaces and dashes go — never mistaken for a 6-digit
+ *  TOTP code, whatever mix of letters and digits it drew. */
 export function looksLikeRecoveryCode(code: string): boolean {
-  return normalizeRecovery(code).length === 10 && !/^\d+$/.test(normalizeRecovery(code));
+  return normalizeRecovery(code).length === 10;
 }
 
 export const SETUP_LIFETIME_MS = 72 * 3_600_000;

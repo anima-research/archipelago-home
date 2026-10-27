@@ -127,6 +127,7 @@ export class HomeNode {
       invites: this.invites,
       mintLog: this.mintLog,
       knownAudiences: () => Object.keys(this.audiences.get()),
+      nameTaken: (n) => this.accounts.nameTaken(n),
     };
   }
 

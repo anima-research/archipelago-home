@@ -6,10 +6,13 @@
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
@@ -92,11 +95,28 @@ export class JsonStore<T> {
     return this.value;
   }
 
+  /**
+   * Read-modify-write under a lock shared with other processes (an O_EXCL
+   * lock file beside the data file), re-reading the file inside the lock —
+   * for stores that both the server and the hn CLI write, so neither drops
+   * the other's change. `fn` throwing aborts with nothing written.
+   */
+  update(fn: (cur: T) => T): T {
+    return withFileLock(`${this.path}.lock`, () => {
+      const fresh = this.loadOnce();
+      if (fresh !== null) this.value = fresh;
+      const next = fn(this.value);
+      this.set(next);
+      return next;
+    });
+  }
+
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
     this.value = next;
     mkdirSync(dirname(this.path), { recursive: true });
-    const tmp = `${this.path}.tmp`;
+    // Per-writer tmp name: the server and the CLI never share one.
+    const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', this.mode !== undefined ? { mode: this.mode } : undefined);
     if (this.mode !== undefined) chmodSync(tmp, this.mode); // mode only applies on create
     renameSync(tmp, this.path);
@@ -104,6 +124,46 @@ export class JsonStore<T> {
       this.lastMtime = statSync(this.path).mtimeMs; // suppress self-reload
     } catch {
       /* ignore */
+    }
+  }
+}
+
+const LOCK_WAIT_MS = 5_000;
+const LOCK_STALE_MS = 10_000;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+
+/** Run `fn` holding `lockPath` (created O_EXCL). Holders keep it for a
+ *  read-parse-write — milliseconds — so waiters spin briefly; a lock older
+ *  than LOCK_STALE_MS is a crashed holder's and is broken. */
+export function withFileLock<R>(lockPath: string, fn: () => R): R {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let fd: number | null = null;
+  while (fd === null) {
+    try {
+      mkdirSync(dirname(lockPath), { recursive: true });
+      fd = openSync(lockPath, 'wx', 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        continue; // released between our open and stat
+      }
+      if (Date.now() > deadline) throw new Error(`${lockPath} held for over ${LOCK_WAIT_MS} ms`);
+      Atomics.wait(sleeper, 0, 0, 5);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    closeSync(fd);
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      /* already gone */
     }
   }
 }

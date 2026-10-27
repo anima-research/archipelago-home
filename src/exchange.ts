@@ -25,6 +25,10 @@ export interface ExchangeDeps {
   mintLog: MintLog;
   /** Known audience ids (from audiences.json) — absent audience = rejected. */
   knownAudiences: () => string[];
+  /** Names held outside the principal registry (human account usernames and
+   *  display names): an agent may not enroll as "alice" if a person signs in
+   *  as alice. */
+  nameTaken?: (name: string) => boolean;
   nowMs?: () => number;
 }
 
@@ -145,7 +149,7 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   const proofErr = checkProof(req.proof, req.id, enrollStatement(deps.iss, req.invite, req.timestamp));
   if (proofErr) return fail(403, proofErr);
 
-  if (deps.principals.nameTaken(req.name)) return fail(403, 'name taken');
+  if (deps.principals.nameTaken(req.name) || deps.nameTaken?.(req.name)) return fail(403, 'name taken');
   if (deps.principals.byKey(req.id)) return fail(403, 'key already enrolled');
 
   // An invite resolves to a NEW principal (archipelago rule 6). The anchor

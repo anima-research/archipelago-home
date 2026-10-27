@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -47,6 +47,7 @@ test('recovery codes: ten, distinct, hashed, recognisable', () => {
     assert.equal(hashes[i], sha256hex(normalizeRecovery(` ${c.toUpperCase()} `)));
   }
   assert.ok(!looksLikeRecoveryCode('123456'));
+  assert.ok(looksLikeRecoveryCode('23456-78923')); // all digits is a possible draw, and must still work
 });
 
 test('store: 0600 file, lookups, uniqueness, and a CLI edit is seen before the next write', () => {
@@ -63,6 +64,23 @@ test('store: 0600 file, lookups, uniqueness, and a CLI edit is seen before the n
   store.update('human:discord:1', (a) => ({ ...a, username: 'one' }));
   const final = new AccountStore(path).all().map((a) => a.sub).sort();
   assert.deepEqual(final, ['human:discord:1', 'human:local:bob']);
+});
+
+test('store: a write that would duplicate a username is refused, file untouched', () => {
+  const { path, store } = fresh();
+  store.add({ sub: 'human:local:a', username: 'same', createdAt: '' });
+  store.add({ sub: 'human:local:b', createdAt: '' });
+  assert.throws(() => store.update('human:local:b', (x) => ({ ...x, username: 'same' })), /taken/);
+  assert.equal(new AccountStore(path).bySub('human:local:b')?.username, undefined);
+});
+
+test('store: a crashed writer’s stale lock is broken, a live one waited for', () => {
+  const { path, store } = fresh();
+  writeFileSync(`${path}.lock`, '');
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(`${path}.lock`, old, old);
+  store.add({ sub: 'human:local:c', createdAt: '' }); // would time out if the stale lock held
+  assert.equal(existsSync(`${path}.lock`), false);
 });
 
 test('store: a hand-edit that breaks the file keeps the previous good state', () => {
