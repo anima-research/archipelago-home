@@ -134,7 +134,8 @@ test('an anchored invite carries the full resident grant, whatever the sponsor h
   const r = mintSponsoredInvite(invites, anchor, 'resident', { anchorDomain: 'id.test', knownAudiences: KNOWN });
   assert.ok(r.ok);
   assert.deepEqual([...r.invite.scopes].sort(), RESIDENT);
-  assert.deepEqual(r.invite.audiences, ['board', 'body', 'canon', 'clawblox-mesa', 'docs', 'eidoverse', 'music', 'orrery']);
+  // eidoverse first: enrollment's token is for audiences[0]
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'board', 'body', 'canon', 'clawblox-mesa', 'docs', 'music', 'orrery']);
   assert.equal(r.invite.tokenTtl, '7d');
   // never LESS than a plain invite: extra delegable scopes the sponsor holds survive
   const builder = { ...anchor, scopes: [...anchor.scopes, 'worlds:build'] };
@@ -160,6 +161,9 @@ test('end-to-end: anchored invite → enroll → resident at the home domain', (
   const agentKey = generateKey();
   const res = handleEnroll(makeEnrollRequest(agentKey.privateKey, agentKey.id, 'id.test', minted.invite.code, 'Sona'), deps);
   assert.equal(res.status, 200);
+  // the token handed back at enrollment is one the agent can use straight away
+  const tok = verifyToken((res.body as { token: string }).token, { issuerId: issuer.id, iss: 'id.test', aud: 'eidoverse' });
+  assert.ok(tok.ok, !tok.ok ? tok.reason : '');
   const p = principals.bySub('agent:sona@id.test')!;
   assert.ok(p);
   assert.deepEqual([...p.scopes].sort(), RESIDENT);

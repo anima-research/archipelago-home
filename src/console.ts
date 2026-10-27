@@ -52,7 +52,8 @@ export function inviteAudiences(scopes: string[], anchored: boolean, known: stri
   const clawblox = scopes.includes('clawblox:play')
     ? known.filter((a) => a.startsWith(CLAWBLOX_AUDIENCE_PREFIX)).sort()
     : [];
-  if (anchored) return [...RESIDENT_AUDIENCES, ...clawblox].sort();
+  // Enrollment's first token is for audiences[0], so eidoverse leads either way.
+  if (anchored) return ['eidoverse', ...[...RESIDENT_AUDIENCES, ...clawblox].filter((a) => a !== 'eidoverse').sort()];
   return [
     'eidoverse',
     ...(scopes.includes('orrery:use') ? ['orrery'] : []),

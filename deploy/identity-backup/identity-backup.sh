@@ -49,12 +49,26 @@ paths=(
 [ -f /etc/nginx/sites-available/id.animalabs.ai ] && paths+=(etc/nginx/sites-available/id.animalabs.ai)
 
 # Checksums travel inside the encrypted tar, so a restore can be verified.
-( cd / && find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum ) > "$work/MANIFEST.sha256"
-files=$(wc -l < "$work/MANIFEST.sha256")
+manifest() { ( cd / && find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum ); }
 
-tar --numeric-owner -cf - -C / "${paths[@]}" -C "$work" MANIFEST.sha256 \
-  | zstd -q -19 \
-  | age -R "$CONF/recipients.txt" -o "$work/$name"
+# The service keeps running (and writing: logins append to minted.jsonl, an
+# enrollment rewrites invites.json and principals.json together). So: hash,
+# archive, hash again. If nothing changed while tar read, the archive is one
+# consistent view and the manifest inside it describes exactly what it holds;
+# if something did, take it again. Plaintext still never touches the disk.
+stable=
+for attempt in 1 2 3 4 5; do
+  manifest > "$work/MANIFEST.sha256"
+  rm -f "$work/$name"
+  tar --numeric-owner -cf - -C / "${paths[@]}" -C "$work" MANIFEST.sha256 \
+    | zstd -q -19 \
+    | age -R "$CONF/recipients.txt" -o "$work/$name"
+  if manifest | cmp -s - "$work/MANIFEST.sha256"; then stable=1; break; fi
+  log "files changed while archiving (attempt $attempt) — taking it again"
+  sleep 3
+done
+[ -n "$stable" ] || { log "files kept changing across 5 attempts — no consistent archive, nothing uploaded"; exit 1; }
+files=$(wc -l < "$work/MANIFEST.sha256")
 rm -f "$work/MANIFEST.sha256"
 
 size=$(stat -c %s "$work/$name")
@@ -64,17 +78,33 @@ rclone copyto "$work/$name" "$REMOTE/daily/$name"
 rclone lsf "$REMOTE/daily/$name" | grep -qx "$name" || { log "upload not visible at $REMOTE/daily/$name"; exit 1; }
 log "uploaded $name ($size bytes, $files files)"
 
+# A listing that fails fails the run, instead of reading as "empty": an
+# unreadable monthly/ must not look like "no copy this month yet", nor an
+# unreadable daily/ like "nothing to prune". The one exception is rclone's
+# exit 3, "directory not found" — a prefix nothing has been written under
+# yet (monthly/ before the first monthly copy), which really is empty.
+list() {
+  local out rc=0
+  out=$(rclone lsf "$1") || rc=$?
+  # (runs inside $(…): its log goes to stderr, or it would land in the variable)
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || { log "listing $1 failed (rclone exit $rc) — not pruning or copying on a guess" >&2; exit 1; }
+  printf '%s' "$out"
+}
+
 # One copy per month, never pruned.
-if ! rclone lsf "$REMOTE/monthly/" 2>/dev/null | grep -q "^identity-$month"; then
+monthly=$(list "$REMOTE/monthly/")
+if ! printf '%s\n' "$monthly" | grep -q "^identity-$month"; then
   rclone copyto "$work/$name" "$REMOTE/monthly/$name"
   log "monthly copy $name"
 fi
 
 # Prune daily/ to the newest KEEP_DAILY, touching only names this script writes.
-mapfile -t daily < <(rclone lsf "$REMOTE/daily/" | grep -E '^identity-[0-9]{8}T[0-9]{6}Z\.tar\.zst\.age$' | sort)
-excess=$(( ${#daily[@]} - KEEP_DAILY ))
+listing=$(list "$REMOTE/daily/")
+daily=$(printf '%s\n' "$listing" | grep -E '^identity-[0-9]{8}T[0-9]{6}Z\.tar\.zst\.age$' | sort || true)
+count=$(printf '%s' "$daily" | grep -c . || true)
+excess=$(( count - KEEP_DAILY ))
 if [ "$excess" -gt 0 ]; then
-  for old in "${daily[@]:0:$excess}"; do
+  printf '%s\n' "$daily" | head -n "$excess" | while read -r old; do
     rclone deletefile "$REMOTE/daily/$old"
     log "pruned $old"
   done
