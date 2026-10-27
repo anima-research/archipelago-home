@@ -99,14 +99,15 @@ export class JsonStore<T> {
    * Read-modify-write under a lock shared with other processes (an O_EXCL
    * lock file beside the data file), re-reading the file inside the lock —
    * for stores that both the server and the hn CLI write, so neither drops
-   * the other's change. `fn` throwing aborts with nothing written.
+   * the other's change. `fn` throwing aborts with nothing written; `fn`
+   * returning its argument unchanged writes nothing either.
    */
   update(fn: (cur: T) => T): T {
     return withFileLock(`${this.path}.lock`, () => {
       const fresh = this.loadOnce();
       if (fresh !== null) this.value = fresh;
       const next = fn(this.value);
-      this.set(next);
+      if (next !== this.value) this.set(next); // fn returning its input = nothing changed, nothing written
       return next;
     });
   }

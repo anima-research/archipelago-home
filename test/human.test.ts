@@ -4,7 +4,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HomeNode, type ServerConfig } from '../src/server.js';
@@ -391,6 +391,35 @@ test('two tabs registering passkeys at once: both passkeys sign in', async () =>
     const done = await post('/login/passkey/finish', { state, credential: k.get(opts.body.publicKey) });
     assert.equal(done.status, 200, JSON.stringify(done.body));
   }
+});
+
+test('a person may take their own display name as their username', async () => {
+  await node.accounts.add({
+    sub: 'human:discord:43', name: 'zed',
+    discord: { id: '43', name: 'Zed', grant: { scopes: ['worlds:join'] }, checkedAt: new Date().toISOString() },
+    createdAt: '',
+  });
+  discordUser = { id: '43', username: 'zed_dc', global_name: 'Zed' };
+  discordRoles = ['r-member'];
+  const tok = rawToken((await discordLogin('account')).location!);
+  const r = await post('/account/password', { username: 'Zed', password: 'zed password 1' }, tok);
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.body.username, 'zed');
+  // …but nobody else may
+  discordUser = { id: '44', username: 'other', global_name: 'Other' };
+  const tok2 = rawToken((await discordLogin('account')).location!);
+  assert.match((await post('/account/password', { username: 'zed', password: 'other password 1' }, tok2)).body.error, /taken/);
+});
+
+test('wrong codes don’t touch the account file', async () => {
+  const file = join(node.cfg.dataDir, 'accounts.json');
+  const t = await passwordLogin('alice', 'alice password 1', 'eidoverse');
+  assert.equal(t.body.next, 'totp');
+  const before = { mtime: statSync(file).mtimeMs, body: readFileSync(file, 'utf8') };
+  assert.equal((await post('/login/totp', { ticket: t.body.ticket, code: '000000' })).status, 401);
+  assert.equal((await post('/login/totp', { ticket: t.body.ticket, code: 'zzzzz-zzzzz' })).status, 401);
+  assert.equal(statSync(file).mtimeMs, before.mtime);
+  assert.equal(readFileSync(file, 'utf8'), before.body);
 });
 
 test('an agent can’t enroll under a person’s username', async () => {

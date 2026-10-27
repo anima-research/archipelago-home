@@ -148,10 +148,12 @@ export class AccountStore {
     return undefined;
   }
 
-  /** A username or display-name override already in use (case-insensitive). */
-  nameTaken(name: string): boolean {
+  /** A username or display-name override already in use (case-insensitive),
+   *  by anyone other than `exceptSub` — your own display name is yours to
+   *  take as a username. */
+  nameTaken(name: string, exceptSub?: string): boolean {
     const n = name.trim().toLowerCase();
-    return this.all().some((a) => a.username === n || a.name?.toLowerCase() === n);
+    return this.all().some((a) => a.sub !== exceptSub && (a.username === n || a.name?.toLowerCase() === n));
   }
 
   /** Throws (writing nothing) on a duplicate sub, username, Discord link or passkey. */
@@ -175,6 +177,7 @@ export class AccountStore {
       const cur = f.accounts.find((a) => a.sub === sub);
       if (!cur) return f;
       next = fn(structuredClone(cur));
+      if (JSON.stringify(next) === JSON.stringify(cur)) return f; // unchanged: no write
       return checked({ accounts: f.accounts.map((a) => (a.sub === sub ? next! : a)) });
     });
     return next;
@@ -202,11 +205,17 @@ export function normalizeUsername(u: string): string {
 /** Why a username can't be used, or null. `takenElsewhere` checks names
  *  held outside the account store (principal display names: an agent
  *  called "fable" means no human may log in as "fable"). */
-export function usernameProblem(raw: string, accounts: AccountStore, takenElsewhere: (n: string) => boolean): string | null {
+export function usernameProblem(
+  raw: string,
+  accounts: AccountStore,
+  takenElsewhere: (n: string) => boolean,
+  /** The account choosing it — its own display name doesn't count against it. */
+  forSub?: string,
+): string | null {
   const u = normalizeUsername(raw);
   if (!USERNAME_RE.test(u)) return 'usernames are 3–32 characters: a–z, 0–9, and . _ - (not at the ends)';
   if (RESERVED.has(u)) return 'that username is reserved';
-  if (accounts.nameTaken(u) || takenElsewhere(u)) return 'that username is taken';
+  if (accounts.nameTaken(u, forSub) || takenElsewhere(u)) return 'that username is taken';
   return null;
 }
 

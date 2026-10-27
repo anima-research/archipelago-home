@@ -404,6 +404,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
 
   private useRecoveryCode(acct: HumanAccount, code: string): boolean {
     const h = sha256hex(normalizeRecovery(code));
+    if (!acct.recovery?.includes(h)) return false; // wrong: no lock, no write
     let left = -1;
     this.d.accounts.update(acct.sub, (a) => {
       if (!a.recovery?.includes(h)) return a;
@@ -417,6 +418,9 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   }
 
   private useTotp(acct: HumanAccount, code: string): boolean {
+    // Wrong or replayed against the row we hold: no lock, no write. Right:
+    // re-checked under the lock against the stored lastStep, then recorded.
+    if (!acct.totp || verifyTotp(acct.totp.secret, code, { lastStep: acct.totp.lastStep }) === null) return false;
     let ok = false;
     this.d.accounts.update(acct.sub, (a) => {
       // against the stored lastStep as it is now: a code is good once
@@ -649,7 +653,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     let username = cur?.username;
     if (!username) {
       const want = normalizeUsername(String(b.username ?? ''));
-      const bad = usernameProblem(want, this.d.accounts, (n) => this.d.principals.nameTaken(n));
+      const bad = usernameProblem(want, this.d.accounts, (n) => this.d.principals.nameTaken(n), t.sub);
       if (bad) return json(res, 400, { error: bad });
       username = want;
     }
@@ -659,7 +663,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     const acct = this.ensureAccount(t);
     if (!acct) return json(res, 404, { error: 'no account' });
     // Re-check the name under the write: two tabs racing for one username.
-    if (!acct.username && usernameProblem(username, this.d.accounts, (n) => this.d.principals.nameTaken(n))) {
+    if (!acct.username && usernameProblem(username, this.d.accounts, (n) => this.d.principals.nameTaken(n), acct.sub)) {
       return json(res, 409, { error: 'that username was just taken' });
     }
     try {
@@ -838,7 +842,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     let username = a.username;
     if (!username) {
       const want = normalizeUsername(String(b.username ?? ''));
-      const bad = usernameProblem(want, this.d.accounts, (n) => this.d.principals.nameTaken(n));
+      const bad = usernameProblem(want, this.d.accounts, (n) => this.d.principals.nameTaken(n), a.sub);
       if (bad) return json(res, 400, { error: bad });
       username = want;
     }
