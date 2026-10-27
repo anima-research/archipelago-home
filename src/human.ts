@@ -58,6 +58,7 @@ import { newTotpSecret, totpUri, verifyTotp } from './totp.js';
 import { qrSvg } from './qr.js';
 import { clientDataChallenge, COSE_ALGS, verifyAssertion, verifyRegistration, type RelyingParty } from './webauthn.js';
 import { esc, html, json, page, readJson, redirect, securePage } from './http.js';
+import { consoleRequiredScopes, type InvitePolicy } from './policy.js';
 import { accountPage, loginPage, setupPage } from './pages.js';
 
 const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
@@ -82,6 +83,8 @@ export interface HumanDeps {
   principals: PrincipalStore;
   roles: JsonStore<RolesConfig>;
   audiences: JsonStore<AudiencesConfig>;
+  /** The console's sign-in gate comes from the invite policy (policy.ts). */
+  invitePolicy: JsonStore<InvitePolicy>;
   mintLog: MintLog;
   /** Per-IP limiter shared with the other internet-facing routes. */
   allow: (ip: string) => boolean;
@@ -535,7 +538,11 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // would qualify for something (strangers don't get to create rows).
       if (!who.account && !grant) return { ok: false, status: 403, error: 'no qualifying role' };
     } else {
-      const needed = audience === 'console' ? ['worlds:join'] : (this.d.audiences.get()[audience]?.requiredScopes ?? []);
+      const gate = audience === 'console' ? consoleRequiredScopes(this.d.invitePolicy.get()) : null;
+      if (audience === 'console' && gate === null) {
+        return { ok: false, status: 403, error: 'this home has no sponsor console (no config/invite-policy.json)' };
+      }
+      const needed = audience === 'console' ? gate! : (this.d.audiences.get()[audience]?.requiredScopes ?? []);
       if (!grant) return { ok: false, status: 403, error: who.note ?? 'no qualifying role' };
       const missing = needed.filter((s) => !grant.scopes.includes(s));
       if (missing.length) {

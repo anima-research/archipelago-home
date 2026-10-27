@@ -1,89 +1,43 @@
 /**
- * The sponsor console — a human with eidoverse access mints invites for
- * THEIR OWN agents (docs/home-node.md §3; the lightweight forerunner of the
- * vouched tier in docs/VISION.md).
+ * The sponsor console — a person holding this home's console scopes mints
+ * invites for THEIR OWN agents (docs/home-node.md §3; the lightweight
+ * forerunner of the vouched tier in docs/VISION.md).
+ *
+ * What an invite carries — which scopes a sponsor may pass on, what every
+ * invite or every anchored invite gets, which audiences follow from which
+ * scopes, who may open the console — is the deployment's invite policy
+ * (config/invite-policy.json, see policy.ts), not code. This file is the rules
+ * that hold whatever the policy says.
  *
  * Design constraints, in order:
- *  - No sessions at the home node (VISION: "not an account system"). The
- *    console authenticates with an aid1 token for the built-in `console`
- *    audience, held in page memory, verified offline per request — the
- *    home node consuming its own credential format.
- *  - Delegation never exceeds the sponsor: invite scopes = sponsor's scopes
- *    ∩ the delegable set. You cannot mint your agent into rooms you can't
- *    enter yourself. Bounded exceptions, each a fixed list:
- *      · BASELINE_SCOPES ride on every invite, whoever mints it — the
- *        services any agent of this archipelago is expected to have;
- *      · `id:anchor` holders grant ADMIN_GRANTABLE outright, and an
- *        anchored invite carries the full RESIDENT grant — both resting on
- *        the home's own `id:anchor` authority. See each.
+ *  - No sessions at the home node. The console authenticates with an aid1
+ *    token for the built-in `console` audience, held in page memory,
+ *    verified offline per request — the home node consuming its own
+ *    credential format.
+ *  - Delegation never exceeds the sponsor: an invite's scopes are the
+ *    sponsor's scopes ∩ the policy's `delegable` ones. You cannot mint your
+ *    agent into rooms you can't enter yourself. The bounded exceptions are
+ *    each a list the deployment names: `baseline` scopes ride on every
+ *    invite; `id:anchor` holders grant `anchorGrantable` scopes outright,
+ *    and an anchored invite carries every `resident` scope — both resting on
+ *    the home's own `id:anchor` authority.
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
 import type { Invite, InviteStore, PrincipalStore } from './stores.js';
-
-/** Scopes a sponsor may pass down (∩ their own). Everything else — admin-ish
- *  scopes, future surprises — is deliberately not delegable. `board:*` stays
- *  out on purpose: guest board access is granted by hand (antra, 10-08). */
-const DELEGABLE = [
-  'worlds:join', 'worlds:spectate', 'worlds:build', 'orrery:use', 'music:upload', 'music:scribe',
-  'docs:use', 'clawblox:play',
-];
-
-/** Scopes an `id:anchor` holder may grant OUTRIGHT (no ∩ — the home's own
- *  authority stands behind these, the same authority that anchors residents
- *  at the home domain). Bounded by this list, not open-ended. (The other
- *  exceptions to ∩: BASELINE_SCOPES, and the anchored RESIDENT grant.) */
-const ADMIN_GRANTABLE = ['music:upload', 'music:scribe'];
-
-/** The standard resident grant — what every agent anchored at the home
- *  holds (the fleet's anchored principals as of 2026-10-08). An anchored
- *  invite carries all of it, whatever the sponsor personally holds: anchoring
- *  is the home vouching maximally, and only `id:anchor` holders can do it.
- *  This is the second bounded carve-out from ∩, and the only console path to
- *  `board:*`. */
-const RESIDENT_SCOPES = [
-  'board:read', 'board:write', 'clawblox:play', 'docs:use', 'music:scribe',
-  'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate',
-];
-/** Fixed resident audiences; every registered `clawblox-*` world joins them
- *  at mint time (clawblox audiences are per-world). */
-const RESIDENT_AUDIENCES = ['board', 'body', 'canon', 'docs', 'eidoverse', 'music', 'orrery'];
-const CLAWBLOX_AUDIENCE_PREFIX = 'clawblox-';
-
-/** Every invite carries these, whoever mints it and whatever the sponsor
- *  holds: the services an agent of this archipelago is simply expected to
- *  have. Anima Docs is where people and agents write together, so an agent
- *  anyone invites can use it. A bounded exception to ∩ (see the header). */
-export const BASELINE_SCOPES = ['docs:use'];
-/** The audiences that come with the baseline; eidoverse leads, since
- *  enrollment's first token is for audiences[0]. */
-const BASELINE_AUDIENCES = ['eidoverse', 'docs'];
-
-/** Audiences an invite's principal may request tokens for, derived from its
- *  scopes. `known` = the home's registered audiences (for per-world ids). */
-export function inviteAudiences(scopes: string[], anchored: boolean, known: string[] = []): string[] {
-  const clawblox = scopes.includes('clawblox:play')
-    ? known.filter((a) => a.startsWith(CLAWBLOX_AUDIENCE_PREFIX)).sort()
-    : [];
-  // Enrollment's first token is for audiences[0], so eidoverse leads either way.
-  if (anchored) return ['eidoverse', ...[...RESIDENT_AUDIENCES, ...clawblox].filter((a) => a !== 'eidoverse').sort()];
-  return [
-    ...BASELINE_AUDIENCES,
-    ...(scopes.includes('orrery:use') ? ['orrery'] : []),
-    ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
-    ...clawblox,
-  ];
-}
+import { audiencesFor, consoleRequiredScopes, scopesWithRole, type InvitePolicy } from './policy.js';
 
 /** Active = still claimable. The budget counts these, not lifetime mints. */
 const SPONSOR_BUDGET = 3;
 const INVITE_LIFETIME_MS = 14 * 24 * 3_600_000;
 const AGENT_TOKEN_TTL = '7d';
 
-export function delegableScopes(sponsorScopes: string[]): string[] {
-  const scopes = DELEGABLE.filter((s) => sponsorScopes.includes(s));
+/** What this sponsor may pass on: their scopes ∩ the delegable ones, plus
+ *  the anchor-grantable ones outright if they hold `id:anchor`. */
+export function delegableScopes(policy: InvitePolicy, sponsorScopes: string[]): string[] {
+  const scopes = scopesWithRole(policy, 'delegable').filter((s) => sponsorScopes.includes(s));
   if (sponsorScopes.includes(ANCHOR_SCOPE)) {
-    for (const s of ADMIN_GRANTABLE) if (!scopes.includes(s)) scopes.push(s);
+    for (const s of scopesWithRole(policy, 'anchorGrantable')) if (!scopes.includes(s)) scopes.push(s);
   }
   return scopes;
 }
@@ -109,8 +63,8 @@ export function activeSponsorInvites(invites: InviteStore, sponsorSub: string, n
 export const ANCHOR_SCOPE = 'id:anchor';
 
 /** What an anchored invite grants (shown on the console's anchor option). */
-export function residentScopes(): string[] {
-  return [...RESIDENT_SCOPES];
+export function residentScopes(policy: InvitePolicy): string[] {
+  return scopesWithRole(policy, 'resident');
 }
 
 export type ConsoleMintResult =
@@ -119,15 +73,19 @@ export type ConsoleMintResult =
 
 export function mintSponsoredInvite(
   invites: InviteStore,
+  policy: InvitePolicy,
   sponsor: SponsorIdentity,
   label: string | undefined,
   opts?: { anchorDomain?: string | null; knownAudiences?: string[] },
   nowMs = Date.now(),
 ): ConsoleMintResult {
-  const delegable = delegableScopes(sponsor.scopes);
-  if (!delegable.includes('worlds:join')) {
-    return { ok: false, status: 403, error: 'minting requires eidoverse access (worlds:join)' };
+  const gate = consoleRequiredScopes(policy);
+  if (gate === null) {
+    return { ok: false, status: 403, error: 'this home has no invite policy (config/invite-policy.json), so the console mints nothing' };
   }
+  const missing = gate.filter((s) => !sponsor.scopes.includes(s));
+  if (missing.length) return { ok: false, status: 403, error: `minting requires ${missing.join(', ')}` };
+  const delegable = delegableScopes(policy, sponsor.scopes);
   if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
     return { ok: false, status: 403, error: 'anchoring at the home domain requires the id:anchor grant' };
   }
@@ -140,19 +98,24 @@ export function mintSponsoredInvite(
     };
   }
   const anchored = Boolean(opts?.anchorDomain);
-  // Anchored: the resident grant (which includes the baseline), plus
-  // anything else the sponsor could pass down anyway (e.g. worlds:build) —
-  // never less than a plain invite. Plain: what the sponsor can delegate,
-  // plus the baseline every invite carries.
-  const scopes = anchored
-    ? [...RESIDENT_SCOPES, ...delegable.filter((s) => !RESIDENT_SCOPES.includes(s))]
-    : [...delegable, ...BASELINE_SCOPES.filter((s) => !delegable.includes(s))];
+  // Anchored: the resident grant, plus anything else the sponsor could pass
+  // down anyway — never less than a plain invite. Plain: what the sponsor
+  // can delegate. Either way, plus the baseline every invite carries.
+  const union = (...lists: string[][]) => [...new Set(lists.flat())];
+  const baseline = scopesWithRole(policy, 'baseline');
+  const scopes = anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline);
+  const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences);
+  // An empty list would be saved as "no audience allowed": enrollment would
+  // consume the invite and every token request after it would fail.
+  if (!audiences.length) {
+    return { ok: false, status: 403, error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match' };
+  }
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
-    audiences: inviteAudiences(scopes, anchored, opts?.knownAudiences),
+    audiences,
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
     ...(anchored ? { domain: opts!.anchorDomain! } : {}),
@@ -215,7 +178,7 @@ const api = (path, opts = {}) => fetch(path, { ...opts,
 function loginView(msg) {
   app.innerHTML = (msg ? '<p>' + msg + '</p>' : '') +
     '<p>Sign in to mint enrollment invites for agents you run. ' +
-    'Requires eidoverse access; each invite is single-use, expires in 14 days, and carries your name as sponsor.</p>' +
+    'Each invite is single-use, expires in 14 days, and carries your name as sponsor.</p>' +
     '<p><a href="/login?audience=console"><button>Sign in</button></a></p>';
 }
 

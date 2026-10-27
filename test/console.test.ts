@@ -9,8 +9,14 @@ import { makeEnrollRequest } from '../src/statements.js';
 import { handleEnroll, type ExchangeDeps } from '../src/exchange.js';
 import { InviteStore, MintLog, PrincipalStore } from '../src/stores.js';
 import {
-  activeSponsorInvites, delegableScopes, inviteAudiences, mintSponsoredInvite, residentScopes, sponsorInviteView,
+  activeSponsorInvites, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
 } from '../src/console.js';
+import { audiencesFor, invitePolicyStore } from '../src/policy.js';
+
+// Anima's policy, exactly as shipped: these tests are also the proof that
+// config/invite-policy.example.json reproduces the console's behaviour.
+const POLICY = invitePolicyStore(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json')).get();
+const inviteAudiences = (scopes: string[], anchored: boolean, known: string[] = []) => audiencesFor(POLICY, scopes, anchored, known);
 
 const SPONSOR = { sub: 'human:discord:111', name: 'antra', scopes: ['worlds:join', 'worlds:spectate', 'orrery:use'] };
 const RESIDENT = ['board:read', 'board:write', 'clawblox:play', 'docs:use', 'music:scribe',
@@ -30,16 +36,16 @@ beforeEach(() => {
 });
 
 test('delegation never exceeds the sponsor', () => {
-  assert.deepEqual(delegableScopes(SPONSOR.scopes), ['worlds:join', 'worlds:spectate', 'orrery:use']);
-  assert.deepEqual(delegableScopes(['worlds:join', 'admin:everything']), ['worlds:join']);
-  assert.deepEqual(delegableScopes(['orrery:use']), ['orrery:use']);
+  assert.deepEqual(delegableScopes(POLICY, SPONSOR.scopes), ['worlds:join', 'worlds:spectate', 'orrery:use']);
+  assert.deepEqual(delegableScopes(POLICY, ['worlds:join', 'admin:everything']), ['worlds:join']);
+  assert.deepEqual(delegableScopes(POLICY, ['orrery:use']), ['orrery:use']);
   // music scopes delegate like any other held scope (antra 08-17: scribe-holders
   // pass scribe down — Lari's agents)
-  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload', 'music:scribe']),
+  assert.deepEqual(delegableScopes(POLICY, ['worlds:join', 'music:upload', 'music:scribe']),
     ['worlds:join', 'music:upload', 'music:scribe']);
-  assert.deepEqual(delegableScopes(['worlds:join', 'music:upload']), ['worlds:join', 'music:upload']);
+  assert.deepEqual(delegableScopes(POLICY, ['worlds:join', 'music:upload']), ['worlds:join', 'music:upload']);
 
-  const r = mintSponsoredInvite(invites, SPONSOR, 'helper');
+  const r = mintSponsoredInvite(invites, POLICY, SPONSOR, 'helper');
   assert.ok(r.ok);
   assert.deepEqual(r.invite.scopes, ['worlds:join', 'worlds:spectate', 'orrery:use', 'docs:use']); // docs:use rides on every invite
   assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery']);
@@ -48,36 +54,36 @@ test('delegation never exceeds the sponsor', () => {
   assert.equal((r.invite.claims as { sponsor?: string }).sponsor, SPONSOR.sub);
 
   // spectate-only sponsor: no worlds:join → refused outright
-  const weak = mintSponsoredInvite(invites, { ...SPONSOR, scopes: ['worlds:spectate'] }, undefined);
+  const weak = mintSponsoredInvite(invites, POLICY, { ...SPONSOR, scopes: ['worlds:spectate'] }, undefined);
   assert.ok(!weak.ok && weak.status === 403);
 });
 
 test('budget: three active invites, then 429; claims free the slot', () => {
-  for (let i = 0; i < 3; i++) assert.ok(mintSponsoredInvite(invites, SPONSOR, `a${i}`).ok);
-  const fourth = mintSponsoredInvite(invites, SPONSOR, 'a3');
+  for (let i = 0; i < 3; i++) assert.ok(mintSponsoredInvite(invites, POLICY, SPONSOR, `a${i}`).ok);
+  const fourth = mintSponsoredInvite(invites, POLICY, SPONSOR, 'a3');
   assert.ok(!fourth.ok && fourth.status === 429);
   assert.equal(activeSponsorInvites(invites, SPONSOR.sub).length, 3);
 
   // a claim consumes a slot
   invites.consume(invites.all()[0]!.code);
-  assert.ok(mintSponsoredInvite(invites, SPONSOR, 'again').ok);
+  assert.ok(mintSponsoredInvite(invites, POLICY, SPONSOR, 'again').ok);
 
   // other sponsors have their own budget
-  assert.ok(mintSponsoredInvite(invites, { ...SPONSOR, sub: 'human:discord:222', name: 'lari' }, undefined).ok);
+  assert.ok(mintSponsoredInvite(invites, POLICY, { ...SPONSOR, sub: 'human:discord:222', name: 'lari' }, undefined).ok);
 });
 
 test('id:anchor sponsors grant music scopes outright, with the music audience', () => {
   const admin = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
   // granted even though the admin holds neither music scope personally
-  assert.deepEqual(delegableScopes(admin.scopes).sort(),
+  assert.deepEqual(delegableScopes(POLICY, admin.scopes).sort(),
     ['music:scribe', 'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate']);
-  const r = mintSponsoredInvite(invites, admin, 'house scribe');
+  const r = mintSponsoredInvite(invites, POLICY, admin, 'house scribe');
   assert.ok(r.ok);
   assert.ok(r.invite.scopes.includes('music:upload') && r.invite.scopes.includes('music:scribe'));
   assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery', 'music']);
   // a music:upload-holding non-admin gets the audience too, but never scribe
   const uploader = { ...SPONSOR, scopes: ['worlds:join', 'music:upload'] };
-  const u = mintSponsoredInvite(invites, { ...uploader, sub: 'human:discord:333' }, undefined);
+  const u = mintSponsoredInvite(invites, POLICY, { ...uploader, sub: 'human:discord:333' }, undefined);
   assert.ok(u.ok);
   assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload', 'docs:use']);
   assert.deepEqual(u.invite.audiences, ['eidoverse', 'docs', 'music']);
@@ -85,18 +91,18 @@ test('id:anchor sponsors grant music scopes outright, with the music audience', 
 
 test('anchoring requires the id:anchor grant and stamps domain + resident tier', () => {
   // without the grant: refused even for a worlds:join holder
-  const plain = mintSponsoredInvite(invites, SPONSOR, 'x', { anchorDomain: 'id.test' });
+  const plain = mintSponsoredInvite(invites, POLICY, SPONSOR, 'x', { anchorDomain: 'id.test' });
   assert.ok(!plain.ok && plain.status === 403);
   assert.match((plain as { error: string }).error, /id:anchor/);
 
   const anchor = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
-  const r = mintSponsoredInvite(invites, anchor, 'resident agent', { anchorDomain: 'id.test' });
+  const r = mintSponsoredInvite(invites, POLICY, anchor, 'resident agent', { anchorDomain: 'id.test' });
   assert.ok(r.ok);
   assert.equal(r.invite.domain, 'id.test');
   assert.equal((r.invite.claims as { tier?: string }).tier, 'resident');
   assert.deepEqual([...r.invite.scopes].sort(), RESIDENT);
   // un-anchored mint from the same sponsor stays @guest-tier
-  const g = mintSponsoredInvite(invites, anchor, 'guest agent');
+  const g = mintSponsoredInvite(invites, POLICY, anchor, 'guest agent');
   assert.ok(g.ok);
   assert.equal(g.invite.domain, undefined);
   assert.equal((g.invite.claims as { tier?: string }).tier, 'sponsored');
@@ -108,7 +114,7 @@ test('clawblox delegates like any held scope, docs rides on every invite; board 
     sub: 'human:discord:444', name: 'tel', scopes: ['board:read', 'board:team', 'clawblox:play', 'docs:use',
       'gate:admin', 'gate:buy', 'orrery:use', 'worlds:join', 'worlds:spectate', 'music:scribe', 'music:upload'],
   };
-  const r = mintSponsoredInvite(invites, team, 'guest helper', { knownAudiences: KNOWN });
+  const r = mintSponsoredInvite(invites, POLICY, team, 'guest helper', { knownAudiences: KNOWN });
   assert.ok(r.ok);
   assert.deepEqual([...r.invite.scopes].sort(),
     ['clawblox:play', 'docs:use', 'music:scribe', 'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate']);
@@ -118,7 +124,7 @@ test('clawblox delegates like any held scope, docs rides on every invite; board 
 
   // a sponsor without clawblox can't pass it (∩ still holds) — but docs is
   // the baseline: every invite carries docs:use and the docs audience
-  const evt = mintSponsoredInvite(invites, { ...SPONSOR, sub: 'human:discord:555' }, undefined, { knownAudiences: KNOWN });
+  const evt = mintSponsoredInvite(invites, POLICY, { ...SPONSOR, sub: 'human:discord:555' }, undefined, { knownAudiences: KNOWN });
   assert.ok(evt.ok);
   assert.ok(!evt.invite.scopes.includes('clawblox:play'));
   assert.ok(evt.invite.scopes.includes('docs:use'));
@@ -130,22 +136,23 @@ test('clawblox delegates like any held scope, docs rides on every invite; board 
 });
 
 test('an anchored invite carries the full resident grant, whatever the sponsor holds', () => {
-  assert.deepEqual([...residentScopes()].sort(), RESIDENT);
+  assert.deepEqual([...residentScopes(POLICY)].sort(), RESIDENT);
   // anchor holder who personally lacks board:write / music / docs / clawblox
   const anchor = { ...SPONSOR, scopes: ['worlds:join', 'worlds:spectate', 'id:anchor'] };
-  const r = mintSponsoredInvite(invites, anchor, 'resident', { anchorDomain: 'id.test', knownAudiences: KNOWN });
+  const r = mintSponsoredInvite(invites, POLICY, anchor, 'resident', { anchorDomain: 'id.test', knownAudiences: KNOWN });
   assert.ok(r.ok);
   assert.deepEqual([...r.invite.scopes].sort(), RESIDENT);
   // eidoverse first: enrollment's token is for audiences[0]
-  assert.deepEqual(r.invite.audiences, ['eidoverse', 'board', 'body', 'canon', 'clawblox-mesa', 'docs', 'music', 'orrery']);
+  // eidoverse first (enrollment's token is for audiences[0]), then the policy's rule order
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery', 'music', 'board', 'body', 'canon', 'clawblox-mesa']);
   assert.equal(r.invite.tokenTtl, '7d');
   // never LESS than a plain invite: extra delegable scopes the sponsor holds survive
   const builder = { ...anchor, scopes: [...anchor.scopes, 'worlds:build'] };
-  const b = mintSponsoredInvite(invites, { ...builder, sub: 'human:discord:666' }, 'r2', { anchorDomain: 'id.test' });
+  const b = mintSponsoredInvite(invites, POLICY, { ...builder, sub: 'human:discord:666' }, 'r2', { anchorDomain: 'id.test' });
   assert.ok(b.ok);
   assert.ok(b.invite.scopes.includes('worlds:build'));
   // the same sponsor's un-anchored invite gets no board
-  const g = mintSponsoredInvite(invites, anchor, 'guest', { knownAudiences: KNOWN });
+  const g = mintSponsoredInvite(invites, POLICY, anchor, 'guest', { knownAudiences: KNOWN });
   assert.ok(g.ok);
   assert.ok(!g.invite.scopes.some((s) => s.startsWith('board:')));
 });
@@ -158,7 +165,7 @@ test('end-to-end: anchored invite → enroll → resident at the home domain', (
     knownAudiences: () => KNOWN,
   };
   const anchor = { ...SPONSOR, scopes: [...SPONSOR.scopes, 'id:anchor'] };
-  const minted = mintSponsoredInvite(invites, anchor, 'sona', { anchorDomain: 'id.test', knownAudiences: KNOWN });
+  const minted = mintSponsoredInvite(invites, POLICY, anchor, 'sona', { anchorDomain: 'id.test', knownAudiences: KNOWN });
   assert.ok(minted.ok);
   const agentKey = generateKey();
   const res = handleEnroll(makeEnrollRequest(agentKey.privateKey, agentKey.id, 'id.test', minted.invite.code, 'Sona'), deps);
@@ -181,7 +188,7 @@ test('end-to-end: sponsored invite → enroll → principal carries the vouch', 
     mintLog: new MintLog(join(dir, 'minted.jsonl')),
     knownAudiences: () => ['eidoverse', 'orrery'],
   };
-  const minted = mintSponsoredInvite(invites, SPONSOR, "skye's agent");
+  const minted = mintSponsoredInvite(invites, POLICY, SPONSOR, "skye's agent");
   assert.ok(minted.ok);
 
   const agentKey = generateKey();
