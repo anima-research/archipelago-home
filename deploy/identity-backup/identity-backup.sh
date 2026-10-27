@@ -49,21 +49,44 @@ paths=(
 [ -f /etc/nginx/sites-available/id.animalabs.ai ] && paths+=(etc/nginx/sites-available/id.animalabs.ai)
 
 # Checksums travel inside the encrypted tar, so a restore can be verified.
-manifest() { ( cd / && find "${paths[@]}" -type f -print0 | sort -z | xargs -0 sha256sum ); }
+# Writers' tmp files (renamed into place) and lock files are in-flight
+# scaffolding, never state: neither hashed nor archived, so one vanishing
+# mid-run can't fail the backup.
+manifest() { ( cd / && find "${paths[@]}" -type f ! -name '*.tmp' ! -name '*.lock' -print0 | sort -z | xargs -0 sha256sum ); }
 
 # The service keeps running (and writing: logins append to minted.jsonl, an
 # enrollment rewrites invites.json and principals.json together). So: hash,
 # archive, hash again. If nothing changed while tar read, the archive is one
 # consistent view and the manifest inside it describes exactly what it holds;
 # if something did, take it again. Plaintext still never touches the disk.
+#
+# Enrollment writes principals.json and invites.json in one synchronous step
+# (microseconds apart), and a pair can't change between the two hash passes
+# without one of them differing, so an archive kept here never holds half an
+# enrollment.
+#
+# GNU tar exits 1 when a file changes under it ("file changed as we read
+# it") — that is the same "take it again" case, not a failure, so each
+# stage's status is read on its own: tar 1 retries; anything else from tar,
+# zstd or age fails the run.
 stable=
 for attempt in 1 2 3 4 5; do
-  manifest > "$work/MANIFEST.sha256"
   rm -f "$work/$name"
-  tar --numeric-owner -cf - -C / "${paths[@]}" -C "$work" MANIFEST.sha256 \
+  if ! manifest > "$work/MANIFEST.sha256"; then
+    log "a file moved while hashing (attempt $attempt) — taking it again"; sleep 3; continue
+  fi
+  set +e
+  tar --numeric-owner --exclude='*.tmp' --exclude='*.lock' -cf - -C / "${paths[@]}" -C "$work" MANIFEST.sha256 \
     | zstd -q -19 \
     | age -R "$CONF/recipients.txt" -o "$work/$name"
-  if manifest | cmp -s - "$work/MANIFEST.sha256"; then stable=1; break; fi
+  st=("${PIPESTATUS[@]}")
+  set -e
+  [ "${st[1]}" -eq 0 ] && [ "${st[2]}" -eq 0 ] || { log "compression/encryption failed (zstd ${st[1]}, age ${st[2]})"; exit 1; }
+  case "${st[0]}" in
+    0) manifest | cmp -s - "$work/MANIFEST.sha256" && { stable=1; break; } ;;
+    1) ;; # a file changed while tar read it
+    *) log "tar failed (exit ${st[0]})"; exit 1 ;;
+  esac
   log "files changed while archiving (attempt $attempt) — taking it again"
   sleep 3
 done
