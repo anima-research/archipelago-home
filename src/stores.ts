@@ -5,6 +5,7 @@
  */
 import {
   appendFileSync,
+  chmodSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -29,6 +30,8 @@ export class JsonStore<T> {
     private readonly validate: (raw: unknown) => T | null,
     private readonly empty: T,
     private readonly label: string,
+    /** File mode for writes (e.g. 0o600 for credential files). */
+    private readonly mode?: number,
   ) {
     this.value = this.loadOnce() ?? empty;
   }
@@ -70,6 +73,21 @@ export class JsonStore<T> {
     if (this.poll) clearInterval(this.poll);
   }
 
+  /** Pick up an out-of-process write (the hn CLI) now rather than at the next
+   *  poll — a stat when nothing changed. Call before a read-modify-write so a
+   *  concurrent CLI edit isn't clobbered. */
+  refresh(): void {
+    let m: number;
+    try {
+      m = statSync(this.path).mtimeMs;
+    } catch {
+      return;
+    }
+    if (m === this.lastMtime) return;
+    const next = this.loadOnce();
+    if (next !== null) this.value = next;
+  }
+
   get(): T {
     return this.value;
   }
@@ -79,7 +97,8 @@ export class JsonStore<T> {
     this.value = next;
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+    writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', this.mode !== undefined ? { mode: this.mode } : undefined);
+    if (this.mode !== undefined) chmodSync(tmp, this.mode); // mode only applies on create
     renameSync(tmp, this.path);
     try {
       this.lastMtime = statSync(this.path).mtimeMs; // suppress self-reload
@@ -405,7 +424,7 @@ export interface MintRecord {
   aud: string;
   scopes: string[];
   exp: number;
-  by: 'oauth' | 'exchange' | 'enroll' | 'cli';
+  by: 'oauth' | 'password' | 'passkey' | 'setup' | 'exchange' | 'enroll' | 'cli';
 }
 
 export class MintLog {

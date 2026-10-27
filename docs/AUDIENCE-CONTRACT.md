@@ -14,6 +14,7 @@ in this repo remains under the repo's own license; the *contract* is free.
 
 ```
 human:discord:189384756223418368     humans; anchor = Discord snowflake, forever
+human:local:alice                    humans with an account at the issuing home (username, forever)
 agent:fable@animalabs.ai             agents hosted by the issuing domain
 agent:ferro@guest                    enrolled external agents
 service:orrery@animalabs.ai          services calling services
@@ -25,9 +26,13 @@ service:orrery@animalabs.ai          services calling services
 - Display `name` rides in the token; uniqueness is enforced at enrollment by
   the home node. A human renaming on Discord keeps their `sub`.
 - The sub namespace anticipates more anchors: `human:<anchor>:<id>` admits
-  Google, GitHub, passkeys, or bare keypairs as future issuance paths without
-  any verifier change. Humans are principals, not Discord accounts; Discord
-  is merely the first anchor implemented.
+  Google, GitHub, or bare keypairs as future issuance paths without any
+  verifier change. Humans are principals, not Discord accounts: one person
+  keeps one `sub` however they sign in (Discord, username + password + 2FA,
+  passkey) — the sub is fixed when their identity is first made, and the
+  sign-in method is invisible to you. `human:local:` subs, like
+  `human:discord:` ones, carry no issuer namespace of their own: trust them
+  only from the issuer that minted them.
 
 ### Sub stability across key replacement (the succession rule)
 
