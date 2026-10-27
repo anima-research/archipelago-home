@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted offsite backup of the identity node
+
+[Timer]
+# Before the 04:30 UTC unattended-upgrade reboot window.
+OnCalendar=*-*-* 03:10:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
