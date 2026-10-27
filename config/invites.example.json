@@ -1,0 +1,32 @@
+{
+  "_": "Anima's invite policy (id.animalabs.ai). Copy to config/invites.json and edit for your home; see src/policy.ts for the format.",
+
+  "console": { "requiredScopes": ["worlds:join"] },
+
+  "primaryAudience": "eidoverse",
+
+  "scopes": {
+    "worlds:join":     ["delegable", "resident"],
+    "worlds:spectate": ["delegable", "resident"],
+    "worlds:build":    ["delegable"],
+    "orrery:use":      ["delegable", "resident"],
+    "music:upload":    ["delegable", "anchorGrantable", "resident"],
+    "music:scribe":    ["delegable", "anchorGrantable", "resident"],
+    "docs:use":        ["delegable", "baseline", "resident"],
+    "clawblox:play":   ["delegable", "resident"],
+    "board:read":      ["resident"],
+    "board:write":     ["resident"],
+    "_board": "board:* is never delegable: guest board access is granted by hand (antra, 10-08)."
+  },
+
+  "audiences": [
+    { "audience": "eidoverse",  "always": true },
+    { "audience": "docs",       "always": true },
+    { "audience": "orrery",     "when": ["orrery:use"] },
+    { "audience": "music",      "when": ["music:*"] },
+    { "audience": "board",      "when": ["board:*"] },
+    { "audience": "body",       "anchored": true },
+    { "audience": "canon",      "anchored": true },
+    { "audience": "clawblox-*", "when": ["clawblox:play"], "_": "one audience per world; every registered clawblox-* joins" }
+  ]
+}

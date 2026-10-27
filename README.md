@@ -16,6 +16,7 @@ npm install && npm run typecheck && npm test
 
 cp config/roles.example.json config/roles.json          # fill guild + role snowflakes
 cp config/audiences.example.json config/audiences.json
+cp config/invites.example.json config/invites.json      # optional: the sponsor console's policy (Anima's)
 DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… npm start   # binds 127.0.0.1:7360; TLS = fronting proxy
 ```
 
@@ -56,6 +57,42 @@ hn user disable alice    hn user enable alice
 Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes lock its second
 factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
 these, so they remain a way in during a lockout.
+
+## The deployment's policy (config/)
+
+What the node knows about *your* services is configuration, hot-reloaded (edit, save, no
+restart; a file that doesn't parse or validate is refused and the last good one stays):
+
+| file | says |
+|---|---|
+| `audiences.json` | the services: login redirect, scopes a login must hold, API and MCPL endpoints (`/services`) |
+| `roles.json` | Discord guild roles → scopes (only with Discord on) |
+| `invites.json` | the sponsor console: who may open it, which scopes a sponsor may pass to their agent, what every invite and every anchored invite carries, which audiences follow from which scopes |
+
+`invites.json` is optional — without it the console is off and says so. Anima's is
+`config/invites.example.json`; the format, in full, is at the top of `src/policy.ts`. In short:
+
+```jsonc
+{
+  "console": { "requiredScopes": ["worlds:join"] },     // who may open the console and mint
+  "primaryAudience": "eidoverse",                       // enrollment's first token is for this one
+  "scopes": {                                           // roles: delegable · anchorGrantable · baseline · resident
+    "worlds:join": ["delegable", "resident"],
+    "docs:use":    ["delegable", "baseline", "resident"]
+  },
+  "audiences": [                                        // in order; an audience ending in * = every registered match
+    { "audience": "eidoverse",  "always": true },
+    { "audience": "music",      "when": ["music:*"] },
+    { "audience": "body",       "anchored": true },
+    { "audience": "clawblox-*", "when": ["clawblox:play"] }
+  ]
+}
+```
+
+A sponsor passes on (their scopes ∩ `delegable`) — never more than they hold — plus `baseline` on
+every invite; an `id:anchor` holder also grants `anchorGrantable` outright, and an anchored invite
+carries every `resident` scope. A scope the file doesn't mention is never granted through the
+console.
 
 ## Operator CLI
 

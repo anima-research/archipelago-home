@@ -13,6 +13,7 @@ import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.
 import {
   ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
 } from './console.js';
+import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './policy.js';
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import type { FetchLike } from './oauth.js';
@@ -94,6 +95,8 @@ export class HomeNode {
   readonly invites: InviteStore;
   readonly roles: JsonStore<RolesConfig>;
   readonly audiences: JsonStore<AudiencesConfig>;
+  /** What console invites carry — the deployment's policy (policy.ts). */
+  readonly invitePolicy: JsonStore<InvitePolicy>;
   readonly mintLog: MintLog;
   readonly accounts: AccountStore;
   readonly human: HumanAuth;
@@ -106,6 +109,7 @@ export class HomeNode {
     this.invites = new InviteStore(join(cfg.dataDir, 'invites.json'));
     this.roles = rolesStore(join(cfg.configDir, 'roles.json'));
     this.audiences = audiencesStore(join(cfg.configDir, 'audiences.json'));
+    this.invitePolicy = invitePolicyStore(join(cfg.configDir, 'invites.json'));
     this.mintLog = new MintLog(join(cfg.dataDir, 'minted.jsonl'));
     this.accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
     this.human = new HumanAuth({
@@ -116,6 +120,7 @@ export class HomeNode {
       roles: this.roles,
       audiences: this.audiences,
       mintLog: this.mintLog,
+      invitePolicy: this.invitePolicy,
       allow: (ip) => this.limiter.allow(ip),
       fetchImpl: opts.fetchImpl,
     });
@@ -135,13 +140,14 @@ export class HomeNode {
 
   /** Resolves with the bound port (useful with port 0 in tests). */
   start(): Promise<number> {
-    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.accounts]) s.startWatching();
+    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts]) s.startWatching();
     return new Promise((resolve) =>
       this.server.listen(this.cfg.port, this.cfg.bind, () => {
         const addr = this.server.address();
         const port = typeof addr === 'object' && addr ? addr.port : this.cfg.port;
         console.error(`[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${port} — issuer ${this.issuer.id}`);
         if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
+        if (!this.invitePolicy.get().configured) console.error('[hn] no config/invites.json — the sponsor console is off');
         resolve(port);
       }),
     );
@@ -153,6 +159,7 @@ export class HomeNode {
     this.invites.stopWatching();
     this.roles.stopWatching();
     this.audiences.stopWatching();
+    this.invitePolicy.stopWatching();
     this.accounts.stopWatching();
   }
 
@@ -219,11 +226,17 @@ export class HomeNode {
 
   // ── sponsor console (see console.ts header for the design) ──
 
-  /** Offline-verify a Bearer console token; null (+401 written) on failure. */
+  /** Offline-verify a Bearer console token; null (+401 written) on failure.
+   *  The scopes it must carry are the invite policy's console gate. */
   private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
+    const gate = consoleRequiredScopes(this.invitePolicy.get());
+    if (gate === null) {
+      json(res, 503, { error: 'this home has no invite policy (config/invites.json), so the console is off' });
+      return null;
+    }
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
     const v = m
-      ? verifyToken(m[1]!, { issuerId: this.issuer.id, iss: this.cfg.iss, aud: 'console', requireScopes: ['worlds:join'] })
+      ? verifyToken(m[1]!, { issuerId: this.issuer.id, iss: this.cfg.iss, aud: 'console', requireScopes: gate })
       : ({ ok: false, reason: 'no bearer token' } as const);
     if (!v.ok) {
       json(res, 401, { error: v.reason });
@@ -241,9 +254,9 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (who) {
         json(res, 200, {
-          sub: who.sub, name: who.name, delegable: delegableScopes(who.scopes),
+          sub: who.sub, name: who.name, delegable: delegableScopes(this.invitePolicy.get(), who.scopes),
           canAnchor: who.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
-          ...(who.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: residentScopes() } : {}),
+          ...(who.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: residentScopes(this.invitePolicy.get()) } : {}),
         });
       }
       return true;
@@ -257,7 +270,7 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
-      const r = mintSponsoredInvite(this.invites, { sub: who.sub, name: who.name, scopes: who.scopes },
+      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), { sub: who.sub, name: who.name, scopes: who.scopes },
         typeof body?.label === 'string' ? body.label : undefined,
         { anchorDomain: body?.anchor === true ? this.cfg.iss : null,
           knownAudiences: Object.keys(this.audiences.get()) });
