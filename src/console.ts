@@ -60,6 +60,9 @@ export function activeSponsorInvites(invites: InviteStore, sponsorSub: string, n
  *  scope, granted via the role map like everything else. */
 export const ANCHOR_SCOPE = 'id:anchor';
 
+/** Scopes every invite carries regardless of what the sponsor could delegate (see mintSponsoredInvite). */
+export const BASELINE_SCOPES = ['docs:use'];
+
 export type ConsoleMintResult =
   | { ok: true; invite: Invite }
   | { ok: false; status: 403 | 429; error: string };
@@ -87,13 +90,17 @@ export function mintSponsoredInvite(
     };
   }
   const anchored = Boolean(opts?.anchorDomain);
+  // Whoever minted it, an invite carries the services an agent of this archipelago is simply
+  // expected to have: Anima Docs is where people and agents write together.
+  const granted = [...scopes, ...BASELINE_SCOPES.filter((b) => !scopes.includes(b))];
   const invite = invites.mint({
-    scopes,
+    scopes: granted,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
     audiences: [
       'eidoverse',
+      'docs',
       ...(scopes.includes('orrery:use') ? ['orrery'] : []),
       ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
     ],
