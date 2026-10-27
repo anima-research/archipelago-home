@@ -41,8 +41,8 @@ test('delegation never exceeds the sponsor', () => {
 
   const r = mintSponsoredInvite(invites, SPONSOR, 'helper');
   assert.ok(r.ok);
-  assert.deepEqual(r.invite.scopes, ['worlds:join', 'worlds:spectate', 'orrery:use']);
-  assert.deepEqual(r.invite.audiences, ['eidoverse', 'orrery']);
+  assert.deepEqual(r.invite.scopes, ['worlds:join', 'worlds:spectate', 'orrery:use', 'docs:use']); // docs:use rides on every invite
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery']);
   assert.equal(r.invite.sponsor, SPONSOR.sub);
   assert.equal(r.invite.maxUses, 1);
   assert.equal((r.invite.claims as { sponsor?: string }).sponsor, SPONSOR.sub);
@@ -74,13 +74,13 @@ test('id:anchor sponsors grant music scopes outright, with the music audience', 
   const r = mintSponsoredInvite(invites, admin, 'house scribe');
   assert.ok(r.ok);
   assert.ok(r.invite.scopes.includes('music:upload') && r.invite.scopes.includes('music:scribe'));
-  assert.deepEqual(r.invite.audiences, ['eidoverse', 'orrery', 'music']);
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery', 'music']);
   // a music:upload-holding non-admin gets the audience too, but never scribe
   const uploader = { ...SPONSOR, scopes: ['worlds:join', 'music:upload'] };
   const u = mintSponsoredInvite(invites, { ...uploader, sub: 'human:discord:333' }, undefined);
   assert.ok(u.ok);
-  assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload']);
-  assert.deepEqual(u.invite.audiences, ['eidoverse', 'music']);
+  assert.deepEqual(u.invite.scopes, ['worlds:join', 'music:upload', 'docs:use']);
+  assert.deepEqual(u.invite.audiences, ['eidoverse', 'docs', 'music']);
 });
 
 test('anchoring requires the id:anchor grant and stamps domain + resident tier', () => {
@@ -102,7 +102,7 @@ test('anchoring requires the id:anchor grant and stamps domain + resident tier',
   assert.equal((g.invite.claims as { tier?: string }).tier, 'sponsored');
 });
 
-test('docs + clawblox delegate like any held scope, with their audiences; board never does', () => {
+test('clawblox delegates like any held scope, docs rides on every invite; board never does', () => {
   // a team member's login scopes (as on the live role map)
   const team = {
     sub: 'human:discord:444', name: 'tel', scopes: ['board:read', 'board:team', 'clawblox:play', 'docs:use',
@@ -113,18 +113,20 @@ test('docs + clawblox delegate like any held scope, with their audiences; board 
   assert.deepEqual([...r.invite.scopes].sort(),
     ['clawblox:play', 'docs:use', 'music:scribe', 'music:upload', 'orrery:use', 'worlds:join', 'worlds:spectate']);
   assert.ok(!r.invite.scopes.some((s) => s.startsWith('board:') || s.startsWith('gate:')));
-  assert.deepEqual(r.invite.audiences, ['eidoverse', 'orrery', 'music', 'docs', 'clawblox-mesa']);
+  assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery', 'music', 'clawblox-mesa']);
   assert.equal(r.invite.domain, undefined);
 
-  // a sponsor without docs/clawblox can't pass them (∩ still holds)
+  // a sponsor without clawblox can't pass it (∩ still holds) — but docs is
+  // the baseline: every invite carries docs:use and the docs audience
   const evt = mintSponsoredInvite(invites, { ...SPONSOR, sub: 'human:discord:555' }, undefined, { knownAudiences: KNOWN });
   assert.ok(evt.ok);
-  assert.ok(!evt.invite.scopes.includes('docs:use') && !evt.invite.scopes.includes('clawblox:play'));
-  assert.deepEqual(evt.invite.audiences, ['eidoverse', 'orrery']);
+  assert.ok(!evt.invite.scopes.includes('clawblox:play'));
+  assert.ok(evt.invite.scopes.includes('docs:use'));
+  assert.deepEqual(evt.invite.audiences, ['eidoverse', 'docs', 'orrery']);
 
   // clawblox audiences are per-world: every registered clawblox-* joins
   assert.deepEqual(inviteAudiences(['worlds:join', 'clawblox:play'], false, ['clawblox-z', 'eidoverse', 'clawblox-a']),
-    ['eidoverse', 'clawblox-a', 'clawblox-z']);
+    ['eidoverse', 'docs', 'clawblox-a', 'clawblox-z']);
 });
 
 test('an anchored invite carries the full resident grant, whatever the sponsor holds', () => {

@@ -10,9 +10,12 @@
  *    home node consuming its own credential format.
  *  - Delegation never exceeds the sponsor: invite scopes = sponsor's scopes
  *    ∩ the delegable set. You cannot mint your agent into rooms you can't
- *    enter yourself. (Bounded exceptions, both resting on the home's own
- *    `id:anchor` authority: anchor holders grant ADMIN_GRANTABLE outright,
- *    and an anchored invite carries the full RESIDENT grant — see each.)
+ *    enter yourself. Bounded exceptions, each a fixed list:
+ *      · BASELINE_SCOPES ride on every invite, whoever mints it — the
+ *        services any agent of this archipelago is expected to have;
+ *      · `id:anchor` holders grant ADMIN_GRANTABLE outright, and an
+ *        anchored invite carries the full RESIDENT grant — both resting on
+ *        the home's own `id:anchor` authority. See each.
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
@@ -28,7 +31,8 @@ const DELEGABLE = [
 
 /** Scopes an `id:anchor` holder may grant OUTRIGHT (no ∩ — the home's own
  *  authority stands behind these, the same authority that anchors residents
- *  at the home domain). Bounded by this list, not open-ended. */
+ *  at the home domain). Bounded by this list, not open-ended. (The other
+ *  exceptions to ∩: BASELINE_SCOPES, and the anchored RESIDENT grant.) */
 const ADMIN_GRANTABLE = ['music:upload', 'music:scribe'];
 
 /** The standard resident grant — what every agent anchored at the home
@@ -46,6 +50,15 @@ const RESIDENT_SCOPES = [
 const RESIDENT_AUDIENCES = ['board', 'body', 'canon', 'docs', 'eidoverse', 'music', 'orrery'];
 const CLAWBLOX_AUDIENCE_PREFIX = 'clawblox-';
 
+/** Every invite carries these, whoever mints it and whatever the sponsor
+ *  holds: the services an agent of this archipelago is simply expected to
+ *  have. Anima Docs is where people and agents write together, so an agent
+ *  anyone invites can use it. A bounded exception to ∩ (see the header). */
+export const BASELINE_SCOPES = ['docs:use'];
+/** The audiences that come with the baseline; eidoverse leads, since
+ *  enrollment's first token is for audiences[0]. */
+const BASELINE_AUDIENCES = ['eidoverse', 'docs'];
+
 /** Audiences an invite's principal may request tokens for, derived from its
  *  scopes. `known` = the home's registered audiences (for per-world ids). */
 export function inviteAudiences(scopes: string[], anchored: boolean, known: string[] = []): string[] {
@@ -55,10 +68,9 @@ export function inviteAudiences(scopes: string[], anchored: boolean, known: stri
   // Enrollment's first token is for audiences[0], so eidoverse leads either way.
   if (anchored) return ['eidoverse', ...[...RESIDENT_AUDIENCES, ...clawblox].filter((a) => a !== 'eidoverse').sort()];
   return [
-    'eidoverse',
+    ...BASELINE_AUDIENCES,
     ...(scopes.includes('orrery:use') ? ['orrery'] : []),
     ...(scopes.some((s) => s.startsWith('music:')) ? ['music'] : []),
-    ...(scopes.includes('docs:use') ? ['docs'] : []),
     ...clawblox,
   ];
 }
@@ -128,11 +140,13 @@ export function mintSponsoredInvite(
     };
   }
   const anchored = Boolean(opts?.anchorDomain);
-  // Anchored: the resident grant, plus anything else the sponsor could pass
-  // down anyway (e.g. worlds:build) — never less than a plain invite.
+  // Anchored: the resident grant (which includes the baseline), plus
+  // anything else the sponsor could pass down anyway (e.g. worlds:build) —
+  // never less than a plain invite. Plain: what the sponsor can delegate,
+  // plus the baseline every invite carries.
   const scopes = anchored
     ? [...RESIDENT_SCOPES, ...delegable.filter((s) => !RESIDENT_SCOPES.includes(s))]
-    : delegable;
+    : [...delegable, ...BASELINE_SCOPES.filter((s) => !delegable.includes(s))];
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
