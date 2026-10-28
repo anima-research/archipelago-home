@@ -61,6 +61,8 @@ function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
     orrery: { redirect: 'https://orrery.test/auth', requiredScopes: ['orrery:use'] },
     // no requiredScopes: open to any grant — what a code must NOT widen into
     ranker: { redirect: 'https://ranker.test/auth' },
+    // open to newcomers
+    notes: { redirect: 'https://notes.test/auth', requiredScopes: ['notes:use'], signup: {} },
     gate: { redirect: 'https://gate.test/auth' },
   }));
   return new HomeNode({
@@ -784,4 +786,42 @@ test('restrict: the live bot re-check on a password sign-in honours set-aside ro
     n2.stop();
     discordRoles = ['r-member'];
   }
+});
+
+// ── audiences open to newcomers ──
+
+test('open audience: a Google newcomer signs up by signing in — for that audience only', async () => {
+  const page = await get('/login?audience=notes');
+  assert.match(page.text, /open to everyone/);
+  assert.doesNotMatch((await get('/login?audience=eidoverse')).text, /open to everyone/);
+  googleUser = { sub: 'g-open-1', email: 'reader@gmail.com', email_verified: true, name: 'Reader' };
+  const r = await googleLogin('notes');
+  assert.equal(r.status, 302);
+  const p = tokenFrom(r.location!, 'notes');
+  assert.equal(p.sub, 'human:google:g-open-1');
+  assert.equal(p.name, 'Reader');
+  assert.deepEqual(p.scopes, ['notes:use']);
+  assert.ok(node.accounts.bySub('human:google:g-open-1'));
+  // nowhere else — not even audiences that take any grant
+  assert.equal((await googleLogin('gate')).status, 403);
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal((await googleLogin('ranker')).status, 403);
+  // a closed audience still makes no row for a stranger
+  googleUser = { sub: 'g-open-2', email: 'other@gmail.com', email_verified: true };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal(node.accounts.bySub('human:google:g-open-2'), undefined);
+});
+
+test('open audience: a Discord account with no role gets in there and nowhere else; withhold still applies', async () => {
+  discordUser = { id: '7700', username: 'nora', global_name: 'Nora' };
+  discordRoles = null; // not in the guild
+  const r = await discordLogin('notes');
+  assert.equal(r.status, 302);
+  assert.deepEqual(tokenFrom(r.location!, 'notes').scopes, ['notes:use']);
+  assert.equal((await discordLogin('gate')).status, 403);
+  // a person the operator withholds it from stays out
+  await node.accounts.add({ sub: 'human:discord:7701', discord: { id: '7701' }, withhold: ['notes:use'], createdAt: '' });
+  discordUser = { id: '7701', username: 'ozzy', global_name: 'Ozzy' };
+  assert.equal((await discordLogin('notes')).status, 403);
+  discordRoles = ['r-member'];
 });

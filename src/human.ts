@@ -36,6 +36,7 @@ import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type Goo
 import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
 import {
   grantForRoles,
+  signupGrant,
   type AudiencesConfig,
   type JsonStore,
   type MintLog,
@@ -279,7 +280,7 @@ export class HumanAuth {
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
     if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
     securePage(res, 200, (nonce) =>
-      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, nonce }),
+      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, open: !!signupGrant(this.d.audiences.get()[audience]), nonce }),
     );
   }
 
@@ -584,7 +585,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     // Codes count for their own audiences only (codes.ts) — read live, so a
     // revoked code stops working at the next sign-in.
     const live = this.d.accounts.bySub(who.sub);
-    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience)), live);
+    // Codes, and an audience open to newcomers, count for that audience only.
+    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience), signupGrant(this.d.audiences.get()[audience])), live);
     if (audience === 'account') {
       // Managing your own sign-in needs an account, or a Discord login that
       // would qualify for something (strangers don't get to create rows).
@@ -1017,6 +1019,19 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       } else if (inv) acct = inv; // disabled: refused just below
     }
     let fresh = false;
+    if (!acct && !st.code && signupGrant(this.d.audiences.get()[st.audience])) {
+      // An audience open to newcomers: a Google account we don't know signs up by signing in.
+      try {
+        acct = this.d.accounts.add({
+          sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${st.audience}`,
+          google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
+        });
+        console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
+      } catch {
+        acct = this.d.accounts.bySub(`human:google:${g.sub}`) ?? this.d.accounts.byGoogle(g.sub);
+      }
+      fresh = true;
+    }
     if (!acct && st.code) {
       // Signing up: a Google account we don't know, with an access code.
       const r = this.signUp(`human:google:${g.sub}`, st.code, {

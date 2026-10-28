@@ -91,7 +91,7 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings
 
 // ── /login ──
 
-export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; nonce: string }): string {
+export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; open?: boolean; nonce: string }): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
   const body = `
 <h1>Sign in</h1>
@@ -128,7 +128,9 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
   <button id="back" class="btn block" type="button">Start over</button>
 </section>
 <p class="dim small" style="margin-top:2rem">${
-    o.discord
+    o.open && (o.google || o.discord)
+      ? `New here? ${o.google ? 'Continue with Google' : 'Continue with Discord'} — this one is open to everyone, and your account is made as you sign in.`
+      : o.discord
       ? 'No username yet? Continue with Discord, then add a password or passkey under <a href="/login?audience=account">sign-in settings</a>.'
       : 'Accounts are created by this home’s operator.'
   }</p>`;

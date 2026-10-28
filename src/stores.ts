@@ -408,9 +408,22 @@ export interface AudienceConfig {
    *  hasn't published one. wss only, for the same reason as `api`: the host
    *  puts the resident's credential on this dial. */
   mcpl?: string;
+  /**
+   * Open to newcomers: anyone who signs in (a Google account the node has
+   * never seen, a Discord account with no role) gets a token for THIS
+   * audience, holding `scopes` (default: its requiredScopes) — and nothing
+   * anywhere else. A Google newcomer gets an account row (human:google:<sub>)
+   * on that first sign-in. Absent = only people with a grant get in.
+   */
+  signup?: { scopes?: string[] };
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
+
+/** What an open audience gives anyone who signs in to it, or null if it isn't open. */
+export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
+  return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
+}
 
 /** The published service directory: audience → API base, for audiences that
  *  declare one. Audiences without an `api` (MCPL-only, or human-login-only)
@@ -450,6 +463,7 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
+        if (v.signup !== undefined && (typeof v.signup !== 'object' || v.signup === null || (v.signup.scopes !== undefined && !Array.isArray(v.signup.scopes)))) return null;
       }
       return raw as AudiencesConfig;
     },

@@ -72,6 +72,13 @@ Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes l
 factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
 these, so they remain a way in during a lockout.
 
+## Audiences open to newcomers
+
+An audience with `"signup": {}` in `audiences.json` (optionally `{"scopes": [...]}`, default its
+`requiredScopes`) admits anyone who signs in — a Google account the node has never seen (it gets
+an account row, `human:google:<sub>`), or a Discord account with no role — holding those scopes
+**for that audience only**. Everywhere else they hold nothing. Per-person `withhold` still applies.
+
 ## Access codes
 
 A code grants named **audiences** (and the scopes they need) to whoever redeems it: on the sign-in
