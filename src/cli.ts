@@ -15,6 +15,8 @@
  *   hn user reset <username> [--clear-2fa] [--clear-passkeys]             → new setup link
  *   hn user set <username> [--scopes a,b] [--name "Display"] [--tier x] [--google <email> | --google none]
  *   hn user disable <username>     hn user enable <username>
+ *   hn user restrict <username | sub | discord-id> [--ignore-roles <role id>,…] [--withhold a,b] [--clear]
+ *                                  roles that don't count for this person / scopes they never hold
  *
  *   hn code add --aud curation [--scopes x,y] [--label "…"] [--max-uses 50] [--expires 14d]  → the code (shown once)
  *   hn code ls                      who redeemed what
@@ -216,6 +218,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `  pw:${a.password ? 'y' : 'n'} 2fa:${a.totp ? 'y' : 'n'} passkeys:${a.passkeys?.length ?? 0}` +
     `${a.discord ? `  discord:${a.discord.id}` : ''}${a.google ? `  google:${a.google.email}${a.google.sub ? '' : '(invited)'}` : ''}` +
     `${a.scopes?.length ? `  [${a.scopes.join(' ')}]` : ''}` +
+    `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
 
   /** --google <email>: an invite by address, checked against everyone else's. */
@@ -314,6 +317,32 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       console.log(describe(next));
       return;
     }
+    case 'restrict': {
+      // A Discord person with no row yet gets one (their sub stays human:discord:<id>).
+      let a = rawName ? (accounts.byUsername(rawName) ?? accounts.bySub(rawName) ?? accounts.byDiscord(rawName.replace(/^human:discord:/, ''))) : undefined;
+      if (!a && rawName && /^(human:discord:)?\d{15,22}$/.test(rawName)) {
+        const id = rawName.replace(/^human:discord:/, '');
+        a = accounts.add({ sub: `human:discord:${id}`, discord: { id }, createdAt: new Date().toISOString(), notes: `hn user restrict ${new Date().toISOString().slice(0, 10)}` });
+        console.error(`[hn] made a row for ${a.sub} (their name fills in at their next Discord sign-in)`);
+      }
+      if (!a) die('usage: hn user restrict <username | sub | discord-id> [--ignore-roles <role id>,…] [--withhold a,b] [--clear]');
+      const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
+      const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
+      if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
+      const next = accounts.update(a.sub, (x) => {
+        const n: HumanAccount = { ...x, ...(ign ? { ignoreRoles: ign } : {}), ...(wh ? { withhold: wh } : {}) };
+        // the last Discord check's grant predates the restriction: drop it, so only a fresh check counts
+        if (ign && n.discord) n.discord = { id: n.discord.id, ...(n.discord.name ? { name: n.discord.name } : {}) };
+        if (flag.has('clear')) {
+          delete n.ignoreRoles;
+          delete n.withhold;
+        }
+        return n;
+      }) ?? a;
+      console.error(`[hn] restricted (from their next sign-in; tokens out now live out their minutes):`);
+      console.log(describe(next));
+      return;
+    }
     case 'disable':
     case 'enable': {
       const a = find();
@@ -322,7 +351,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       return;
     }
     default:
-      die('usage: hn user add | ls | reset | set | disable | enable');
+      die('usage: hn user add | ls | reset | set | restrict | disable | enable');
   }
 }
 
