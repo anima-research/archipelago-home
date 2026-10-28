@@ -59,6 +59,9 @@ function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
   writeFileSync(join(dir, 'audiences.json'), JSON.stringify({
     eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
     orrery: { redirect: 'https://orrery.test/auth', requiredScopes: ['orrery:use'] },
+    // no requiredScopes: open to any grant — what a code must NOT widen into
+    ranker: { redirect: 'https://ranker.test/auth' },
+    gate: { redirect: 'https://gate.test/auth' },
   }));
   return new HomeNode({
     iss: 'id.test', publicUrl: ORIGIN, bind: '127.0.0.1', port: 0, dataDir: dir, configDir: dir,
@@ -642,4 +645,100 @@ test('Google: cancelled at Google, or no Google configured', async () => {
   } finally {
     n2.stop();
   }
+});
+
+// ── access codes ──
+
+async function withCode(audience: string, code: string, via: 'google' | 'discord') {
+  const state = await loginState(audience);
+  const c = await post('/login/code', { state, code });
+  if (c.status !== 200) return { code: c, cb: null };
+  const start = await get(`/login/${via}?state=${state}`);
+  assert.equal(start.status, 302);
+  return { code: c, cb: await get(`${via === 'google' ? '/oauth/google/callback' : '/oauth/callback'}?state=${state}&code=x`) };
+}
+
+test('codes: a newcomer signs up with Google + a code; the code opens ONLY its own audiences', async () => {
+  const { code, record } = node.codes.add({ label: 'Speaker ranker', audiences: ['ranker'], scopes: ['ranker:member'] });
+  googleUser = { sub: 'g-new', email: 'newcomer@gmail.com', email_verified: true, name: 'New Comer' };
+  // without the code: refused, nothing made
+  assert.equal((await googleLogin('ranker')).status, 403);
+  assert.equal(node.accounts.bySub('human:google:g-new'), undefined);
+  const { code: c, cb } = await withCode('ranker', code.toUpperCase().replace(/-/g, ' '), 'google'); // typed sloppily: still the code
+  assert.equal(c.status, 200);
+  assert.deepEqual(c.body, { label: 'Speaker ranker', audiences: ['ranker'] });
+  assert.equal(cb!.status, 302);
+  const p = tokenFrom(cb!.location!, 'ranker');
+  assert.equal(p.sub, 'human:google:g-new');
+  assert.equal(p.name, 'New Comer');
+  assert.deepEqual(p.scopes, ['ranker:member']);
+  assert.equal(node.codes.byId(record.id)!.uses, 1);
+  // signing in again later needs no code
+  assert.equal(tokenFrom((await googleLogin('ranker')).location!, 'ranker').sub, 'human:google:g-new');
+  // other audiences — even scope-less ones that take any grant — stay shut
+  assert.equal((await googleLogin('gate')).status, 403);
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  // the account page opens, and lists the code
+  const tok = rawToken((await googleLogin('account')).location!);
+  const view = JSON.parse((await get('/account/me', base, { authorization: `Bearer ${tok}` })).text);
+  assert.deepEqual(view.codes.map((x: { label: string }) => x.label), ['Speaker ranker']);
+  // revoked: the access goes with it
+  node.codes.set(record.id, { closed: true, revoked: true });
+  assert.equal((await googleLogin('ranker')).status, 403);
+});
+
+test('codes: Discord newcomer outside the guild signs up with a code; limits, expiry, closing', async () => {
+  const one = node.codes.add({ label: 'one seat', audiences: ['ranker'], scopes: [], maxUses: 1 });
+  discordUser = { id: '8001', username: 'kit', global_name: 'Kit' };
+  discordRoles = null; // not in the guild: no role grant at all
+  assert.equal((await discordLogin('ranker')).status, 403);
+  const first = await withCode('ranker', one.code, 'discord');
+  assert.equal(first.cb!.status, 302);
+  const p = tokenFrom(first.cb!.location!, 'ranker');
+  assert.equal(p.sub, 'human:discord:8001');
+  assert.deepEqual(p.scopes, []); // a code can grant an audience with no scopes at all
+  // the same person again needs no code; redeeming it again is a no-op, not a second use
+  assert.equal((await discordLogin('ranker')).status, 302);
+  assert.notEqual(node.codes.redeem(one.code, 'human:discord:8001'), 'used up');
+  assert.equal(node.codes.byId(one.record.id)!.uses, 1);
+  // someone else: used up
+  discordUser = { id: '8002', username: 'lee', global_name: 'Lee' };
+  const second = await withCode('ranker', one.code, 'discord');
+  assert.equal(second.code.status, 400);
+  assert.match(second.code.body.error, /used up/);
+  // wrong / expired / closed
+  assert.match((await withCode('ranker', 'abcd-efgh-jkmn', 'discord')).code.body.error, /isn’t valid/);
+  const old = node.codes.add({ label: 'old', audiences: ['ranker'], scopes: [], expires: new Date(Date.now() - 1000).toISOString() });
+  assert.match((await withCode('ranker', old.code, 'discord')).code.body.error, /expired/);
+  const shut = node.codes.add({ label: 'shut', audiences: ['ranker'], scopes: [] });
+  node.codes.set(shut.record.id, { closed: true });
+  assert.match((await withCode('ranker', shut.code, 'discord')).code.body.error, /no longer accepted/);
+  // closing keeps what was given: kit still gets in
+  node.codes.set(one.record.id, { closed: true });
+  discordUser = { id: '8001', username: 'kit', global_name: 'Kit' };
+  assert.equal((await discordLogin('ranker')).status, 302);
+  discordRoles = ['r-member'];
+});
+
+test('codes: redeemed under sign-in settings, or riding a password sign-in', async () => {
+  await node.accounts.add({ sub: 'human:local:mo', username: 'mo', password: await hashPassword('mo password 11'), createdAt: '' });
+  const { code } = node.codes.add({ label: 'Ranker', audiences: ['ranker'], scopes: ['ranker:member'] });
+  assert.equal((await passwordLogin('mo', 'mo password 11', 'ranker')).status, 403); // no grant yet
+  const tok = await accountToken('mo', 'mo password 11');
+  assert.equal((await post('/account/code', { code: 'nope-nope-nope' }, tok)).status, 400);
+  const r = await post('/account/code', { code }, tok);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.redeemed, { label: 'Ranker', audiences: ['ranker'] });
+  assert.equal(r.body.codes.length, 1);
+  const ok = await passwordLogin('mo', 'mo password 11', 'ranker');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(tokenFrom(ok.body.redirect, 'ranker').scopes, ['ranker:member']);
+
+  await node.accounts.add({ sub: 'human:local:nia', username: 'nia', password: await hashPassword('nia password 11'), createdAt: '' });
+  const state = await loginState('ranker');
+  assert.equal((await post('/login/code', { state, code })).status, 200);
+  const viaPw = await post('/login/password', { state, username: 'nia', password: 'nia password 11' });
+  assert.equal(viaPw.status, 200);
+  assert.equal(tokenFrom(viaPw.body.redirect, 'ranker').sub, 'human:local:nia');
+  assert.equal(node.accounts.bySub('human:local:nia')!.codes!.length, 1);
 });

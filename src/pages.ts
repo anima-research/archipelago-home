@@ -109,6 +109,14 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
     <button class="btn primary block" type="submit">Sign in</button>
   </form>
   <button id="pk" class="btn block" type="button" hidden>Sign in with a passkey</button>
+  <p id="code-ok" class="ok" role="status" hidden></p>
+  <details id="code-box" style="margin-top:1rem">
+    <summary class="dim small" style="cursor:pointer">Have an access code?</summary>
+    <form id="cf" class="row" novalidate style="margin-top:.5rem">
+      <input id="code" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="xxxx-xxxx-xxxx" aria-label="Access code">
+      <button class="btn" type="submit">Use code</button>
+    </form>
+  </details>
 </section>
 <section id="step2" hidden>
   <form id="otp" novalidate>
@@ -158,6 +166,21 @@ $('otp').onsubmit = async (e) => {
 };
 function restart() { ticket = null; $('step2').hidden = true; $('step1').hidden = false; $('p').value = ''; $('c').value = ''; }
 $('back').onclick = () => { err(''); restart(); };
+
+const SIGNUP = ${scriptJson([o.google && 'Google', o.discord && 'Discord'].filter(Boolean))};
+async function useCode(code) {
+  err('');
+  const r = await post('/login/code', { state: S.state, code }).catch(() => ({ body: { error: 'Network error.' } }));
+  if (!r.body.label) return err(r.body.error || 'That code didn’t work.');
+  $('code-box').hidden = true; $('code-box').open = false;
+  const ok = $('code-ok'); ok.hidden = false;
+  ok.textContent = 'Code accepted — ' + r.body.label + ' (access to ' + r.body.audiences.join(', ') + '). Now sign in' +
+    (SIGNUP.length ? ' — new here? Continue with ' + SIGNUP.join(' or ') + ' to make your account.' : '.');
+}
+$('cf').onsubmit = (e) => { e.preventDefault(); const c = $('code').value.trim(); if (c) useCode(c); else err('Enter the code.'); };
+// A shared link can carry the code in its fragment: /login?audience=…#code=…
+const hashCode = new URLSearchParams(location.hash.slice(1)).get('code');
+if (hashCode) { history.replaceState(null, '', location.pathname + location.search); $('code-box').open = true; $('code').value = hashCode; useCode(hashCode); }
 
 async function passkey(mode) {
   if (conditional) { conditional.abort(); conditional = null; }
@@ -286,6 +309,15 @@ function render(extra) {
     : '<p class="dim small">This browser can’t create passkeys.</p>';
   s += '</div>';
 
+  // access codes
+  s += '<div class="card"><h2>Access codes</h2>';
+  if (me.codes.length) {
+    s += '<ul class="list">' + me.codes.map((c) => '<li><span><b>' + h(c.label) + '</b><br><span class="dim small">access to ' +
+      h(c.audiences.join(', ')) + ' · since ' + fmt(c.at) + '</span></span></li>').join('') + '</ul>';
+  } else s += '<p class="dim">Got a code for a service? Enter it here.</p>';
+  s += '<form id="f-code" class="row"><input id="code-in" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="xxxx-xxxx-xxxx" aria-label="Access code">' +
+    '<button class="btn primary" type="submit">Redeem</button></form></div>';
+
   // google
   if (me.google || me.canLinkGoogle) {
     s += '<div class="card"><h2>Google</h2>';
@@ -351,6 +383,11 @@ function wire() {
     if (!confirm('Remove this passkey? (Also delete it from your device or password manager.)')) return;
     if (await act('/account/passkeys/remove', { id: b.dataset.rm }, 'Passkey removed.')) render();
   }));
+  on('f-code', 'submit', async (e) => {
+    e.preventDefault();
+    const r = await act('/account/code', { code: $('code-in').value.trim() });
+    if (r) { render(); msg('Code redeemed — ' + r.redeemed.label + ': access to ' + r.redeemed.audiences.join(', ') + '.'); }
+  });
   on('g-link', 'click', async () => { const r = await act('/account/google/link', {}); if (r && r.url) location.assign(r.url); });
   on('g-off', 'click', async () => {
     if (!confirm('Unlink Google? Continue with Google will stop signing in here.')) return;
