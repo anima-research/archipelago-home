@@ -485,7 +485,7 @@ export interface MintRecord {
   aud: string;
   scopes: string[];
   exp: number;
-  by: 'oauth' | 'password' | 'passkey' | 'setup' | 'exchange' | 'enroll' | 'cli';
+  by: 'oauth' | 'google' | 'password' | 'passkey' | 'setup' | 'exchange' | 'enroll' | 'cli';
 }
 
 export class MintLog {

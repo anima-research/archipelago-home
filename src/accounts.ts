@@ -13,6 +13,8 @@
  *
  * The sub is fixed at creation. Login methods attach to it and come and go;
  * a Discord-anchored row can't drop its Discord link (that link IS its sub).
+ * Google is only ever a login method (google.ts): it never makes a row or a
+ * sub of its own, and grants nothing by itself.
  *
  * Scopes: the Discord leg still decides what a Discord-linked person holds
  * (roles → scopes, read live at Discord login, or by bot lookup / a recent
@@ -21,6 +23,7 @@
  */
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual, type JsonWebKey } from 'node:crypto';
 import { JsonStore, type RoleGrant } from './stores.js';
+import { emailKey } from './google.js';
 
 // ── record ──
 
@@ -49,6 +52,18 @@ export interface HumanAccount {
     /** Role grant at the last Discord check (null = in no qualifying role). */
     grant?: RoleGrant | null;
     checkedAt?: string;
+  };
+  /**
+   * Google login. No `sub` yet = an operator invite (`hn user add --google`):
+   * the first Google sign-in with this verified address claims the row and
+   * fills in `sub`. With `sub`, that Google account signs in here, whatever
+   * its address is now (`email` is just the last one seen).
+   */
+  google?: {
+    sub?: string;
+    email: string;
+    name?: string;
+    linkedAt?: string;
   };
   /** `scrypt$<logN>$<r>$<p>$<salt>$<hash>` */
   password?: string;
@@ -84,6 +99,8 @@ function accountsProblem(raw: unknown): string | null {
   const subs = new Set<string>();
   const names = new Set<string>();
   const discords = new Set<string>();
+  const googles = new Set<string>();
+  const invited = new Set<string>();
   const passkeys = new Set<string>();
   for (const a of f.accounts) {
     if (typeof a.sub !== 'string' || !a.sub.startsWith('human:')) return 'bad sub';
@@ -97,6 +114,18 @@ function accountsProblem(raw: unknown): string | null {
     if (a.discord) {
       if (discords.has(a.discord.id)) return 'that Discord account is linked elsewhere';
       discords.add(a.discord.id);
+    }
+    if (a.google) {
+      if (typeof a.google.email !== 'string') return 'bad google email';
+      if (a.google.sub !== undefined) {
+        if (typeof a.google.sub !== 'string' || !a.google.sub) return 'bad google sub';
+        if (googles.has(a.google.sub)) return 'that Google account is linked elsewhere';
+        googles.add(a.google.sub);
+      } else {
+        const k = emailKey(a.google.email);
+        if (invited.has(k)) return `${a.google.email} is already invited to another account`;
+        invited.add(k);
+      }
     }
     for (const p of a.passkeys ?? []) {
       if (passkeys.has(p.id)) return 'that passkey is already registered';
@@ -140,6 +169,14 @@ export class AccountStore {
   byDiscord(id: string): HumanAccount | undefined {
     return this.all().find((a) => a.discord?.id === id);
   }
+  byGoogle(sub: string): HumanAccount | undefined {
+    return this.all().find((a) => a.google?.sub === sub);
+  }
+  /** The row an operator invited by this address, not yet claimed. */
+  byGoogleInvite(email: string): HumanAccount | undefined {
+    const k = emailKey(email);
+    return this.all().find((a) => a.google && !a.google.sub && emailKey(a.google.email) === k);
+  }
   byPasskey(credentialId: string): { account: HumanAccount; passkey: Passkey } | undefined {
     for (const account of this.all()) {
       const passkey = account.passkeys?.find((p) => p.id === credentialId);
@@ -156,7 +193,7 @@ export class AccountStore {
     return this.all().some((a) => a.sub !== exceptSub && (a.username === n || a.name?.toLowerCase() === n));
   }
 
-  /** Throws (writing nothing) on a duplicate sub, username, Discord link or passkey. */
+  /** Throws (writing nothing) on a duplicate sub, username, Discord/Google link or passkey. */
   add(a: HumanAccount): HumanAccount {
     this.store.update((f) => {
       if (f.accounts.some((x) => x.sub === a.sub)) throw new Error(`account ${a.sub} exists`);
@@ -169,7 +206,7 @@ export class AccountStore {
    * Read-modify-write of one account against the file as it is now, under a
    * lock the hn CLI shares, so neither side drops the other's change. `fn`
    * returns the new record, or throws to abort (nothing written). Throws if
-   * the result would duplicate a username, Discord link or passkey.
+   * the result would duplicate a username, Discord/Google link or passkey.
    */
   update(sub: string, fn: (a: HumanAccount) => HumanAccount): HumanAccount | undefined {
     let next: HumanAccount | undefined;
@@ -194,7 +231,7 @@ function checked(f: AccountsFile): AccountsFile {
 
 const USERNAME_RE = /^[a-z0-9](?:[a-z0-9._-]{1,30})[a-z0-9]$/;
 const RESERVED = new Set([
-  'admin', 'administrator', 'root', 'system', 'operator', 'guest', 'anonymous', 'discord', 'local', 'console',
+  'admin', 'administrator', 'root', 'system', 'operator', 'guest', 'anonymous', 'discord', 'google', 'local', 'console',
   'account', 'home', 'support', 'security', 'staff', 'everyone', 'here',
 ]);
 
@@ -336,7 +373,8 @@ export function displayName(a: HumanAccount): string {
   return (a.name || anchored || a.username || a.discord?.name || a.sub).slice(0, 32);
 }
 
-/** Login methods still standing — an account must always keep one. */
+/** Login methods still standing — an account must always keep one. (An
+ *  unclaimed Google invite counts: it is how that person gets in.) */
 export function loginMethods(a: HumanAccount): number {
-  return (a.password ? 1 : 0) + (a.passkeys?.length ?? 0) + (a.discord ? 1 : 0);
+  return (a.password ? 1 : 0) + (a.passkeys?.length ?? 0) + (a.discord ? 1 : 0) + (a.google ? 1 : 0);
 }
