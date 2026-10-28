@@ -13,7 +13,8 @@ services. The design has to hold for dozens or hundreds of homes, not just two.
 [Anima Docs, restricted](https://docs.animalabs.ai/d/duQI18Txo)). Sections below name the
 NET item they implement so the two documents don't drift.
 
-**Revision 2** takes in the first review on PR #7: revocation scope and reinstatement,
+**Revision 2** (with two corrections from its review: agents' proof of relationship, and
+freshness bounded by receiver challenges) takes in the first review on PR #7: revocation scope and reinstatement,
 interest-scoped event streams with proof of relationship, a subscriber state contract,
 conformance vectors, agent key lifecycle, key generations in place of token expiry, three
 declared shapes for scheme code, `(iss, aud)` for services that judge visitors directly,
@@ -208,8 +209,8 @@ Ferro, an agent of `lynx.example`, wants a token for Anima's docs.
    `archipelago-token|v1|id.animalabs.ai|docs|<timestamp>` signed with `K` — plus the
    attestation.
 3. Anima resolves `lynx.example`, verifies the attestation and the proof, registers interest
-   in Ferro with Lynx (the attestation is the proof of relationship), evaluates its scheme,
-   and returns a token for docs.
+   in Ferro with Lynx — presenting both, since together they show Ferro came to Anima
+   (§9.1) — evaluates its scheme, and returns a token for docs.
 
 The proof names Anima and a timestamp, so nobody can replay it elsewhere. Lynx mints nothing
 per destination, and its agents keep working while Lynx is briefly down, within what the
@@ -329,13 +330,20 @@ Two kinds of stream:
 
 - **Interest-scoped**, for anything about a principal. A receiver holds one session with each
   home it has visitors from, over which it **registers interest** in principals it admitted.
-  Registering needs **proof of relationship**: the receiver authenticates as the home or
-  service the credential was addressed to and presents a credential the publisher issued for
-  that principal — the login handoff token from §6.1, or the attestation from §6.2. The
-  publisher checks it against its own issuance record. It answers with the principal's
-  current status, then pushes changes for that principal on the session. A receiver never
-  learns about principals it didn't admit, and the stream carries only what the release
-  policy (§7) allows that receiver to know.
+  Registering needs **proof of relationship** — evidence that this principal came to *this*
+  receiver. The receiver authenticates as itself, and presents:
+  - **for a person**, the login handoff token from §6.1, which the publisher addressed to the
+    receiver;
+  - **for an agent**, the attestation the publisher issued for the agent's key *and* the
+    agent's key proof (§6.2) that names the receiver. The attestation alone names no
+    receiver — it is reused everywhere — so the proof is what ties the visit to this
+    receiver. The publisher checks that the proof is signed by the attested key, names the
+    authenticated receiver, and carries a timestamp within its window.
+
+  The publisher checks the credential against its own issuance record, answers with the
+  principal's current status, then pushes changes for that principal on the session. A
+  receiver never learns about principals it didn't admit, and the stream carries only what
+  the release policy (§7) allows that receiver to know.
 - **Public**, for facts about homes: an oracle's facts and a home's own key events concern
   homes, not people, and are broadcast to any subscriber.
 
@@ -387,9 +395,12 @@ of events, plus a signed snapshot of current state for a stream at a given `seq`
 
 **What a relay can do.** Because each event carries its issuer's signature, a relay can delay
 or withhold events but never alter them. Withholding is detectable: heartbeats carry the
-publisher's own `seq`, so a gap shows. A relay that withholds heartbeats too makes the source
-go stale, which the scheme already handles. A home relays the events of the oracles its
-schemes rely on, so its own services subscribe in one place.
+publisher's own `seq`, so a gap shows. Delay is bounded by challenges (§9.4): a relay can hold
+back a gap-free run of events and heartbeats, but none of them answers a challenge the
+receiver issues later, so the held-back run can't make anything fresh. A relay that holds back
+or withholds everything makes the source go stale, which the scheme already handles. A home
+relays the events of the oracles its schemes rely on, so its own services subscribe in one
+place; challenges pass through the relay to the publisher and back.
 
 ### 9.4 Status: fresh, stale, revoked (NET-2, NET-3)
 
@@ -399,16 +410,24 @@ A receiver's view of a principal is one of:
 - **stale(age)** — not confirmed recently, or not synced;
 - **revoked(scope)** — a revocation applies.
 
-*Confirmed* means the receiver has applied the stream up to a `seq` that covers the
-principal. **Synced** means it has applied a verified snapshot (or the interest
-registration's answer) and every event after it, with no gap, up to the `seq` the latest
-heartbeat reports. A live connection or a recent heartbeat is evidence of liveness only,
-never of a complete view: a receiver holding `seq` 1042 that sees a heartbeat at 1050 is
-missing events, and the principal stays at its last-confirmed age until it has caught up.
+**Challenges.** On each session the receiver regularly sends the publisher a fresh nonce
+and notes the time on its own clock. The publisher answers with a signed heartbeat that
+includes the nonce and its current `seq`. A heartbeat that doesn't carry the receiver's
+outstanding nonce says the stream is alive but confirms nothing.
 
-`age` is measured **at the receiver**, from when it received and applied the confirming
-events — never from the publisher's `at`, so clock skew between homes can't manufacture
-freshness.
+*Confirmed* means the receiver has applied the stream up to the `seq` stated in a signed
+answer to one of its own challenges, and that `seq` covers the principal. **Synced** means it
+has applied a verified snapshot (or the interest registration's answer) and every event after
+it, with no gap, up to that `seq`. A live connection or a recent heartbeat is evidence of
+liveness only, never of a complete view: a receiver holding `seq` 1042 whose challenge is
+answered at 1050 is missing events, and the principal stays at its last-confirmed age until
+it has caught up.
+
+`age` is measured **on the receiver's clock, from when it issued the challenge** that the
+confirming answer carried — never from the publisher's `at` (so clock skew between homes
+can't manufacture freshness), and never from when the events arrived (so a relay or network
+that delays a run of events can't either). Delay can only make a principal look older, never
+younger.
 
 **Unsynced is stale.** No fresh grant rests on a stream the receiver isn't synced with. The
 scheme sets, per grant (per action, NET-3), what happens to a stale principal:
@@ -430,7 +449,7 @@ What a receiver keeps, so that every subscriber does the same thing instead of i
 
 | Per | Persisted |
 |---|---|
-| stream | last applied `seq`; the snapshot it started from (id and `seq`); synced or not |
+| stream | last applied `seq`; the snapshot it started from (id and `seq`); synced or not; the outstanding challenge and when it was issued; the last answered challenge's time and `seq` |
 | interest | the principal, the proof it was registered with, when it lapses |
 | principal | current status (fresh, stale, revoked with scope) and when it was last confirmed, by the receiver's clock |
 | home | key generations seen and which are retired |
@@ -670,6 +689,7 @@ and at least one subscribing service.
 | 8 | Carried statement issued at oracle `seq` 1000; oracle published `denied` at 1010 | a synced receiver refuses; an unsynced one treats the statement as stale |
 | 9 | First visitor from a new home | the interest registration's answer makes the principal fresh, with no full snapshot |
 | 10 | Interest registration without proof of relationship | refused |
+| 10a | Interest registration for an agent with its attestation but no key proof naming the receiver | refused; with the attestation and a proof naming the receiver, accepted |
 | 11 | `revoked` with `key:2`, then a proof by key generation 3 | accepted; a proof by generation 2 is refused |
 | 12 | `revoked` with `tokensBefore:<t>` | tokens with `iat` before `t` refused, later ones accepted |
 | 13 | `revoked` with `grant:docs:write` | `docs:write` removed, other grants kept |
@@ -677,6 +697,7 @@ and at least one subscribing service.
 | 15 | `revoked` then `reinstated` with the same scope | accepted again |
 | 16 | A revocation signed by a home other than the principal's | ignored |
 | 17 | Token signed under a retired issuer key generation | refused; the snapshot omits revocations for that generation |
-| 18 | Event `at` far in the future | age measured from receipt; no freshness gained |
+| 18 | Event `at` far in the future | age measured from the receiver's challenge; no freshness gained |
+| 18a | A relay holds a gap-free run of events and heartbeats, releases it after the oracle publishes `denied` | none of the held heartbeats answers the receiver's current challenge; the principal is not made fresh |
 | 19 | A service judging directly gets a token with `aud: docs` from another issuer | refused unless `(iss, aud)` matches |
 | 20 | A scheme from a remote publisher carrying an unsandboxed module | refused |
