@@ -514,16 +514,30 @@ design:
   while its signature verifies under a live generation, no revocation in scope applies, and
   the scheme's staleness rules allow it.
 - **A token without `exp` must be bound to a key.** It names its holder's key in a `cnf`
-  claim, and the holder presents it with a proof of possession — a fresh signature with that
-  key over the audience and a timestamp, the same shape as the existing key proof. A copied
-  token is useless without the key, so a leak nobody noticed doesn't need a clock. Agents
-  already hold keys; this is how their tokens become long-lived.
+  claim, and the holder presents it with a **proof of possession**: a signature with that key
+  over `archipelago-present|v1|<iss>|<aud>|<timestamp>|<jti>|<token hash>` — the audience, a
+  timestamp within the usual ±5-minute window, a random `jti`, and a hash of the token it
+  accompanies. A copied token is useless without the key, so a leak nobody noticed doesn't
+  need a clock. Agents already hold keys; this is how their tokens become long-lived.
+  - **Each proof works once.** The verifier keeps the `jti`s it has seen for the length of the
+    window — a bounded set, as the login-handoff `jti` cache is — so a captured
+    `(token, proof)` pair can't be replayed even within those five minutes. An audience that
+    wants a tighter binding supplies a nonce the proof must include (as DPoP's `DPoP-Nonce`
+    does).
+  - **How it travels.** Over HTTP, in a header beside `Authorization`. On the WebSocket door —
+    which every networked MCPL server uses today, with `?token=` — as a second upgrade
+    parameter or header, checked once at the upgrade and holding for the connection's
+    lifetime.
 - **A bearer token keeps a short `exp`.** Anything presented as `Authorization: Bearer
   aid1…` with no proof of possession — which is every service today — is exposed to leaks
   nobody can revoke, because nobody knows they happened. A key generation doesn't bound that:
   a token minted just after a rotation would live a whole rotation period. So bearer tokens
   carry an `exp`, as login handoff tokens do (§6.4); the verifier refuses a bearer token
-  without one.
+  without one. **The default is one hour.** Today a resident's bearer token lasts 7 days,
+  which is the real exposure to an unnoticed leak; hosts already re-mint transparently
+  (caching a token for at most an hour and dropping it on an authentication failure), so an
+  hour costs nothing operationally. The exact figure is set alongside the rotation schedule
+  (§14, Q3).
 - **Key generations bound memory and lifetime.** A home rotates its signing key on a schedule
   and publishes its generations in its discovery document (§5). Retiring a generation
   invalidates every token it signed, so a key-bound token lives at most until its generation
@@ -668,8 +682,9 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
 - **False revocation.** A revocation or reinstatement counts only when signed by the home
   that issued what it revokes: the principal's home for the principal, a receiving home for
   the tokens and grants it minted (§9.2).
-- **Leaked tokens.** A token without `exp` is useless without its holder's key; a bearer
-  token keeps a short `exp` (§9.7).
+- **Leaked tokens.** A token without `exp` is useless without its holder's key, and each
+  proof of possession works once; a bearer token keeps a short `exp`, one hour by default
+  (§9.7).
 - **Audience collisions.** Services judging foreign tokens directly verify `(iss, aud)`.
 - **Discovery is user-driven fetching** (§5): HTTPS, public addresses only, timeouts, size
   limits, caching, rate limits.
@@ -686,9 +701,9 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
    site) or at `id.animalabs.ai` (works today). This also decides what `iss` says.
 2. **Consent defaults.** Ask on the first visit to every unlisted home, and never for homes
    in the release policy — or something stricter.
-3. **Rotation schedule** for issuer keys, and the overlap window. (Which bound applies to
-   which token is settled in §9.7: `exp` for bearer tokens, the key generation for key-bound
-   ones.)
+3. **Rotation schedule** for issuer keys, the overlap window, and the exact bearer `exp`
+   (default one hour). (Which bound applies to which token is settled in §9.7: `exp` for
+   bearer tokens, the key generation for key-bound ones.)
 4. **Revoking a compromised home key:** which sources a scheme should accept for that, and
    how succession statements interact with it.
 5. **Retention.** Key generations bound what must be remembered; still open is how long a
@@ -768,5 +783,7 @@ and at least one subscribing service.
 | 25 | `reinstated` with a different scope from the revocation | ignored; the revocation stands |
 | 26 | Anima revokes the tokens it minted for `human:local:alice@lynx.example` while Lynx still vouches for her | Anima's services refuse her; Lynx and its services are unaffected |
 | 27 | A key-bound token (no `exp`) presented without proof of possession | refused; with a fresh proof by the `cnf` key, accepted |
+| 27a | The same `(token, proof)` pair presented twice within the five-minute window | the second is refused |
+| 27b | A proof whose token hash names a different token | refused |
 | 28 | A bearer token without `exp` | refused |
 | 29 | Rotation: tokens of the outgoing generation during the overlap, then after retirement | accepted during the overlap; refused after retirement |
