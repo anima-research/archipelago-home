@@ -47,6 +47,8 @@ import {
 import {
   DISCORD_SNAPSHOT_MAX_AGE_MS,
   displayName,
+  effectiveRoles,
+  withheld,
   hashPassword,
   loginMethods,
   looksLikeRecoveryCode,
@@ -326,7 +328,9 @@ export class HumanAuth {
       this.d.fetchImpl,
     );
     const discordName = displayNameOf(user, member);
-    const discordGrant = member ? grantForRoles(member.roles, this.d.roles.get()) : null;
+    // Roles the operator set aside for this person don't count (accounts.ts).
+    const target = st.intent === 'link' ? this.d.accounts.bySub(st.sub) : this.d.accounts.byDiscord(user.id);
+    const discordGrant = member ? grantForRoles(effectiveRoles(member.roles, target), this.d.roles.get()) : null;
     const snapshot = { id: user.id, name: discordName, grant: discordGrant, checkedAt: new Date().toISOString() };
 
     if (st.intent === 'link') {
@@ -547,7 +551,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       if (this.d.cfg.discordBotToken && this.d.roles.get().guildId) {
         try {
           const m = await botGuildMember(this.d.cfg.discordBotToken, this.d.roles.get().guildId, dc.id, this.d.fetchImpl);
-          discordGrant = m ? grantForRoles(m.roles, this.d.roles.get()) : null;
+          discordGrant = m ? grantForRoles(effectiveRoles(m.roles, acct), this.d.roles.get()) : null;
           const name = m?.user ? displayNameOf(m.user, m) : dc.name;
           account =
             this.d.accounts.update(acct.sub, (a) => ({
@@ -579,7 +583,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (!target) return { ok: false, status: 400, error: `unknown audience ${audience}` };
     // Codes count for their own audiences only (codes.ts) — read live, so a
     // revoked code stops working at the next sign-in.
-    const grant = mergeGrants(who.grant, this.d.codes.grantFor(this.d.accounts.bySub(who.sub)?.codes, audience));
+    const live = this.d.accounts.bySub(who.sub);
+    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience)), live);
     if (audience === 'account') {
       // Managing your own sign-in needs an account, or a Discord login that
       // would qualify for something (strangers don't get to create rows).

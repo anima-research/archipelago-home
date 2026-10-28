@@ -80,6 +80,12 @@ export interface HumanAccount {
   codes?: Array<{ id: string; at: string }>;
   /** Operator grant, unioned with whatever Discord grants. */
   scopes?: string[];
+  /** Operator restriction: Discord roles (ids) that don't count for this
+   *  person — they hold what their OTHER roles give. */
+  ignoreRoles?: string[];
+  /** Operator restriction: scopes this person never holds here, whatever
+   *  grants them (roles, operator, codes). */
+  withhold?: string[];
   claims?: Record<string, unknown>;
   /** One-time setup link (hn user add / reset): sha256 of the code + expiry. */
   setup?: { hash: string; exp: string };
@@ -346,6 +352,17 @@ export function newSetupCode(nowMs = Date.now()): { code: string; setup: { hash:
 }
 
 // ── grants ──
+
+/** The person's Discord roles minus the ones the operator set aside for them. */
+export function effectiveRoles(roles: string[], a: HumanAccount | undefined): string[] {
+  return a?.ignoreRoles?.length ? roles.filter((r) => !a.ignoreRoles!.includes(r)) : roles;
+}
+
+/** A grant minus what the operator withholds from this person. */
+export function withheld(g: RoleGrant | null, a: HumanAccount | undefined): RoleGrant | null {
+  if (!g || !a?.withhold?.length) return g;
+  return { ...g, scopes: g.scopes.filter((s) => !a.withhold!.includes(s)) };
+}
 
 /** Discord snapshots this old stop counting for non-Discord logins when no
  *  bot token is configured to re-check live: a removed role takes effect on
