@@ -2,8 +2,8 @@
 
 **Status:** Draft (revision 2, 2026-10-28). Draft→Accepted is gated on the
 [conformance vectors](#16-conformance-vectors) existing as executable fixtures, as for the
-mcpl RFCs. Nothing here is built yet. [Open questions](#14-open-questions) are listed near
-the end.
+mcpl RFCs. Nothing here is built yet. [Decisions and what's still open](#14-decided-and-still-open) are
+listed near the end.
 
 **Why now:** a second home node (Lynx) is coming up with its own people, agents and
 services. The design has to hold for dozens or hundreds of homes, not just two.
@@ -108,6 +108,10 @@ elsewhere; agents never type anything — their credential already carries their
   itself, and what directories say about it — never one shared table.
 - **An agent's handle uses the name inside its `sub`**, which is already a lowercase slug,
   not its display name.
+- **A home keeps handle names unique across people and agents.** Names are compared in slug
+  form, so a person `alice-smith` and an agent named "Alice Smith" (slug `alice-smith`) can't
+  both exist: registration and enrolment refuse a name whose slug is already taken by anyone
+  at the home.
 
 **Subjects of visitors.** When home R admits a principal from home H, it qualifies the `sub`
 H used. A subject always has exactly one `@`, so a verifier that splits on the first or the
@@ -541,8 +545,13 @@ What a receiver keeps, so that every subscriber does the same thing instead of i
 reset), every stream is unsynced, and the receiver resumes each relationship's stream with
 `since=<seq>` — one request per publisher, however many principals it holds there.
 **After falling out of the retention window**, it sends one batched resync listing its
-interest ids, takes the answer as the snapshot for that interest set, and replays from the
-snapshot's `seq`. It never re-registers interests one by one: a receiver with thousands of
+interest ids. The answer says, per id, whether the interest is **still live** — with that
+principal's current state, which serves as the snapshot for them — or **lapsed**. The
+receiver replays from the snapshot's `seq` for the live ones. A lapsed interest can't be
+restored by its id (§9.1): that principal stays stale until they come back with a fresh proof
+of relationship, which their next sign-in or token request provides. (With both defaults at
+30 days, a receiver offline longer than that finds most idle interests lapsed; the ones it
+kept renewing while serving are still live.) It never re-registers interests one by one: a receiver with thousands of
 visitors from one home would otherwise fire thousands of requests at it on every restart. **On a gap**, it resyncs from its cursor
 with jittered backoff and a per-pair rate limit, so a gap seen by many receivers can't turn
 into a resync storm (NET-7). Revocations are kept only while the key generation they apply
@@ -844,7 +853,7 @@ and at least one subscribing service.
 | 19 | A service judging directly gets a token with `aud: docs` from another issuer | refused unless `(iss, aud)` matches |
 | 20 | A scheme from a remote publisher carrying an unsandboxed module | refused |
 | 21 | Receiver restarts holding cursor 1042 on a relationship's stream | every stream unsynced, principals keep aging; one `since=1042` request per publisher resumes it |
-| 22 | Receiver restarts after falling out of the retention window | one batched resync by interest ids, no per-principal re-registration |
+| 22 | Receiver restarts after falling out of the retention window | one batched resync by interest ids, no per-principal re-registration; live interests come back with current state, lapsed ones are reported lapsed and their principals stay stale until a fresh proof |
 | 23 | Before its idle limit, the receiver renews an interest by interest id; later, an interest that has lapsed | renewed before the lapse; after it, renewal by id is refused, as is the original, now-stale proof — a fresh proof of relationship is needed |
 | 24 | A heartbeat that doesn't carry the receiver's outstanding nonce | the stream is alive; nothing is confirmed and age keeps growing |
 | 25 | `reinstated` with a different scope from the revocation | ignored; the revocation stands |
@@ -855,6 +864,7 @@ and at least one subscribing service.
 | 28 | A bearer token without `exp` | refused |
 | 29 | Rotation: tokens of the outgoing generation during the overlap, then after retirement | accepted during the overlap; refused after retirement |
 | 30 | Handle `alice@id.lynx.example` typed at sign-in | name `alice`, home `id.lynx.example`; discovery is fetched from `id.lynx.example` |
+| 31 | Registering a person `alice-smith` at a home with an agent named "Alice Smith" | refused: the slug is taken |
 
 ## 17. Later: short names, unexposed homes, network discovery
 
