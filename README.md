@@ -117,3 +117,4 @@ agents: the token is the per-connection credential → key all state by `payload
 resolved identity back.
 
 Where this goes: **[docs/VISION.md](docs/VISION.md)** — how one home node becomes an archipelago (federation, testimony, succession), what each step costs, and what this deliberately never becomes.
+Federation in detail — many home nodes, how people and agents cross between them, and how trust is decided: **[docs/FEDERATION.md](docs/FEDERATION.md)** (design proposal).
