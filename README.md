@@ -72,6 +72,25 @@ Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes l
 factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
 these, so they remain a way in during a lockout.
 
+## Access codes
+
+A code grants named **audiences** (and the scopes they need) to whoever redeems it: on the sign-in
+page ("Have an access code?", which also signs a newcomer up through Google or Discord), or later
+under sign-in settings. What a code grants counts **only for its own audiences**: it never widens
+what the person holds elsewhere (audiences without `requiredScopes` take any grant, and a code for
+one service must not open those).
+
+```sh
+hn code add --aud speakers.coev.ai --scopes speakers:member --label "Speaker ranker" --max-uses 25 [--expires 14d]
+                                       # → the code, shown once (stored hashed in data/codes.json, 0600)
+hn code ls                             # uses, and who redeemed what
+hn code close <id>                     # no new redemptions; what it gave stays
+hn code revoke <id>                    # and take back what it gave, at each holder's next sign-in
+```
+
+A code can ride a link: `https://<HN_DOMAIN>/login?audience=<aud>#code=<code>` (fragment, so it
+stays out of logs). `--expires` and `--max-uses` limit redeeming, not access once redeemed.
+
 ## The deployment's policy (config/)
 
 What the node knows about *your* services is configuration, hot-reloaded (edit, save, no
