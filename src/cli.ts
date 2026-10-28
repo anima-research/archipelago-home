@@ -10,9 +10,10 @@
  *   hn revoke <sub>            hn revoke-invite <code>
  *
  *   hn user add <username> [--scopes a,b] [--name "Display"] [--tier x]   → one-time setup link
+ *   hn user add <username> --google alice@gmail.com [--scopes a,b] …     → no link: they Continue with Google
  *   hn user ls [--json]
  *   hn user reset <username> [--clear-2fa] [--clear-passkeys]             → new setup link
- *   hn user set <username> [--scopes a,b] [--name "Display"] [--tier x]
+ *   hn user set <username> [--scopes a,b] [--name "Display"] [--tier x] [--google <email> | --google none]
  *   hn user disable <username>     hn user enable <username>
  */
 import { join } from 'node:path';
@@ -23,6 +24,7 @@ import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './tok
 import { InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
 import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
+import { emailKey, looksLikeEmail } from './google.js';
 
 function flags(args: string[]): { flag: Map<string, string>; pos: string[] } {
   const flag = new Map<string, string>();
@@ -204,14 +206,28 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
   const describe = (a: HumanAccount) =>
     `  ${a.username ?? '—'}  ${a.sub}  "${displayName(a)}"` +
     `  pw:${a.password ? 'y' : 'n'} 2fa:${a.totp ? 'y' : 'n'} passkeys:${a.passkeys?.length ?? 0}` +
-    `${a.discord ? `  discord:${a.discord.id}` : ''}${a.scopes?.length ? `  [${a.scopes.join(' ')}]` : ''}` +
+    `${a.discord ? `  discord:${a.discord.id}` : ''}${a.google ? `  google:${a.google.email}${a.google.sub ? '' : '(invited)'}` : ''}` +
+    `${a.scopes?.length ? `  [${a.scopes.join(' ')}]` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
+
+  /** --google <email>: an invite by address, checked against everyone else's. */
+  const googleFlag = (forSub?: string): { email: string } | null | undefined => {
+    const v = flag.get('google');
+    if (v === undefined) return undefined;
+    if (v === 'none') return null;
+    if (!looksLikeEmail(v)) die(`--google wants an email address (or "none"), got "${v}"`);
+    const k = emailKey(v);
+    const clash = accounts.all().find((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
+    if (clash) die(`${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}`);
+    return { email: v.trim() };
+  };
 
   switch (sub) {
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
       const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
       if (bad) die(bad);
+      const google = googleFlag();
       const { code, setup } = newSetupCode();
       const tier = flag.get('tier');
       accounts.add({
@@ -220,11 +236,16 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         ...(flag.get('name') ? { name: flag.get('name')!.slice(0, 32) } : {}),
         ...(scopesFlag ? { scopes: scopesFlag } : {}),
         ...(tier ? { claims: { tier } } : {}),
-        setup,
+        // Invited by Google address: that is their way in, no setup link.
+        ...(google ? { google } : { setup }),
         createdAt: new Date().toISOString(),
         notes: `hn user add ${new Date().toISOString().slice(0, 10)}`,
       });
       console.error(`[hn] account human:local:${username} created [${(scopesFlag ?? []).join(' ') || 'no scopes yet — hn user set --scopes'}]`);
+      if (google) {
+        console.error(`[hn] they sign in with "Continue with Google" as ${google.email} (the first sign-in links it). For a password too: hn user reset ${username}`);
+        return;
+      }
       console.error(`[hn] send them this one-time link (valid 72h) to set a password:`);
       console.log(setupLink(code));
       return;
@@ -268,12 +289,19 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         const clash = accounts.all().some((x) => x.sub !== a.sub && (x.username === n || x.name?.toLowerCase() === n));
         if (clash || principals.nameTaken(n)) die(`the name "${newName}" is already in use here`);
       }
-      const next = accounts.update(a.sub, (x) => ({
-        ...x,
-        ...(scopesFlag ? { scopes: scopesFlag } : {}),
-        ...(flag.get('name') ? { name: flag.get('name')!.slice(0, 32) } : {}),
-        ...(tier ? { claims: { ...x.claims, tier } } : {}),
-      }))!;
+      const google = googleFlag(a.sub);
+      if (google !== undefined && a.google?.sub) console.error(`[hn] note: replacing the linked Google account (${a.google.email}) on ${a.sub}`);
+      const next = accounts.update(a.sub, (x) => {
+        const n: HumanAccount = {
+          ...x,
+          ...(scopesFlag ? { scopes: scopesFlag } : {}),
+          ...(flag.get('name') ? { name: flag.get('name')!.slice(0, 32) } : {}),
+          ...(tier ? { claims: { ...x.claims, tier } } : {}),
+          ...(google ? { google } : {}),
+        };
+        if (google === null) delete n.google;
+        return n;
+      })!;
       console.error(`[hn] updated:`);
       console.log(describe(next));
       return;
