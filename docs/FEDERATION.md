@@ -13,13 +13,20 @@ services. The design has to hold for dozens or hundreds of homes, not just two.
 [Anima Docs, restricted](https://docs.animalabs.ai/d/duQI18Txo)). Sections below name the
 NET item they implement so the two documents don't drift.
 
-**Revision 2** (with two corrections from its review: agents' proof of relationship, and
-freshness bounded by receiver challenges) takes in the first review on PR #7: revocation scope and reinstatement,
+**Revision 2** took in the first review on PR #7: revocation scope and reinstatement,
 interest-scoped event streams with proof of relationship, a subscriber state contract,
-conformance vectors, agent key lifecycle, key generations in place of token expiry, three
-declared shapes for scheme code, `(iss, aud)` for services that judge visitors directly,
-single-`@` subjects, showing the resolved home before redirecting, and collapsing the
-verifier copies before anything builds on them.
+conformance vectors, agent key lifecycle, key generations, three declared shapes for scheme
+code, `(iss, aud)` for services that judge visitors directly, single-`@` subjects, showing the
+resolved home before redirecting, and collapsing the verifier copies first — plus Greptile's
+corrections: agents' proof of relationship, and freshness bounded by receiver challenges,
+on sessions and polls alike.
+
+**Revision 3** settles the seams the second review found: interest-scoped streams are
+numbered per relationship, so a cursor survives sessions; first registration returns an
+interest id that renewal and re-registration use; tokens without `exp` must be bound to a
+key, while bearer tokens keep a short `exp` (this closes the old Q3); key rotation keeps two
+generations live; a home signs revocations for what it issued, including the tokens it
+minted for visitors; five more vectors; and the full inventory of verifier copies.
 
 ---
 
@@ -48,10 +55,10 @@ verifier copies before anything builds on them.
 | 6 | Judgment is a **scheme**: a named, published policy. A service writes its own or delegates to a scheme published on a home node, including how rules combine. | agreed |
 | 7 | Seed vocabularies for facts and events are proposed, and optional. | agreed |
 | 8 | Anima runs an oracle. | agreed |
-| 9 | Revocation is **pushed** over interest sessions (NET-1, NET-5). A revocation names its scope and holds until a signed reinstatement. Each scheme says what to do when a source goes quiet. | agreed; scope and reinstatement from review |
+| 9 | Revocation is **pushed** over interest sessions (NET-1, NET-5). A revocation names its scope and holds until a signed reinstatement. A home signs revocations for what it issued — its own principals, and the tokens and grants it minted for visitors. Each scheme says what to do when a source goes quiet. | agreed; scope, reinstatement and signers from review |
 | 10 | **Login handoff tokens keep a 10-minute expiry** and stay single-use. That expiry protects a token travelling in a URL, not trust. | agreed |
 | 11 | Binding the same person's identities across homes is a separate, later step. | agreed |
-| 12 | Tokens stay `aid1`. `exp` becomes optional; the **issuer key generation** becomes mandatory and bounds how long anything must be remembered (§9.7). | from review |
+| 12 | Tokens stay `aid1`, and the **issuer key generation** (`kg`) becomes mandatory. A token without `exp` must be **bound to a key** and presented with proof of possession; a **bearer** token keeps a short `exp`. Generations bound how long anything must be remembered (§9.7). | from review |
 
 ## 3. Doctrine changes
 
@@ -239,8 +246,9 @@ through history, screenshots or extensions — something no revocation can catch
 nobody knows it leaked. It also backs up the single-use check, which lives in memory and is
 lost on restart.
 
-Everything else that lasts — agent tokens, attestations, grants — stays valid until a pushed
-event changes it, within the horizon of its key generation (§9.7).
+Everything else that lasts — key-bound tokens, attestations, grants — stays valid until a
+pushed event changes it, within the horizon of its key generation (§9.7). A token that works
+as a bearer credential keeps a short `exp` for the same reason the handoff token does.
 
 ## 7. Release: what a home tells other homes
 
@@ -340,21 +348,30 @@ Two kinds of stream:
     receiver. The publisher checks that the proof is signed by the attested key, names the
     authenticated receiver, and carries a timestamp within its window.
 
-  The publisher checks the credential against its own issuance record, answers with the
-  principal's current status, then pushes changes for that principal on the session. A
-  receiver never learns about principals it didn't admit, and the stream carries only what
-  the release policy (§7) allows that receiver to know.
+  The publisher checks the credential against its own issuance record, records the
+  relationship, and answers with an **interest id** and the principal's current status. It
+  then pushes changes for that principal on the relationship's stream (§9.2). A receiver
+  never learns about principals it didn't admit, and the stream carries only what the release
+  policy (§7) allows that receiver to know.
+
+  The proof's time window applies to the **first registration only**: the handoff token is
+  single-use, and the agent's key proof is minutes old at best. Renewal and re-registration
+  reference the interest id, with the receiver authenticated as itself. The id is useless to
+  anyone else, so it is not a bearer credential.
 - **Public**, for facts about homes: an oracle's facts and a home's own key events concern
   homes, not people, and are broadcast to any subscriber.
 
 An interest lapses when the receiver drops it, when the key generation it was registered
-under retires (§9.7), or after an idle period the publisher sets, which the receiver renews
-while it still serves the principal.
+under retires (§9.7), or after an idle period the publisher sets. The receiver renews it by
+interest id while it still serves the principal. A lapsed interest needs a fresh proof of
+relationship — the principal has to come back.
 
 ### 9.2 Events
 
-Signed events, numbered without gaps per stream (per session for interest-scoped streams,
-per publisher for public ones):
+Signed events, numbered without gaps per stream. An interest-scoped stream is numbered per
+**relationship** — one receiver and one publisher — and that numbering persists across
+sessions, so a cursor saved before a restart still means something after it. A public stream
+is numbered per publisher.
 
 | Publisher | Events |
 |---|---|
@@ -380,8 +397,20 @@ per publisher for public ones):
 
 `revoked` is absorbing: a known revocation never degrades into staleness on disconnect, and
 it ends only with a signed `reinstated` of the same scope, or a replacement through key
-rotation or succession. Only the principal's own home can sign either; a revocation from
-anyone else is ignored.
+rotation or succession. A `reinstated` with a different scope changes nothing.
+
+**Who signs.** A home signs revocations and reinstatements for **what it issued**, and they
+apply only to that:
+
+- **The principal's own home** — Lynx, for `human:local:alice` — revokes the principal itself:
+  any scope, everywhere her identity is accepted.
+- **A receiving home** — Anima, which minted its own tokens for
+  `human:local:alice@lynx.example` (decision 4) — revokes **the tokens and grants it issued**,
+  under its own key and on its own stream: its scheme changed, it blocks her locally, or it
+  cuts off its own tokens issued before a time. Anima's services refuse her; Lynx and its
+  services are unaffected.
+
+A revocation signed by anyone else is ignored.
 
 Each event is signed by its issuer with the same construction as `aid1` tokens: ed25519
 over the literal bytes, with its own prefix, under the issuer key generation `kg`.
@@ -390,7 +419,8 @@ over the literal bytes, with its own prefix, under the issuer key generation `kg
 
 Sessions run on the home's MCPL endpoint (published under `home.events`, and in `/services`
 under `mcpl`). For a receiver that holds no session, the polled feed is the fallback (NET-5):
-`GET <home.feed>?since=<seq>&challenge=<nonce>` returns the events after `seq` and ends with a
+`GET <home.feed>?since=<seq>&challenge=<nonce>` (with the receiver authenticated, for its
+relationship's stream) returns the events after `seq` and ends with a
 signed heartbeat that carries the nonce and the publisher's current `seq` — the same answer a
 session gives (§9.4), so a polling receiver confirms freshness exactly as a connected one
 does. A feed request without a challenge still returns events, but confirms nothing. A publisher keeps a retention window
@@ -452,15 +482,18 @@ What a receiver keeps, so that every subscriber does the same thing instead of i
 
 | Per | Persisted |
 |---|---|
-| stream | last applied `seq`; the snapshot it started from (id and `seq`); synced or not; the outstanding challenge and when it was issued; the last answered challenge's time and `seq` |
-| interest | the principal, the proof it was registered with, when it lapses |
+| stream | last applied `seq` (per relationship for interest-scoped streams); the snapshot it started from (id and `seq`); synced or not; the outstanding challenge and when it was issued; the last answered challenge's time and `seq` |
+| interest | the principal, its interest id, when it lapses |
 | principal | current status (fresh, stale, revoked with scope) and when it was last confirmed, by the receiver's clock |
 | home | key generations seen and which are retired |
 
 **On restart**, every principal starts at its last-confirmed age (so it ages, it doesn't
-reset), every stream is unsynced, and the receiver resumes each stream with `since=<seq>`.
-**After falling out of the retention window**, it requests a snapshot for its interest set,
-applies it, and replays from the snapshot's `seq`. **On a gap**, it resyncs from its cursor
+reset), every stream is unsynced, and the receiver resumes each relationship's stream with
+`since=<seq>` — one request per publisher, however many principals it holds there.
+**After falling out of the retention window**, it sends one batched resync listing its
+interest ids, takes the answer as the snapshot for that interest set, and replays from the
+snapshot's `seq`. It never re-registers interests one by one: a receiver with thousands of
+visitors from one home would otherwise fire thousands of requests at it on every restart. **On a gap**, it resyncs from its cursor
 with jittered backoff and a per-pair rate limit, so a gap seen by many receivers can't turn
 into a resync storm (NET-7). Revocations are kept only while the key generation they apply
 to is live (§9.7), which bounds this state.
@@ -477,21 +510,36 @@ open in the Desktop doc (Q20 (b)–(c)); step 3's first consumer needs an answer
 Today every `aid1` token has an `exp`, and the verifier refuses one without it. Under this
 design:
 
-- **`aid1` stays.** `exp` becomes optional; **`kg`, the issuer key generation, becomes
-  mandatory.** A token is valid while its signature verifies under a live generation, no
-  revocation in scope applies, and the scheme's staleness rules allow it.
-- **Login handoff tokens keep `exp`** (§6.4).
-- **Key generations bound memory.** A home rotates its signing key on a schedule, publishing
-  generations in its discovery document (§5). Retiring a generation invalidates every token
-  it signed, so a revocation need only be remembered while its generation is live, and a
-  snapshot never lists more than that. Without this, a token minted in 2026 could be
-  presented in 2031, and no publisher could ever drop a revocation.
-- **Moving over.** Services that don't subscribe yet keep receiving tokens with `exp`. An
-  audience opts in to the new behaviour with a setting in `audiences.json`.
+- **`aid1` stays, and `kg`, the issuer key generation, becomes mandatory.** A token is valid
+  while its signature verifies under a live generation, no revocation in scope applies, and
+  the scheme's staleness rules allow it.
+- **A token without `exp` must be bound to a key.** It names its holder's key in a `cnf`
+  claim, and the holder presents it with a proof of possession — a fresh signature with that
+  key over the audience and a timestamp, the same shape as the existing key proof. A copied
+  token is useless without the key, so a leak nobody noticed doesn't need a clock. Agents
+  already hold keys; this is how their tokens become long-lived.
+- **A bearer token keeps a short `exp`.** Anything presented as `Authorization: Bearer
+  aid1…` with no proof of possession — which is every service today — is exposed to leaks
+  nobody can revoke, because nobody knows they happened. A key generation doesn't bound that:
+  a token minted just after a rotation would live a whole rotation period. So bearer tokens
+  carry an `exp`, as login handoff tokens do (§6.4); the verifier refuses a bearer token
+  without one.
+- **Key generations bound memory and lifetime.** A home rotates its signing key on a schedule
+  and publishes its generations in its discovery document (§5). Retiring a generation
+  invalidates every token it signed, so a key-bound token lives at most until its generation
+  retires, a revocation need only be remembered while its generation is live, and a snapshot
+  never lists more than that.
+- **Rotation overlaps.** At least two generations are live during a rotation, so tokens of the
+  outgoing generation keep working while holders re-mint. The home announces the rotation with
+  `keyRotated` on its public stream, so hosts re-mint ahead of the retirement instead of
+  discovering it as a wave of refused connections.
+- **Moving over.** Services that don't subscribe or check proofs of possession yet keep
+  receiving bearer tokens with `exp`. An audience opts in to key-bound tokens with a setting
+  in `audiences.json`.
 
-The Desktop doc's NET-2 proposes the opposite default: `exp` as a hard outer bound, with a
-7-day `exp` and 60-second freshness given as sound. Here the outer bound is the key
-generation instead. The two need reconciling (§14).
+**Reconciling with NET-2.** The Desktop doc's NET-2 keeps `exp` as the outer bound. Both hold
+here, for different tokens: `exp` bounds bearer tokens, where an unnoticed leak is the risk;
+the key generation bounds key-bound tokens, where it isn't.
 
 ## 10. Seed vocabularies (optional)
 
@@ -617,8 +665,11 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
   timestamp.
 - **Subscription flooding.** Interest needs proof of relationship (§9.1); nobody can watch
   a principal they never admitted.
-- **False revocation.** Only a principal's own home can sign a revocation or a reinstatement
-  for it.
+- **False revocation.** A revocation or reinstatement counts only when signed by the home
+  that issued what it revokes: the principal's home for the principal, a receiving home for
+  the tokens and grants it minted (§9.2).
+- **Leaked tokens.** A token without `exp` is useless without its holder's key; a bearer
+  token keeps a short `exp` (§9.7).
 - **Audience collisions.** Services judging foreign tokens directly verify `(iss, aud)`.
 - **Discovery is user-driven fetching** (§5): HTTPS, public addresses only, timeouts, size
   limits, caching, rate limits.
@@ -635,16 +686,16 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
    site) or at `id.animalabs.ai` (works today). This also decides what `iss` says.
 2. **Consent defaults.** Ask on the first visit to every unlisted home, and never for homes
    in the release policy — or something stricter.
-3. **`exp` against key generations.** This revision makes the key generation the outer
-   bound; the Desktop doc's NET-2 proposes `exp`. Which bound, or both, and the rotation
-   schedule for issuer keys.
+3. **Rotation schedule** for issuer keys, and the overlap window. (Which bound applies to
+   which token is settled in §9.7: `exp` for bearer tokens, the key generation for key-bound
+   ones.)
 4. **Revoking a compromised home key:** which sources a scheme should accept for that, and
    how succession statements interact with it.
 5. **Retention.** Key generations bound what must be remembered; still open is how long a
    publisher keeps replayable events before a subscriber must take a snapshot, and the
    snapshot format.
-6. **Interest lapse.** The idle period after which a publisher drops an interest, and how a
-   receiver renews it.
+6. **Interest lapse.** The idle period after which a publisher drops an interest. (Renewal
+   is by interest id, §9.1.)
 7. **Sandbox runtime** for `module` schemes: WASM, a JS isolate, or both.
 8. **Oracle governance:** who reviews Anima's oracle file, and whether a home is told when a
    fact about it changes.
@@ -657,11 +708,16 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
 
 1. **This document**, to Accepted once the conformance vectors (§16) exist as executable
    fixtures.
-2. **Collapse the verifier copies.** Several services carry their own copy of the `aid1`
-   verifier — eidoverse-worlds, gate, archipelago-docs, ecowitt, clawblox in TypeScript,
-   orrery in Python. Make `@animalabs/archipelago-home/verifier` the only TypeScript copy and
-   add a Python twin, so the revocation hook and the evaluator each land once rather than
-   forking across every service.
+2. **Collapse the verifier copies.** About a dozen services carry their own copy of the
+   `aid1` verifier, in three languages:
+   - TypeScript: eidoverse-worlds, gate, archipelago-docs, archipelago-board, ecowitt-mcpl,
+     games-mcpl, go-mcpl, vst-mcpl, clawblox-mcpl;
+   - CommonJS: sam-archive, and canon's `server/aid1.js` (reported in the 10-10 survey);
+   - Python: orrery.
+
+   Make `@animalabs/archipelago-home/verifier` the only JavaScript and TypeScript copy and add
+   a Python twin, so the revocation hook and the evaluator each land once rather than forking
+   across every service.
 3. **The home's event stream:** interest sessions with proof of relationship, scoped
    revocation and reinstatement, heartbeats carrying `seq`, snapshots per interest set, the
    polled fallback, and the subscriber side in the verifier package. This pays off before any
@@ -705,3 +761,12 @@ and at least one subscribing service.
 | 18b | A receiver with no session polls the feed with a challenge | the response's final heartbeat answers the challenge; after applying the events the principal is fresh. Without a challenge, the events apply but confirm nothing |
 | 19 | A service judging directly gets a token with `aud: docs` from another issuer | refused unless `(iss, aud)` matches |
 | 20 | A scheme from a remote publisher carrying an unsandboxed module | refused |
+| 21 | Receiver restarts holding cursor 1042 on a relationship's stream | every stream unsynced, principals keep aging; one `since=1042` request per publisher resumes it |
+| 22 | Receiver restarts after falling out of the retention window | one batched resync by interest ids, no per-principal re-registration |
+| 23 | An interest lapses; the receiver renews by interest id | renewed; renewal presenting only the original, now-stale proof is refused |
+| 24 | A heartbeat that doesn't carry the receiver's outstanding nonce | the stream is alive; nothing is confirmed and age keeps growing |
+| 25 | `reinstated` with a different scope from the revocation | ignored; the revocation stands |
+| 26 | Anima revokes the tokens it minted for `human:local:alice@lynx.example` while Lynx still vouches for her | Anima's services refuse her; Lynx and its services are unaffected |
+| 27 | A key-bound token (no `exp`) presented without proof of possession | refused; with a fresh proof by the `cnf` key, accepted |
+| 28 | A bearer token without `exp` | refused |
+| 29 | Rotation: tokens of the outgoing generation during the overlap, then after retirement | accepted during the overlap; refused after retirement |
