@@ -754,7 +754,7 @@ and at least one subscribing service.
 | 13 | `revoked` with `grant:docs:write` | `docs:write` removed, other grants kept |
 | 14 | `revoked`, connection lost, old token presented | still refused: revocation doesn't decay into staleness |
 | 15 | `revoked` then `reinstated` with the same scope | accepted again |
-| 16 | A revocation signed by a home other than the principal's | ignored |
+| 16 | A revocation signed by a home that issued neither the principal nor the tokens or grants it names | ignored |
 | 17 | Token signed under a retired issuer key generation | refused; the snapshot omits revocations for that generation |
 | 18 | Event `at` far in the future | age measured from the receiver's challenge; no freshness gained |
 | 18a | A relay holds a gap-free run of events and heartbeats, releases it after the oracle publishes `denied` | none of the held heartbeats answers the receiver's current challenge; the principal is not made fresh |
@@ -763,7 +763,7 @@ and at least one subscribing service.
 | 20 | A scheme from a remote publisher carrying an unsandboxed module | refused |
 | 21 | Receiver restarts holding cursor 1042 on a relationship's stream | every stream unsynced, principals keep aging; one `since=1042` request per publisher resumes it |
 | 22 | Receiver restarts after falling out of the retention window | one batched resync by interest ids, no per-principal re-registration |
-| 23 | An interest lapses; the receiver renews by interest id | renewed; renewal presenting only the original, now-stale proof is refused |
+| 23 | Before its idle limit, the receiver renews an interest by interest id; later, an interest that has lapsed | renewed before the lapse; after it, renewal by id is refused, as is the original, now-stale proof — a fresh proof of relationship is needed |
 | 24 | A heartbeat that doesn't carry the receiver's outstanding nonce | the stream is alive; nothing is confirmed and age keeps growing |
 | 25 | `reinstated` with a different scope from the revocation | ignored; the revocation stands |
 | 26 | Anima revokes the tokens it minted for `human:local:alice@lynx.example` while Lynx still vouches for her | Anima's services refuse her; Lynx and its services are unaffected |
