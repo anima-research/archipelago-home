@@ -78,8 +78,10 @@ H used:
 | `agent:ferro@guest` (a home-local qualifier, not a domain) | `agent:ferro@guest@lynx.example` |
 | `agent:x@other.example` (a domain H does **not** speak for) | refused |
 
-A home speaks for the domains its discovery document lists in `speaksFor` (§5). Anima
-already needs two: of its 66 agents today, 17 are `agent:…@id.animalabs.ai` (anchored
+A home speaks for a domain only when **that domain's own discovery document resolves to the
+home** (§5) — directly, or by delegation. A home's own `speaksFor` list proves nothing by
+itself: a hostile home could list `lynx.example`, but `lynx.example`'s discovery document
+won't point at it. Anima already needs two: of its 66 agents today, 17 are `agent:…@id.animalabs.ai` (anchored
 through the console), 2 are `agent:…@animalabs.ai`, and 47 are `agent:…@guest`.
 
 **Rendering.** Services show visitors with their home: `alice ✓lynx.example`. Display names
@@ -120,7 +122,10 @@ A bare domain can delegate to its node, so handles stay short:
 ```
 
 The resolver follows one delegation, then requires the node's `speaksFor` to include the
-domain it came from.
+domain it came from. The check runs in both directions. Before accepting a `sub` qualified
+by domain D from a home, the receiver resolves D itself and requires D's discovery document
+— directly or through its one delegation — to name that home and its key. `speaksFor` says
+which domains a home *claims*; each domain's own document is what confirms it.
 
 **Fetching what strangers type.** A handle is user input, so discovery is a request to an
 address a stranger chose. Guards: HTTPS only; public addresses only (no loopback, private
@@ -254,6 +259,12 @@ in its discovery document (`attestations`), and the receiver verifies them offli
 calling the oracle. Negative facts — `denied`, a downgrade — never travel with the subject,
 so a receiver learns those from the oracle itself, through the oracle's event stream.
 
+So a carried statement can be outdated without anyone saying so: the oracle may have
+published `denied` since. Each carried statement names the oracle `seq` it was issued at. A
+receiver synced with that oracle (§9.2) uses its own current state, which already includes
+any later denial; a receiver not yet synced treats the carried statement as stale evidence,
+and the scheme's staleness rules (§9.4) decide what it is worth.
+
 ### 8.4 Evidence in tokens
 
 When a home admits a visitor, it records in the token which scheme it used and which facts,
@@ -264,7 +275,7 @@ reading or re-check the same facts itself.
 
 ### 9.1 What is pushed
 
-Signed events, numbered per publisher:
+Signed events, numbered per publisher with no gaps:
 
 | Publisher | Events |
 |---|---|
@@ -286,9 +297,16 @@ over the literal bytes, with its own prefix.
 Events go out on the home's MCPL endpoint (published under `home.events`, and in
 `/services` under `mcpl`) as a channel, and as server-sent events at
 `GET /events?since=<seq>` for subscribers that don't speak MCPL. A subscriber resumes from
-the last `seq` it saw and can tell when it missed something. A publisher keeps a retention
-window of events, plus a snapshot of current state (who is revoked, current facts) for a
-subscriber that fell behind further than that.
+the last `seq` it applied. A publisher keeps a retention window of events, plus a signed
+snapshot of current state (who is revoked, current facts) at a given `seq`, for a
+subscriber starting fresh or fallen further behind than the window.
+
+**Synced, per source.** A subscriber is *synced* with a source when it has applied a
+verified snapshot and every event after it, with no gap, up to the `seq` the source's
+latest heartbeat reports. Every heartbeat carries the publisher's current `seq`, so a
+subscriber that sees heartbeat 1050 while holding 1042 knows it is missing events, not
+merely waiting. A gap, a new subscription, or a restart makes the source *unsynced* until
+the subscriber has caught up.
 
 ### 9.3 Relay
 
@@ -299,9 +317,15 @@ when that home's first visitor arrives, and drops idle streams.
 
 ### 9.4 Staleness
 
-A heartbeat separates "nothing happened" from "the channel is down". The freshness of a
-decision is the time since the last heartbeat from each source it rests on. The scheme sets,
-per grant, what happens when that gets too old:
+A heartbeat separates "nothing happened" from "the channel is down". A source is **fresh**
+when the subscriber is synced with it (§9.2) and its latest heartbeat is recent; a recent
+heartbeat alone is not enough, because it doesn't prove earlier events were applied. A
+decision is as fresh as the least fresh source it rests on.
+
+**Unsynced is stale.** No fresh grant rests on a source the subscriber isn't synced with —
+in particular, a new receiver that hasn't yet applied a source's snapshot treats it as stale
+from the first moment, however recent the heartbeat. The scheme sets, per grant, what happens
+when a source is stale or unsynced:
 
 ```jsonc
 "staleness": {
@@ -421,7 +445,9 @@ knows and pushing changes.
 - **"Any home that verifies" means anyone with a domain and a key.** Fine for low-trust
   services such as docs, with per-home rate limits and `claims.home` visible to the service.
   Anything that spends money or controls a body grants only to homes a scheme names.
-- **A home speaks only for its own domains** (§4). A `sub` naming another domain is refused.
+- **A home speaks only for its own domains** (§4), confirmed from each domain's side: the
+  receiver resolves the domain in a `sub` and requires it to point at the signing home. A
+  home listing someone else's domain in `speaksFor` gains nothing.
 - **Replay.** Login handoff tokens are addressed to one receiver, single-use, short-lived,
   and bound to the browser that started the flow. Agent proofs name the receiving home and a
   timestamp.
@@ -444,7 +470,8 @@ knows and pushing changes.
 4. **Revoking a compromised home key:** which sources a scheme should accept for that, and
    how succession statements interact with it.
 5. **Event retention and snapshots:** how long a publisher keeps events, and the snapshot
-   format.
+   format. (The safety rule doesn't depend on these: nothing fresh is granted on a source the
+   subscriber isn't synced with, §9.4.)
 6. **Scheme language:** whether the JSON rule shape above is enough before anyone needs the
    code plug-in.
 7. **Oracle governance:** who reviews Anima's oracle file, and whether a home is told when a
