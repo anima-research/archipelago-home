@@ -28,6 +28,14 @@ key, while bearer tokens keep a short `exp` (this closes the old Q3); key rotati
 generations live; a home signs revocations for what it issued, including the tokens it
 minted for visitors; five more vectors; and the full inventory of verifier copies.
 
+**Revision 4** records the decisions taken after it: handles as `name@home`, with the home a
+domain for now and short home names, unexposed homes and network discovery deferred together
+(§17) — with three rules now so nothing built meanwhile assumes every home is reachable; why
+consent belongs to the person's home, compromised home keys handled by hand like a compromised root certificate,
+the default numbers (retention, interest lapse, rotation, bearer lifetime), WebAssembly as the
+only sandbox, oracle governance, Discord role changes pushed in step 3, and the verifier as
+its own module. Most of what §14 left open is now decided.
+
 ---
 
 ## 1. What this has to do
@@ -47,7 +55,7 @@ minted for visitors; five more vectors; and the full inventory of verifier copie
 
 | # | Decision | |
 |---|---|---|
-| 1 | The identifier says which home to sign in with: `alice@lynx.example`. No list of homes to choose from. | agreed |
+| 1 | The identifier says which home to sign in with: `alice@id.lynx.example`. No list of homes to choose from. For now the home part is a domain; short home names (`alice@lynx`) come with network discovery (§17). | agreed |
 | 2 | A visitor's `sub` is qualified by their home, with exactly one `@`: `human:local:alice@lynx.example`. | agreed |
 | 3 | A home reveals only what it chooses to each other home — by default, who the person is. This covers event streams too (§9.1). | agreed |
 | 4 | The receiving home translates: it verifies the visitor's home and mints its own token for its own services. A service may also judge visitors itself; it then verifies the `(iss, aud)` pair, since audience names are unique only within a home. | agreed; `(iss, aud)` from review |
@@ -86,9 +94,20 @@ with it, as they did for the home's own login.
 
 ## 4. Names
 
-**Handles.** Every principal has a handle `name@domain`. The domain names the home that
-answers for it. People type their handle to sign in elsewhere; agents never type anything —
-their credential already carries their home (§6.2).
+**Handles.** Every principal has a handle `name@home`. People type their handle to sign in
+elsewhere; agents never type anything — their credential already carries their home (§6.2).
+
+- **For now, the home part is a domain** — `alice@id.lynx.example`, `fable@id.animalabs.ai` —
+  because DNS is the one layer every node can resolve without a directory. The handle splits
+  at the `@`, and the domain is resolved through its discovery document (§5). Anima's
+  handles use `id.animalabs.ai`, the domain the home node already serves; the token issuer
+  stays `id.animalabs.ai` too, and existing `sub`s keep whichever domain they have.
+- **Short home names come later** (§17): `alice@lynx`, where `lynx` is resolved through signed
+  directories each node chooses to believe, with the domain form as the fallback that always
+  works. In a peer-to-peer network a short name can only be testimony — what a home calls
+  itself, and what directories say about it — never one shared table.
+- **An agent's handle uses the name inside its `sub`**, which is already a lowercase slug,
+  not its display name.
 
 **Subjects of visitors.** When home R admits a principal from home H, it qualifies the `sub`
 H used. A subject always has exactly one `@`, so a verifier that splits on the first or the
@@ -110,13 +129,13 @@ won't point at it. Anima already needs two: of its 66 agents today, 17 are
 `agent:…@id.animalabs.ai` (anchored through the console), 2 are `agent:…@animalabs.ai`, and
 47 are `agent:…@guest`.
 
-**Rendering.** Services show visitors with their home: `alice ✓lynx.example`. Display names
-are unique only within a home; the domain suffix is what tells two Alices apart (archipelago
-§8).
+**Rendering.** Services show visitors by their handle: `alice@id.lynx.example`. Display names
+are unique only within a home; the handle is what tells two Alices apart (archipelago §8).
 
-**Binding** `alice@lynx.example` to a local account at Anima comes later and works like
-linking Discord to a local account today: the account keeps its own `sub`, the link adds a
-way in.
+**Binding** `alice@id.lynx.example` to a local account at Anima comes later and works like
+linking Discord to a local account today. From her Anima account she signs in at Lynx; Lynx
+returns a one-time login handoff token to Anima's link flow, which is bound to the browser that
+started it; the account keeps its own `sub`, and the link adds a way in.
 
 ## 5. Discovery
 
@@ -144,7 +163,9 @@ The file every home already serves grows the home's endpoints and its key genera
 }
 ```
 
-A bare domain can delegate to its node, so handles stay short:
+A bare domain can delegate to its node. (`animalabs.ai`, a Framer site served through
+Netlify, could do so with one rewrite rule; handles don't need it, since they use
+`id.animalabs.ai`.)
 
 ```jsonc
 // GET https://animalabs.ai/.well-known/mcpl-identity
@@ -157,6 +178,10 @@ qualified by domain D from a home, the receiver resolves D itself and requires D
 document — directly or through its one delegation — to name that home and its key.
 `speaksFor` says which domains a home *claims*; each domain's own document is what confirms
 it.
+
+**A carried discovery document.** The document is also signed with the home's key, so it
+can be carried — attached to a token or an attestation, or relayed — and verified without
+reaching the home. A home that can't be reached over HTTPS still has to be verifiable (§17).
 
 **Fetching what strangers type.** A handle is user input, so discovery is a request to an
 address a stranger chose. Guards: HTTPS only; public addresses only (no loopback, private or
@@ -172,7 +197,8 @@ Alice has an account at `lynx.example` and opens Anima's docs.
 1. Docs sends her browser to `id.animalabs.ai/login?audience=docs`. The sign-in page has one
    field: *username or handle*. Local accounts (and passkey autofill) work as now; the
    Discord button stays on homes that use Discord.
-2. She types `alice@lynx.example`. Anima resolves `lynx.example` (§5) and **shows the
+2. She types `alice@id.lynx.example`. Anima splits it at the `@`, resolves
+   `id.lynx.example` (§5) and **shows the
    resolved home before leaving**: *"You'll sign in at lynx.example"*, with a button to
    continue. Identifier-first is an open redirect by construction — a typed
    `alice@evil.example` would send her to evil's login page inside this flow — so the page
@@ -183,7 +209,7 @@ Alice has an account at `lynx.example` and opens Anima's docs.
    another.
 3. Lynx signs her in its own way (her passkey there, password, Discord). The first time she
    goes to a home Lynx doesn't list, Lynx asks her once: *"id.animalabs.ai will know you as
-   alice@lynx.example."* Lynx mints a **login handoff token** — 10 minutes, single use —
+   alice@id.lynx.example."* Lynx mints a **login handoff token** — 10 minutes, single use —
    addressed to `id.animalabs.ai`, carrying only what Lynx's release policy gives that home
    (§7), and returns it in the URL fragment to Anima's `callback`.
 4. Anima verifies it against Lynx's key, checks it's addressed to Anima, uses it once, and
@@ -280,6 +306,18 @@ vouches for them somewhere new. The same boundary holds for event streams: a hom
 subscriber about a principal only when that subscriber has registered interest in them
 (§9.1).
 
+**Why consent, and why it is the home's job.** Signing someone in elsewhere does two things:
+it reveals who they are to another home, and it puts their home's standing behind them
+somewhere it may never have seen. The person's own home is the only party they can trust to
+say who is asking — the page where they typed their handle belongs to the receiving home,
+which controls everything shown there, so a page saying "Sign in to Docs" could be
+`evil.example` collecting identities. Only their home's own screen can truthfully say "evil.example
+will know you as alice". And the home is the one disclosing their data, so the basis for it
+is the home's to have: its release policy covers homes it has an arrangement with, and for a
+home it has never heard of, the person agrees once (`first-visit`, remembered per home).
+Agents get no prompt: an agent's host presents its credentials only where the agent itself
+chose to go.
+
 ## 8. Evidence: oracles and facts
 
 ### 8.1 Facts
@@ -361,10 +399,17 @@ Two kinds of stream:
 - **Public**, for facts about homes: an oracle's facts and a home's own key events concern
   homes, not people, and are broadcast to any subscriber.
 
+**Either side can open a session.** A receiver usually dials the publisher, but a home that
+can't be dialled — behind NAT, or on a laptop — dials out to the receivers it serves, and the
+session carries the same streams in both directions once open (NET-8).
+
 An interest lapses when the receiver drops it, when the key generation it was registered
-under retires (§9.7), or after an idle period the publisher sets. The receiver renews it by
-interest id while it still serves the principal. A lapsed interest needs a fresh proof of
-relationship — the principal has to come back.
+under retires (§9.7), or after an idle period the publisher sets — **30 days** by default.
+The receiver renews it by interest id while it still serves the principal. A lapsed interest
+needs a fresh proof of relationship — the principal has to come back. That costs a returning
+visitor nothing: every new sign-in, and every agent token request, is itself a fresh proof.
+Lapse only affects receivers that stopped serving someone, which bounds what each home must
+track and stops a receiver following people who left long ago.
 
 ### 9.2 Events
 
@@ -424,7 +469,12 @@ relationship's stream) returns the events after `seq` and ends with a
 signed heartbeat that carries the nonce and the publisher's current `seq` — the same answer a
 session gives (§9.4), so a polling receiver confirms freshness exactly as a connected one
 does. A feed request without a challenge still returns events, but confirms nothing. A publisher keeps a retention window
-of events, plus a signed snapshot of current state for a stream at a given `seq`.
+of events — **30 days** by default — plus a signed snapshot of current state for a stream at
+a given `seq`. Discarding old events forgets nothing a decision rests on: revocations and
+current facts live in the publisher's current state, which a snapshot carries; only the
+history of intermediate changes goes. A receiver offline longer than the window takes a
+snapshot instead of replaying. An audit trail of every change, if wanted, is a separate
+append-only log, as `minted.jsonl` is today.
 
 **What a relay can do.** Because each event carries its issuer's signature, a relay can delay
 or withhold events but never alter them. Withholding is detectable: heartbeats carry the
@@ -533,7 +583,8 @@ design:
   nobody can revoke, because nobody knows they happened. A key generation doesn't bound that:
   a token minted just after a rotation would live a whole rotation period. So bearer tokens
   carry an `exp`, as login handoff tokens do (§6.4); the verifier refuses a bearer token
-  without one. **The default is one hour.** Today a resident's bearer token lasts 7 days,
+  without one. **The default is one hour**, switched on once every host is confirmed to
+  re-mint on its own. Today a resident's bearer token lasts 7 days,
   which is the real exposure to an unnoticed leak; hosts already re-mint transparently
   (caching a token for at most an hour and dropping it on an authentication failure), so an
   hour costs nothing operationally. The exact figure is set alongside the rotation schedule
@@ -543,6 +594,9 @@ design:
   invalidates every token it signed, so a key-bound token lives at most until its generation
   retires, a revocation need only be remembered while its generation is live, and a snapshot
   never lists more than that.
+- **Rotation is yearly by default, with a 30-day overlap.** A shorter period means less to
+  remember and a shorter worst case for key-bound tokens, at the price of more frequent
+  rotations.
 - **Rotation overlaps.** At least two generations are live during a rotation, so tokens of the
   outgoing generation keep working while holders re-mint. The home announces the rotation with
   `keyRotated` on its public stream, so hosts re-mint ahead of the retirement instead of
@@ -639,8 +693,11 @@ verifies `(iss, aud)` together: Lynx may have a `docs` too.
 **How a scheme computes** is declared in `evaluation`, one of three shapes:
 
 1. **`rules`** — the JSON rules above, extended as needs arise.
-2. **`module`** — a sandboxed pure function (WASM or an isolate): input `(person, evidence)`,
-   output a grant, no I/O, bounded time and memory, identified by content hash.
+2. **`module`** — a sandboxed pure function in **WebAssembly**: input `(person, evidence)`,
+   output a grant, no I/O, bounded time and memory, identified by content hash. WebAssembly
+   only, because it runs in both the TypeScript and the Python verifier; a JavaScript isolate
+   would tie schemes to one language. `rules` is built first; `module` and `remote` come when
+   a scheme needs them.
 3. **`remote`** — the scheme runs at its publisher or a delegate, and the service accepts a
    **signed decision**. That makes the publisher a runtime dependency of the scheme and lets
    it see the evidence, which the scheme states.
@@ -656,8 +713,11 @@ knows and pushing changes.
 
 - **Its own key**, separate from the issuer key: an oracle compromise must not let anyone
   mint identities, and the reverse.
-- **A reviewed source of truth:** facts come from a file in a repo, so every change has an
-  author and a diff, and the published history is the merge history.
+- **A reviewed source of truth:** facts come from a file in its own repo, so every change has
+  an author and a diff, and the published history is the merge history. A change merges only
+  after review by two maintainers (Antra and one other).
+- **The subject is told.** When a fact about a home changes, the oracle notifies that home's
+  `contact`; the home can dispute it with an issue or a pull request on the repo.
 - **First entries:** `id.animalabs.ai` itself and the Lynx home.
 - **Relayed** by Anima's home node, so Anima's services subscribe in one place.
 
@@ -688,36 +748,38 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
 - **Audience collisions.** Services judging foreign tokens directly verify `(iss, aud)`.
 - **Discovery is user-driven fetching** (§5): HTTPS, public addresses only, timeouts, size
   limits, caching, rate limits.
-- **A compromised home key** can sign reassuring events about itself, so revoking that home
-  can't come from the home. It comes from oracles (`denied`, `keyCompromised`) and from key
-  succession (VISION §7).
+- **A compromised home key** is handled like a compromised root certificate: by hand, with
+  no automatic recovery. It can sign reassuring events about itself, so the warning can't come
+  from the home: oracles publish `keyCompromised` (and `denied` if need be), and schemes that
+  rely on them refuse the home meanwhile. The operator issues a new key, and each receiving
+  operator deliberately trusts it. Identities stay with the domain, so the home's people keep
+  their `sub`s once receivers have re-pointed.
 - **Oracle compromise** is limited by schemes naming oracles per fact; a scheme that relies
   on one oracle for a high-stakes grant inherits that oracle's risk, visibly.
 - **Scheme code from elsewhere** never runs unsandboxed (§11).
 
-## 14. Open questions
+## 14. Decided, and still open
 
-1. **Identity domain.** Handles at `animalabs.ai` (needs a delegation file on the main
-   site) or at `id.animalabs.ai` (works today). This also decides what `iss` says.
-2. **Consent defaults.** Ask on the first visit to every unlisted home, and never for homes
-   in the release policy — or something stricter.
-3. **Rotation schedule** for issuer keys, the overlap window, and the exact bearer `exp`
-   (default one hour). (Which bound applies to which token is settled in §9.7: `exp` for
-   bearer tokens, the key generation for key-bound ones.)
-4. **Revoking a compromised home key:** which sources a scheme should accept for that, and
-   how succession statements interact with it.
-5. **Retention.** Key generations bound what must be remembered; still open is how long a
-   publisher keeps replayable events before a subscriber must take a snapshot, and the
-   snapshot format.
-6. **Interest lapse.** The idle period after which a publisher drops an interest. (Renewal
-   is by interest id, §9.1.)
-7. **Sandbox runtime** for `module` schemes: WASM, a JS isolate, or both.
-8. **Oracle governance:** who reviews Anima's oracle file, and whether a home is told when a
-   fact about it changes.
-9. **Discord role changes as push events** need the home to watch the guild (bot gateway)
-   rather than check at sign-in.
-10. **Live state on revocation:** queued data and disclosed copies (Desktop Q20 (b)–(c)).
-11. **Cross-home identity binding** (decision 11).
+**Decided** (revision 4):
+
+| Question | Decision |
+|---|---|
+| Handles | `name@home`; for now the home is a domain (`alice@id.animalabs.ai`); short home names deferred to §17 (§4). |
+| Consent | Asked once per unlisted home, remembered; never for homes on the release list (§7). |
+| Rotation and bearer lifetime | Yearly rotation with a 30-day overlap; bearer `exp` one hour, once hosts are confirmed to re-mint (§9.7). |
+| Compromised home key | By hand, like a root certificate: oracles warn, operators re-trust a new key (§13). |
+| Retention and snapshots | 30 days of replayable events; a snapshot is a signed document of current state for one receiver's interests — each principal's status, live key generations, revocations in force (§9.3). |
+| Interest lapse | 30 idle days; renewed by interest id while serving (§9.1). |
+| Sandbox runtime | WebAssembly only; `rules` first (§11). |
+| Oracle governance | Two-maintainer review; the subject home is notified and can dispute (§12). |
+| Discord role changes | Pushed as `grantChanged` from step 3, with the bot watching the guild (needs the Server Members privileged intent). |
+| Live state on revocation | For docs, the first consumer: close the person's live sessions and drop their undelivered notifications. Each service decides its own (§9.6). |
+| Cross-home binding | Later; shaped like Discord linking (§4). |
+
+**Still open:**
+
+1. The snapshot's exact wire format, settled in step 3 against the vectors.
+2. Everything in §17: short home names, unexposed homes, network discovery.
 
 ## 15. Build order
 
@@ -730,12 +792,17 @@ Abuse surfaces and their bounds follow the Desktop doc's NET-7; the federation-s
    - CommonJS: sam-archive, and canon's `server/aid1.js` (reported in the 10-10 survey);
    - Python: orrery.
 
-   Make `@animalabs/archipelago-home/verifier` the only JavaScript and TypeScript copy and add
-   a Python twin, so the revocation hook and the evaluator each land once rather than forking
-   across every service.
+   Replace them all with **one verifier module in its own repo**, `archipelago-verifier`:
+   `@animalabs/archipelago-verifier` on npm (TypeScript, no dependencies), a Python twin on
+   PyPI, and the conformance vectors as shared JSON that both run against, so the two
+   languages can't drift. It is its own module so that a service never installs the home
+   node to verify a token, and its versions don't move with every home-node release; the
+   home node uses it too. The revocation hook and the evaluator then land once rather than
+   forking across every service.
 3. **The home's event stream:** interest sessions with proof of relationship, scoped
    revocation and reinstatement, heartbeats carrying `seq`, snapshots per interest set, the
-   polled fallback, and the subscriber side in the verifier package. This pays off before any
+   polled fallback, Discord role changes pushed as `grantChanged`, and the subscriber side in
+   the verifier package, with docs as its first consumer. This pays off before any
    federation: today `hn revoke` only stops new tokens, and existing ones keep working until
    they expire. With push, Anima's own services drop a revoked principal at once.
 4. **Schemes and the shared evaluator**, `rules` first.
@@ -787,3 +854,29 @@ and at least one subscribing service.
 | 27b | A proof whose token hash names a different token | refused |
 | 28 | A bearer token without `exp` | refused |
 | 29 | Rotation: tokens of the outgoing generation during the overlap, then after retirement | accepted during the overlap; refused after retirement |
+| 30 | Handle `alice@id.lynx.example` typed at sign-in | name `alice`, home `id.lynx.example`; discovery is fetched from `id.lynx.example` |
+
+## 17. Later: short names, unexposed homes, network discovery
+
+Deferred together, because they are one problem: how nodes find and name each other without a
+shared authority. Nothing in steps 2–4 depends on them. The rules that keep the door open are
+already in place: discovery documents can be carried, signed (§5); either side can open a
+session (§9.1); and formats don't assume a home is a DNS name.
+
+- **Homes that aren't on the internet** — laptops, homes behind NAT, homes that sleep (the
+  Desktop doc's NET-4). Such a home is identified by its key, not a domain; it dials out
+  (NET-8) and reaches others through relays that hold its queue while it sleeps (the Desktop
+  doc's FED relays). Its people are stale to the rest of the network while it sleeps, which
+  is expected (NET-4); they may want an authority they choose to certify them meanwhile.
+- **Short home names**, `alice@lynx`. A home claims a name, signed, in its discovery document;
+  directories — oracles, communities, partner homes — publish signed bindings from names to
+  homes; nodes forward these statements to each other, since signatures make relaying safe;
+  and each node resolves a short name by its own scheme: which directories it believes, and
+  what to do when they disagree. A name resolves wherever a believed directory knows it, and
+  the domain or key form is the fallback that always works. Services show the short form only
+  when it comes from a source they believe (archipelago §8).
+- **Network discovery** — how a node learns which homes, relays and directories exist —
+  rides the same machinery: signed statements, forwarded between nodes, judged per node.
+- **One mechanism, several uses.** Names, oracle facts and, later, reputation (VISION §5) are
+  all signed statements with an issuer attached, distributed across the network and judged by
+  each node — never a shared table. Short names are the simplest first use of it.
