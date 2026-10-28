@@ -389,8 +389,11 @@ over the literal bytes, with its own prefix, under the issuer key generation `kg
 ### 9.3 Channels and relays
 
 Sessions run on the home's MCPL endpoint (published under `home.events`, and in `/services`
-under `mcpl`). For a receiver that holds no session, the polled feed
-`GET <home.feed>?since=<seq>` is the fallback (NET-5). A publisher keeps a retention window
+under `mcpl`). For a receiver that holds no session, the polled feed is the fallback (NET-5):
+`GET <home.feed>?since=<seq>&challenge=<nonce>` returns the events after `seq` and ends with a
+signed heartbeat that carries the nonce and the publisher's current `seq` — the same answer a
+session gives (§9.4), so a polling receiver confirms freshness exactly as a connected one
+does. A feed request without a challenge still returns events, but confirms nothing. A publisher keeps a retention window
 of events, plus a signed snapshot of current state for a stream at a given `seq`.
 
 **What a relay can do.** Because each event carries its issuer's signature, a relay can delay
@@ -410,8 +413,8 @@ A receiver's view of a principal is one of:
 - **stale(age)** — not confirmed recently, or not synced;
 - **revoked(scope)** — a revocation applies.
 
-**Challenges.** On each session the receiver regularly sends the publisher a fresh nonce
-and notes the time on its own clock. The publisher answers with a signed heartbeat that
+**Challenges.** On each session — or with each feed request (§9.3) — the receiver sends the
+publisher a fresh nonce and notes the time on its own clock. The publisher answers with a signed heartbeat that
 includes the nonce and its current `seq`. A heartbeat that doesn't carry the receiver's
 outstanding nonce says the stream is alive but confirms nothing.
 
@@ -699,5 +702,6 @@ and at least one subscribing service.
 | 17 | Token signed under a retired issuer key generation | refused; the snapshot omits revocations for that generation |
 | 18 | Event `at` far in the future | age measured from the receiver's challenge; no freshness gained |
 | 18a | A relay holds a gap-free run of events and heartbeats, releases it after the oracle publishes `denied` | none of the held heartbeats answers the receiver's current challenge; the principal is not made fresh |
+| 18b | A receiver with no session polls the feed with a challenge | the response's final heartbeat answers the challenge; after applying the events the principal is fresh. Without a challenge, the events apply but confirm nothing |
 | 19 | A service judging directly gets a token with `aud: docs` from another issuer | refused unless `(iss, aud)` matches |
 | 20 | A scheme from a remote publisher carrying an unsandboxed module | refused |
