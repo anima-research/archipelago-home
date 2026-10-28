@@ -76,6 +76,11 @@ list synced from audiences (world rosters, fleet names).
 
 ### 4. More communities — federation (the actual point)
 
+> **2026-10:** the concrete design is now [FEDERATION.md](FEDERATION.md) — identifier-first
+> sign-in across homes, oracles and schemes, pushed revocation. It changes some of what
+> follows (who translates, and how revocation works); this section is kept as the original
+> sketch.
+
 This is where "central IdP" stops being even approximately true. The
 Archipelago design (§3, §7): every community runs its OWN home node; the
 durable identity is `name@domain`; audiences decide which issuer domains
