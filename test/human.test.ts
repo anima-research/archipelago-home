@@ -850,6 +850,22 @@ test('open somewhere: a Google newcomer who starts at the wrong door gets an acc
   discordRoles = ['r-member'];
 });
 
+test('google.verified: recorded at sign-up, refreshed at each sign-in (what hn user add trusts)', async () => {
+  googleUser = { sub: 'g-ver-1', email: 'ver@gmail.com', email_verified: true, name: 'Ver' };
+  assert.equal((await googleLogin('notes')).status, 302);
+  assert.equal(node.accounts.bySub('human:google:g-ver-1')!.google!.verified, true);
+  // a row from before the flag existed gets it at its next verified sign-in
+  node.accounts.update('human:google:g-ver-1', (a) => ({ ...a, google: { sub: a.google!.sub, email: a.google!.email, name: a.google!.name } }));
+  assert.equal((await googleLogin('notes')).status, 302);
+  assert.equal(node.accounts.bySub('human:google:g-ver-1')!.google!.verified, true);
+  // Google stops vouching (a new, unverified address): the flag goes
+  googleUser = { sub: 'g-ver-1', email: 'ver@elsewhere.example', email_verified: false, name: 'Ver' };
+  assert.equal((await googleLogin('notes')).status, 302);
+  const g = node.accounts.bySub('human:google:g-ver-1')!.google!;
+  assert.equal(g.email, 'ver@elsewhere.example');
+  assert.equal(g.verified, undefined);
+});
+
 test('open nowhere: a stranger’s Google sign-in still makes no row', async () => {
   const n2 = makeNode({}, { eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
   const b2 = `http://127.0.0.1:${await n2.start()}`;

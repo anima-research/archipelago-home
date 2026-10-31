@@ -225,6 +225,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
    *  keyed on that Google account, no username, nothing an operator gave it. */
   const signedUpRow = (x: HumanAccount): boolean =>
     Boolean(x.google?.sub) && x.sub === `human:google:${x.google!.sub}` && !x.username && !x.scopes?.length && !x.claims;
+  /** …that may be granted by address: Google vouched for the address it holds
+   *  (a fresh invite asks the same of its first sign-in), and it isn't disabled. */
+  const adoptable = (x: HumanAccount): boolean => signedUpRow(x) && x.google!.verified === true && !x.disabled;
 
   /** --google <email>: an invite by address, checked against everyone else's. */
   const googleFlag = (forSub?: string): { email: string } | null | undefined => {
@@ -237,7 +240,8 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     if (clash) {
       die(
         `${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
-          (signedUpRow(clash) ? ` — they signed up by signing in; give that account access instead: hn user set ${clash.sub} --scopes …` : ''),
+          (signedUpRow(clash) ? ` — they signed up by signing in; give that account access instead: hn user set ${clash.sub} --scopes …` : '') +
+          (signedUpRow(clash) && !clash.google!.verified ? ` (Google hasn't vouched for that address on it — check who it is first)` : ''),
       );
     }
     return { email: v.trim() };
@@ -246,21 +250,23 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
   switch (sub) {
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
-      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
-      if (bad) die(bad);
       const tier = flag.get('tier');
       // Already signed up with that Google address (an open audience, or a
-      // code)? Then THAT row is the person: it takes the username and the
-      // access, and keeps its sub — so whatever a service already holds
-      // under it (docs shares, comments) stays theirs. No second account.
+      // code), and Google vouched for it? Then THAT row is the person: it
+      // takes the username and the access, and keeps its sub — so whatever a
+      // service already holds under it (docs shares, comments) stays theirs.
       const gv = flag.get('google');
-      const mine = gv && gv !== 'none' && looksLikeEmail(gv)
+      const match = gv && gv !== 'none' && looksLikeEmail(gv)
         ? accounts.all().find((x) => x.google && emailKey(x.google.email) === emailKey(gv))
         : undefined;
-      if (mine && signedUpRow(mine) && !mine.disabled) {
+      const mine = match && adoptable(match) ? match : undefined;
+      // its own display name doesn't count against it
+      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n), mine?.sub);
+      if (bad) die(bad);
+      if (mine) {
         const day = new Date().toISOString().slice(0, 10);
         const next = accounts.update(mine.sub, (x) => {
-          if (!signedUpRow(x) || x.disabled) throw new Error(`${x.sub} changed under us — run it again`);
+          if (!adoptable(x)) throw new Error(`${x.sub} changed under us — run it again`);
           return {
             ...x,
             username,

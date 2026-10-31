@@ -35,6 +35,7 @@ import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes
 import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
 import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
 import {
+  anyOpen,
   grantForRoles,
   openSites,
   signupGrant,
@@ -162,6 +163,19 @@ class Throttle {
   clear(k: string): void {
     this.m.delete(k);
   }
+}
+
+/** The Google link a sign-in writes. `verified` only when Google vouched for
+ *  the address it sent just now — an address kept from before (`fallback`)
+ *  is not re-vouched. */
+function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<HumanAccount['google']> {
+  return {
+    sub: g.sub,
+    email: g.email ?? fallback,
+    ...(g.email && g.emailVerified ? { verified: true } : {}),
+    ...(g.name ? { name: g.name } : {}),
+    linkedAt: now,
+  };
 }
 
 export class HumanAuth {
@@ -1001,7 +1015,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       try {
         acct = this.d.accounts.update(st.sub, (a) => {
           if (a.disabled || (a.google?.sub && a.google.sub !== g.sub)) throw new Error('account changed');
-          return { ...a, google: { sub: g.sub, email: g.email ?? a.google?.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+          return { ...a, google: googleLink(g, now, a.google?.email) };
         });
       } catch {
         acct = undefined;
@@ -1020,7 +1034,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         try {
           acct = this.d.accounts.update(inv.sub, (a) => {
             if (a.disabled || !a.google || a.google.sub || emailKey(a.google.email) !== emailKey(g.email!)) throw new Error('changed');
-            return { ...a, google: { sub: g.sub, email: g.email!, ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+            return { ...a, google: googleLink(g, now) };
           });
           if (acct) console.error(`[hn] account: ${acct.sub} claimed by google:${g.sub} (${g.email})`);
         } catch {
@@ -1029,7 +1043,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       } else if (inv) acct = inv; // disabled: refused just below
     }
     let fresh = false;
-    if (!acct && !st.code && g.emailVerified && openSites(this.d.audiences.get()).length) {
+    if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
       // This node is open to newcomers somewhere: a Google account we don't
       // know gets its row on first sign-in, wherever it started. The row
       // holds nothing — an open audience lets it in, everywhere else it is
@@ -1039,7 +1053,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       try {
         acct = this.d.accounts.add({
           sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${st.audience}`,
-          google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
+          google: googleLink(g, now),
         });
         console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
       } catch {
@@ -1049,9 +1063,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
     if (!acct && st.code) {
       // Signing up: a Google account we don't know, with an access code.
-      const r = this.signUp(`human:google:${g.sub}`, st.code, {
-        google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
-      });
+      const r = this.signUp(`human:google:${g.sub}`, st.code, { google: googleLink(g, now) });
       if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}.</p>`));
       acct = r.account;
       fresh = true;
@@ -1070,9 +1082,22 @@ If you were given an access code, enter it on the sign-in page first. If you hav
       if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}. Sign in without it, or ask for a new code.</p>`));
       acct = r.account;
     }
-    if (acct.google?.sub === g.sub && ((g.email && g.email !== acct.google.email) || (g.name && g.name !== acct.google.name))) {
+    const seen = acct.google;
+    if (
+      seen?.sub === g.sub &&
+      ((g.email && (g.email !== seen.email || g.emailVerified !== Boolean(seen.verified))) || (g.name && g.name !== seen.name))
+    ) {
       try {
-        acct = this.d.accounts.update(acct.sub, (a) => (a.google?.sub === g.sub ? { ...a, google: { ...a.google, ...(g.email ? { email: g.email } : {}), ...(g.name ? { name: g.name } : {}) } } : a)) ?? acct;
+        acct = this.d.accounts.update(acct.sub, (a) => {
+          if (a.google?.sub !== g.sub) return a;
+          const next = { ...a.google, ...(g.name ? { name: g.name } : {}) };
+          if (g.email) {
+            next.email = g.email;
+            if (g.emailVerified) next.verified = true;
+            else delete next.verified;
+          }
+          return { ...a, google: next };
+        }) ?? acct;
       } catch {
         /* a new address that clashes with someone's invite: keep the old one on file */
       }

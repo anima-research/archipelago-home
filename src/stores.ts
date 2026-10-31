@@ -427,6 +427,12 @@ export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
   return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
 }
 
+/** Is any audience open to newcomers? (What lets a Google newcomer's first
+ *  sign-in make their row — independent of whether a link can be shown.) */
+export function anyOpen(all: AudiencesConfig): boolean {
+  return Object.values(all).some((a) => Boolean(a.signup));
+}
+
 /** The audiences open to newcomers, each with the site to send a person to
  *  (its `api` origin, else its redirect's) — what a refusal page and the
  *  account page point at. */
@@ -435,7 +441,7 @@ export function openSites(all: AudiencesConfig): Array<{ audience: string; url: 
   for (const [audience, a] of Object.entries(all)) {
     if (!a.signup) continue;
     try {
-      const u = new URL(a.api ?? a.redirect);
+      const u = new URL(a.api || a.redirect);
       out.push({ audience, url: u.origin, host: u.host });
     } catch {
       /* a malformed URL: nothing to point at */
