@@ -46,7 +46,7 @@ function fakeDiscord(): typeof fetch {
   }) as typeof fetch;
 }
 
-function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
+function makeNode(extra: Partial<ServerConfig> = {}, audiences?: Record<string, unknown>): HomeNode {
   const dir = mkdtempSync(join(tmpdir(), 'hn-human-'));
   writeFileSync(join(dir, 'roles.json'), JSON.stringify({
     guildId: 'g1',
@@ -56,7 +56,7 @@ function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
     principals: [{ sub: 'agent:fable@id.test', name: 'Fable', kind: 'agent', key: null, scopes: [] }],
   }));
   copyFileSync(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json'), join(dir, 'invite-policy.json'));
-  writeFileSync(join(dir, 'audiences.json'), JSON.stringify({
+  writeFileSync(join(dir, 'audiences.json'), JSON.stringify(audiences ?? {
     eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
     orrery: { redirect: 'https://orrery.test/auth', requiredScopes: ['orrery:use'] },
     // no requiredScopes: open to any grant — what a code must NOT widen into
@@ -519,14 +519,18 @@ test('Google: chooser offers it; the trip out is OIDC code flow with PKCE and on
   assert.equal(googleTokenBody!.get('client_secret'), 'gsecret');
 });
 
-test('Google: an unknown Google account gets nothing and makes no row', async () => {
-  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: true, name: 'Stranger' };
+test('Google: an unknown Google account gets nothing — an unverified one not even a row', async () => {
+  // unverified address: no row, nothing opens (not even sign-in settings)
+  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: false, name: 'Stranger' };
   const r = await googleLogin('eidoverse');
   assert.equal(r.status, 403);
   assert.match(r.text, /isn’t linked to an account here/);
   assert.equal(node.accounts.byGoogle('g-stranger'), undefined);
-  // the account page doesn't open for them either
   assert.equal((await googleLogin('account')).status, 403);
+  // verified (this node has an open audience): a row that holds nothing
+  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: true, name: 'Stranger' };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal(node.accounts.byGoogle('g-stranger')!.scopes, undefined);
 });
 
 test('Google: an operator invite by address is claimed by the first VERIFIED sign-in, then follows the Google account', async () => {
@@ -663,9 +667,9 @@ async function withCode(audience: string, code: string, via: 'google' | 'discord
 test('codes: a newcomer signs up with Google + a code; the code opens ONLY its own audiences', async () => {
   const { code, record } = node.codes.add({ label: 'Speaker ranker', audiences: ['ranker'], scopes: ['ranker:member'] });
   googleUser = { sub: 'g-new', email: 'newcomer@gmail.com', email_verified: true, name: 'New Comer' };
-  // without the code: refused, nothing made
+  // without the code: refused (the row this node makes for a verified newcomer holds nothing)
   assert.equal((await googleLogin('ranker')).status, 403);
-  assert.equal(node.accounts.bySub('human:google:g-new'), undefined);
+  assert.equal(node.accounts.bySub('human:google:g-new')!.scopes, undefined);
   const { code: c, cb } = await withCode('ranker', code.toUpperCase().replace(/-/g, ' '), 'google'); // typed sloppily: still the code
   assert.equal(c.status, 200);
   assert.deepEqual(c.body, { label: 'Speaker ranker', audiences: ['ranker'] });
@@ -806,10 +810,61 @@ test('open audience: a Google newcomer signs up by signing in — for that audie
   assert.equal((await googleLogin('gate')).status, 403);
   assert.equal((await googleLogin('eidoverse')).status, 403);
   assert.equal((await googleLogin('ranker')).status, 403);
-  // a closed audience still makes no row for a stranger
-  googleUser = { sub: 'g-open-2', email: 'other@gmail.com', email_verified: true };
-  assert.equal((await googleLogin('eidoverse')).status, 403);
-  assert.equal(node.accounts.bySub('human:google:g-open-2'), undefined);
+});
+
+test('open somewhere: a Google newcomer who starts at the wrong door gets an account, no access, and a pointer', async () => {
+  // a closed audience: the row is made, it holds nothing, and the page says where to go
+  googleUser = { sub: 'g-open-2', email: 'other@gmail.com', email_verified: true, name: 'Other' };
+  const closed = await googleLogin('eidoverse');
+  assert.equal(closed.status, 403);
+  assert.match(closed.text, /signed in, but/);
+  assert.match(closed.text, /Open to everyone: <a href="https:\/\/notes\.test">notes\.test<\/a>/);
+  const row = node.accounts.bySub('human:google:g-open-2');
+  assert.ok(row);
+  assert.equal(row.scopes, undefined);
+  assert.equal((await googleLogin('gate')).status, 403);
+  assert.equal((await googleLogin('ranker')).status, 403);
+  // the same person then goes to the open one: the same row, in
+  const r = await googleLogin('notes');
+  assert.equal(r.status, 302);
+  assert.equal(tokenFrom(r.location!, 'notes').sub, 'human:google:g-open-2');
+
+  // sign-in settings: a newcomer lands on their account page, which lists the open sites
+  googleUser = { sub: 'g-open-3', email: 'third@gmail.com', email_verified: true, name: 'Third' };
+  const acct = await googleLogin('account');
+  assert.equal(acct.status, 302);
+  const t = rawToken(acct.location!);
+  const me = await get('/account/me', base, { authorization: `Bearer ${t}` });
+  assert.equal(me.status, 200);
+  const body = JSON.parse(me.text);
+  assert.equal(body.sub, 'human:google:g-open-3');
+  assert.deepEqual(body.open, [{ url: 'https://notes.test', host: 'notes.test' }]);
+  assert.deepEqual(body.scopes, []);
+
+  // a Discord account with no role, refused at a closed audience, gets the pointer too
+  discordUser = { id: '7710', username: 'pia', global_name: 'Pia' };
+  discordRoles = null;
+  const d = await discordLogin('eidoverse');
+  assert.equal(d.status, 403);
+  assert.match(d.text, /Open to everyone: <a href="https:\/\/notes\.test">/);
+  discordRoles = ['r-member'];
+});
+
+test('open nowhere: a stranger’s Google sign-in still makes no row', async () => {
+  const n2 = makeNode({}, { eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
+  const b2 = `http://127.0.0.1:${await n2.start()}`;
+  try {
+    googleUser = { sub: 'g-closed-1', email: 'closed@gmail.com', email_verified: true };
+    for (const aud of ['eidoverse', 'account']) {
+      const r = await googleLogin(aud, b2);
+      assert.equal(r.status, 403);
+      assert.match(r.text, /isn’t linked to an account here/);
+      assert.doesNotMatch(r.text, /Open to everyone/);
+    }
+    assert.equal(n2.accounts.bySub('human:google:g-closed-1'), undefined);
+  } finally {
+    n2.stop();
+  }
 });
 
 test('open audience: a Discord account with no role gets in there and nowhere else; withhold still applies', async () => {

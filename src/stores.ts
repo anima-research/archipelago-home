@@ -412,8 +412,10 @@ export interface AudienceConfig {
    * Open to newcomers: anyone who signs in (a Google account the node has
    * never seen, a Discord account with no role) gets a token for THIS
    * audience, holding `scopes` (default: its requiredScopes) — and nothing
-   * anywhere else. A Google newcomer gets an account row (human:google:<sub>)
-   * on that first sign-in. Absent = only people with a grant get in.
+   * anywhere else. While any audience is open, a Google newcomer gets an
+   * account row (human:google:<sub>) on first sign-in WHEREVER it started —
+   * the row holds nothing, so closed audiences still refuse it (pointing at
+   * the open ones). Absent = only people with a grant get in.
    */
   signup?: { scopes?: string[] };
 }
@@ -423,6 +425,23 @@ export type AudiencesConfig = Record<string, AudienceConfig>;
 /** What an open audience gives anyone who signs in to it, or null if it isn't open. */
 export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
   return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
+}
+
+/** The audiences open to newcomers, each with the site to send a person to
+ *  (its `api` origin, else its redirect's) — what a refusal page and the
+ *  account page point at. */
+export function openSites(all: AudiencesConfig): Array<{ audience: string; url: string; host: string }> {
+  const out: Array<{ audience: string; url: string; host: string }> = [];
+  for (const [audience, a] of Object.entries(all)) {
+    if (!a.signup) continue;
+    try {
+      const u = new URL(a.api ?? a.redirect);
+      out.push({ audience, url: u.origin, host: u.host });
+    } catch {
+      /* a malformed URL: nothing to point at */
+    }
+  }
+  return out;
 }
 
 /** The published service directory: audience → API base, for audiences that
