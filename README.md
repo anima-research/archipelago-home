@@ -84,6 +84,11 @@ sign-in **wherever they started** — sign-in settings, or a service they can't 
 holds no scopes, so a closed audience still refuses them; its refusal page (and the account page)
 lists the sites open to everyone, so someone who came in the wrong door sees where to go.
 
+Inviting someone who already signed up this way (`hn user add <name> --google <their address>`)
+doesn't make a second account: their existing `human:google:<sub>` row takes the username and the
+`--scopes`, and keeps its sub — so what services already hold under it (docs shares, comments) stays
+theirs.
+
 ## Access codes
 
 A code grants named **audiences** (and the scopes they need) to whoever redeems it: on the sign-in
