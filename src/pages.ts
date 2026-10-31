@@ -251,7 +251,9 @@ const fmt = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { year: '
 function render(extra) {
   const until = new Date(me.exp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   let s = '<div class="card"><p>Signed in as <b>' + h(me.name) + '</b></p><p class="dim small mono">' + h(me.sub) + '</p>' +
-    '<p class="dim small">This page stays signed in until ' + until + '.</p></div>';
+    '<p class="dim small">This page stays signed in until ' + until + '.</p>' +
+    ((me.open || []).length ? '<p>Open to everyone: ' + me.open.map((o) => '<a href="' + h(o.url) + '">' + h(o.host) + '</a>').join(', ') + '</p>' : '') +
+    '</div>';
 
   // username + password
   s += '<div class="card"><h2>Username &amp; password</h2>';

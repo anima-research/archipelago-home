@@ -35,7 +35,9 @@ import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes
 import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
 import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
 import {
+  anyOpen,
   grantForRoles,
+  openSites,
   signupGrant,
   type AudiencesConfig,
   type JsonStore,
@@ -163,6 +165,19 @@ class Throttle {
   }
 }
 
+/** The Google link a sign-in writes. `verified` only when Google vouched for
+ *  the address it sent just now — an address kept from before (`fallback`)
+ *  is not re-vouched. */
+function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<HumanAccount['google']> {
+  return {
+    sub: g.sub,
+    email: g.email ?? fallback,
+    ...(g.email && g.emailVerified ? { verified: true } : {}),
+    ...(g.name ? { name: g.name } : {}),
+    linkedAt: now,
+  };
+}
+
 export class HumanAuth {
   private states = new Pending<LoginState & { exp: number }>();
   private tickets = new Pending<{ sub: string; state: string; exp: number; tries: number }>();
@@ -192,6 +207,14 @@ export class HumanAuth {
 
   /** Built-in audiences of this very node — no config entry, no server
    *  session: the login token IS the page's credential. */
+  /** For a refusal page: the sites anyone can sign in to, so a newcomer who
+   *  started at the wrong door sees where to go. */
+  private openHint(except: string): string {
+    const sites = openSites(this.d.audiences.get()).filter((o) => o.audience !== except);
+    if (!sites.length) return '';
+    return `<p>Open to everyone: ${sites.map((o) => `<a href="${esc(o.url)}">${esc(o.host)}</a>`).join(', ')}.</p>`;
+  }
+
   audienceRedirect(audience: string): string | null {
     if (audience === 'console') return `${this.d.cfg.publicUrl}/console`;
     if (audience === 'account') return `${this.d.cfg.publicUrl}/account`;
@@ -375,9 +398,9 @@ export class HumanAuth {
       : { sub: `human:discord:${user.id}`, name: discordName, grant };
     const out = this.issue(st.audience, who, 'oauth');
     if (out.ok) return redirect(res, out.redirect);
-    console.error(`[hn] login refused: discord:${user.id} (${user.username}) — ${out.error}`);
+    console.error(`[hn] login refused: discord:${user.id} (${user.username}) at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — your Discord account
-doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>`));
+doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>${this.openHint(st.audience)}`));
   }
 
   private async loginPassword(res: ServerResponse, b: Record<string, unknown>): Promise<void> {
@@ -702,6 +725,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         return c && !c.revoked ? [{ label: c.label, audiences: c.audiences, at: r.at }] : [];
       }),
       scopes: t.scopes,
+      open: openSites(this.d.audiences.get()).map((o) => ({ url: o.url, host: o.host })),
     };
   }
 
@@ -991,7 +1015,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       try {
         acct = this.d.accounts.update(st.sub, (a) => {
           if (a.disabled || (a.google?.sub && a.google.sub !== g.sub)) throw new Error('account changed');
-          return { ...a, google: { sub: g.sub, email: g.email ?? a.google?.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+          return { ...a, google: googleLink(g, now, a.google?.email) };
         });
       } catch {
         acct = undefined;
@@ -1010,7 +1034,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         try {
           acct = this.d.accounts.update(inv.sub, (a) => {
             if (a.disabled || !a.google || a.google.sub || emailKey(a.google.email) !== emailKey(g.email!)) throw new Error('changed');
-            return { ...a, google: { sub: g.sub, email: g.email!, ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+            return { ...a, google: googleLink(g, now) };
           });
           if (acct) console.error(`[hn] account: ${acct.sub} claimed by google:${g.sub} (${g.email})`);
         } catch {
@@ -1019,12 +1043,17 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       } else if (inv) acct = inv; // disabled: refused just below
     }
     let fresh = false;
-    if (!acct && !st.code && signupGrant(this.d.audiences.get()[st.audience])) {
-      // An audience open to newcomers: a Google account we don't know signs up by signing in.
+    if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
+      // This node is open to newcomers somewhere: a Google account we don't
+      // know gets its row on first sign-in, wherever it started. The row
+      // holds nothing — an open audience lets it in, everywhere else it is
+      // refused with a pointer to what IS open (issue() decides, as for anyone).
+      // Verified addresses only: a row keyed on this Google account would
+      // shadow an operator invite to that address before it could be claimed.
       try {
         acct = this.d.accounts.add({
           sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${st.audience}`,
-          google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
+          google: googleLink(g, now),
         });
         console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
       } catch {
@@ -1034,15 +1063,13 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
     if (!acct && st.code) {
       // Signing up: a Google account we don't know, with an access code.
-      const r = this.signUp(`human:google:${g.sub}`, st.code, {
-        google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
-      });
+      const r = this.signUp(`human:google:${g.sub}`, st.code, { google: googleLink(g, now) });
       if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}.</p>`));
       acct = r.account;
       fresh = true;
     }
     if (!acct) {
-      console.error(`[hn] login refused: google:${g.sub} (${label}) — not linked to an account`);
+      console.error(`[hn] login refused: google:${g.sub} (${label}) at ${st.audience} — not linked to an account`);
       return html(res, 403, page('no account', `<p>Hi <b>${esc(label)}</b> — this Google account isn’t linked to an account here.
 If you were given an access code, enter it on the sign-in page first. If you have an account, sign in another way and link Google under <a href="/login?audience=account">sign-in settings</a>; otherwise ask an operator.</p>`));
     }
@@ -1055,9 +1082,22 @@ If you were given an access code, enter it on the sign-in page first. If you hav
       if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}. Sign in without it, or ask for a new code.</p>`));
       acct = r.account;
     }
-    if (acct.google?.sub === g.sub && ((g.email && g.email !== acct.google.email) || (g.name && g.name !== acct.google.name))) {
+    const seen = acct.google;
+    if (
+      seen?.sub === g.sub &&
+      ((g.email && (g.email !== seen.email || g.emailVerified !== Boolean(seen.verified))) || (g.name && g.name !== seen.name))
+    ) {
       try {
-        acct = this.d.accounts.update(acct.sub, (a) => (a.google?.sub === g.sub ? { ...a, google: { ...a.google, ...(g.email ? { email: g.email } : {}), ...(g.name ? { name: g.name } : {}) } } : a)) ?? acct;
+        acct = this.d.accounts.update(acct.sub, (a) => {
+          if (a.google?.sub !== g.sub) return a;
+          const next = { ...a.google, ...(g.name ? { name: g.name } : {}) };
+          if (g.email) {
+            next.email = g.email;
+            if (g.emailVerified) next.verified = true;
+            else delete next.verified;
+          }
+          return { ...a, google: next };
+        }) ?? acct;
       } catch {
         /* a new address that clashes with someone's invite: keep the old one on file */
       }
@@ -1066,8 +1106,8 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     if (this.d.accounts.bySub(acct.sub)?.disabled) return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     const out = this.issue(st.audience, who, 'google');
     if (out.ok) return redirect(res, out.redirect);
-    console.error(`[hn] login refused: ${acct.sub} via google — ${out.error}`);
-    return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>`));
+    console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — ${out.error}`);
+    return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${this.openHint(st.audience)}`));
   }
 
   private googleLink(res: ServerResponse, t: Aid1Payload): void {

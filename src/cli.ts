@@ -221,6 +221,14 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
 
+  /** A row a Google sign-in made by itself (an open audience, or a code) —
+   *  keyed on that Google account, no username, nothing an operator gave it. */
+  const signedUpRow = (x: HumanAccount): boolean =>
+    Boolean(x.google?.sub) && x.sub === `human:google:${x.google!.sub}` && !x.username && !x.scopes?.length && !x.claims;
+  /** …that may be granted by address: Google vouched for the address it holds
+   *  (a fresh invite asks the same of its first sign-in), and it isn't disabled. */
+  const adoptable = (x: HumanAccount): boolean => signedUpRow(x) && x.google!.verified === true && !x.disabled;
+
   /** --google <email>: an invite by address, checked against everyone else's. */
   const googleFlag = (forSub?: string): { email: string } | null | undefined => {
     const v = flag.get('google');
@@ -229,18 +237,52 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     if (!looksLikeEmail(v)) die(`--google wants an email address (or "none"), got "${v}"`);
     const k = emailKey(v);
     const clash = accounts.all().find((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
-    if (clash) die(`${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}`);
+    if (clash) {
+      die(
+        `${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
+          (signedUpRow(clash) ? ` — they signed up by signing in; give that account access instead: hn user set ${clash.sub} --scopes …` : '') +
+          (signedUpRow(clash) && !clash.google!.verified ? ` (Google hasn't vouched for that address on it — check who it is first)` : ''),
+      );
+    }
     return { email: v.trim() };
   };
 
   switch (sub) {
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
-      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
+      const tier = flag.get('tier');
+      // Already signed up with that Google address (an open audience, or a
+      // code), and Google vouched for it? Then THAT row is the person: it
+      // takes the username and the access, and keeps its sub — so whatever a
+      // service already holds under it (docs shares, comments) stays theirs.
+      const gv = flag.get('google');
+      const match = gv && gv !== 'none' && looksLikeEmail(gv)
+        ? accounts.all().find((x) => x.google && emailKey(x.google.email) === emailKey(gv))
+        : undefined;
+      const mine = match && adoptable(match) ? match : undefined;
+      // its own display name doesn't count against it
+      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n), mine?.sub);
       if (bad) die(bad);
+      if (mine) {
+        const day = new Date().toISOString().slice(0, 10);
+        const next = accounts.update(mine.sub, (x) => {
+          if (!adoptable(x)) throw new Error(`${x.sub} changed under us — run it again`);
+          return {
+            ...x,
+            username,
+            ...(flag.get('name') ? { name: flag.get('name')!.slice(0, 32) } : {}),
+            ...(scopesFlag ? { scopes: scopesFlag } : {}),
+            ...(tier ? { claims: { tier } } : {}),
+            notes: `${x.notes ? `${x.notes}; ` : ''}hn user add ${day}`,
+          };
+        })!;
+        console.error(`[hn] ${gv} already has an account (${next.sub}, made when they first signed in) — gave it the username ${username} [${(scopesFlag ?? []).join(' ') || 'no scopes yet — hn user set --scopes'}]`);
+        console.error(`[hn] they keep signing in with "Continue with Google". For a password too: hn user reset ${username}`);
+        console.log(describe(next));
+        return;
+      }
       const google = googleFlag();
       const { code, setup } = newSetupCode();
-      const tier = flag.get('tier');
       accounts.add({
         sub: `human:local:${username}`,
         username,
