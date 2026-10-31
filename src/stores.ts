@@ -408,9 +408,47 @@ export interface AudienceConfig {
    *  hasn't published one. wss only, for the same reason as `api`: the host
    *  puts the resident's credential on this dial. */
   mcpl?: string;
+  /**
+   * Open to newcomers: anyone who signs in (a Google account the node has
+   * never seen, a Discord account with no role) gets a token for THIS
+   * audience, holding `scopes` (default: its requiredScopes) — and nothing
+   * anywhere else. While any audience is open, a Google newcomer gets an
+   * account row (human:google:<sub>) on first sign-in WHEREVER it started —
+   * the row holds nothing, so closed audiences still refuse it (pointing at
+   * the open ones). Absent = only people with a grant get in.
+   */
+  signup?: { scopes?: string[] };
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
+
+/** What an open audience gives anyone who signs in to it, or null if it isn't open. */
+export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
+  return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
+}
+
+/** Is any audience open to newcomers? (What lets a Google newcomer's first
+ *  sign-in make their row — independent of whether a link can be shown.) */
+export function anyOpen(all: AudiencesConfig): boolean {
+  return Object.values(all).some((a) => Boolean(a.signup));
+}
+
+/** The audiences open to newcomers, each with the site to send a person to
+ *  (its `api` origin, else its redirect's) — what a refusal page and the
+ *  account page point at. */
+export function openSites(all: AudiencesConfig): Array<{ audience: string; url: string; host: string }> {
+  const out: Array<{ audience: string; url: string; host: string }> = [];
+  for (const [audience, a] of Object.entries(all)) {
+    if (!a.signup) continue;
+    try {
+      const u = new URL(a.api || a.redirect);
+      out.push({ audience, url: u.origin, host: u.host });
+    } catch {
+      /* a malformed URL: nothing to point at */
+    }
+  }
+  return out;
+}
 
 /** The published service directory: audience → API base, for audiences that
  *  declare one. Audiences without an `api` (MCPL-only, or human-login-only)
@@ -450,6 +488,7 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
+        if (v.signup !== undefined && (typeof v.signup !== 'object' || v.signup === null || (v.signup.scopes !== undefined && !Array.isArray(v.signup.scopes)))) return null;
       }
       return raw as AudiencesConfig;
     },
