@@ -1,0 +1,9 @@
+.git
+.worktrees
+node_modules
+dist
+data
+.env
+test
+deploy/identity-backup
+deploy/provision-identity-box.sh
