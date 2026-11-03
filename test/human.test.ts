@@ -896,3 +896,74 @@ test('open audience: a Discord account with no role gets in there and nowhere el
   assert.equal((await discordLogin('notes')).status, 403);
   discordRoles = ['r-member'];
 });
+
+// ── stack review (Greptile on #8–#11) ──
+
+test('review: an invitation to an address Google isn’t authoritative for can’t be claimed by a Google sign-in', async () => {
+  await node.accounts.add({ sub: 'human:local:nina', username: 'nina', scopes: ['worlds:join'], google: { email: 'nina@corp.example' }, createdAt: '' });
+  // a consumer Google account on that address (verified once, maybe not hers now)
+  googleUser = { sub: 'g-nina-old', email: 'nina@corp.example', email_verified: true, name: 'Nina?' };
+  const r = await googleLogin('eidoverse');
+  assert.equal(r.status, 403);
+  assert.match(r.text, /can only vouch/);
+  assert.equal(node.accounts.byUsername('nina')!.google!.sub, undefined);
+  assert.equal(node.accounts.bySub('human:google:g-nina-old'), undefined); // no shadow row either
+  // the same address on a Workspace account (hd): claimed
+  googleUser = { sub: 'g-nina', email: 'nina@corp.example', email_verified: true, hd: 'corp.example', name: 'Nina' };
+  const ok = await googleLogin('eidoverse');
+  assert.equal(ok.status, 302);
+  assert.equal(tokenFrom(ok.location!, 'eidoverse').sub, 'human:local:nina');
+  assert.equal(node.accounts.byUsername('nina')!.google!.verified, true);
+});
+
+test('review: a Google-made account can’t unlink Google, and a row whose Google was unlinked never signs in by it', async () => {
+  const { code } = node.codes.add({ label: 'r2', audiences: ['ranker'], scopes: ['ranker:member'] });
+  googleUser = { sub: 'g-anch', email: 'anch@gmail.com', email_verified: true, name: 'Anch' };
+  assert.equal((await googleLogin('notes')).status, 302);
+  const tok = rawToken((await googleLogin('account')).location!);
+  const un = await post('/account/google/unlink', {}, tok);
+  assert.equal(un.status, 400);
+  assert.match(un.body.error, /IS your Google identity/);
+  // a row already in that state (Google unlinked, another way in): Google is no way back — not with a code, not at an open audience
+  node.accounts.update('human:google:g-anch', (a) => {
+    const { google: _g, ...rest } = a;
+    return { ...rest, password: 'scrypt$15$8$1$x$y' };
+  });
+  const open = await googleLogin('notes');
+  assert.equal(open.status, 403);
+  assert.match(open.text, /was unlinked/);
+  const w = await withCode('ranker', code, 'google');
+  assert.equal(w.cb!.status, 403);
+  assert.equal(node.codes.all().find((c) => c.label === 'r2')!.uses ?? 0, 0);
+});
+
+test('review: linking Google is refused while an invitation to that address waits on another account', async () => {
+  await node.accounts.add({ sub: 'human:local:ivy', username: 'ivy', scopes: ['worlds:join'], google: { email: 'ivy@gmail.com' }, createdAt: '' });
+  await node.accounts.add({ sub: 'human:local:ike', username: 'ike', password: await hashPassword('ike password 1'), createdAt: '' });
+  const tok = await accountToken('ike', 'ike password 1');
+  const link = await post('/account/google/link', {}, tok);
+  const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
+  const state = new URL(start.location!).searchParams.get('state')!;
+  googleUser = { sub: 'g-ivy', email: 'ivy@gmail.com', email_verified: true };
+  const cb = await get(`/oauth/google/callback?state=${state}&code=x`, base, { cookie: link.cookie });
+  assert.equal(cb.status, 409);
+  assert.match(cb.text, /invitation/);
+  assert.equal(node.accounts.byGoogle('g-ivy'), undefined);
+  // and the invitation is still there to claim
+  assert.equal(tokenFrom((await googleLogin('eidoverse')).location!, 'eidoverse').sub, 'human:local:ivy');
+});
+
+test('review: an account with restrictions can’t unlink Discord or Google (it would come back unrestricted)', async () => {
+  await node.accounts.add({
+    sub: 'human:local:rex', username: 'rex', password: await hashPassword('rex password 1'), createdAt: '',
+    discord: { id: '8801', name: 'Rex' }, google: { sub: 'g-rex', email: 'rex@gmail.com' }, withhold: ['worlds:build'],
+  });
+  const tok = await accountToken('rex', 'rex password 1');
+  for (const which of ['discord', 'google']) {
+    const r = await post(`/account/${which}/unlink`, {}, tok);
+    assert.equal(r.status, 400, which);
+    assert.match(r.body.error, /restrictions/);
+  }
+  const a = node.accounts.bySub('human:local:rex')!;
+  assert.ok(a.discord && a.google?.sub);
+});

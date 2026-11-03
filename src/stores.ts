@@ -427,6 +427,15 @@ export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
   return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
 }
 
+/** `signup` must be a plain object, its `scopes` (if any) strings — else the
+ *  file is refused and the last good one stays (an array would open the
+ *  audience; a number in scopes would mint tokens verifiers reject). */
+function signupOk(s: unknown): boolean {
+  if (typeof s !== 'object' || s === null || Array.isArray(s)) return false;
+  const scopes = (s as { scopes?: unknown }).scopes;
+  return scopes === undefined || (Array.isArray(scopes) && scopes.every((x) => typeof x === 'string' && x.length > 0));
+}
+
 /** Is any audience open to newcomers? (What lets a Google newcomer's first
  *  sign-in make their row — independent of whether a link can be shown.) */
 export function anyOpen(all: AudiencesConfig): boolean {
@@ -488,7 +497,7 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
-        if (v.signup !== undefined && (typeof v.signup !== 'object' || v.signup === null || (v.signup.scopes !== undefined && !Array.isArray(v.signup.scopes)))) return null;
+        if (v.signup !== undefined && !signupOk(v.signup)) return null;
       }
       return raw as AudiencesConfig;
     },

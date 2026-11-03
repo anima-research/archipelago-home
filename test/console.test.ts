@@ -212,3 +212,16 @@ test('end-to-end: sponsored invite → enroll → principal carries the vouch', 
   assert.equal(view[0]!.status, 'claimed');
   assert.deepEqual(view[0]!.agent, { sub: 'agent:wisp@guest', name: 'Wisp' });
 });
+
+test('mint: what the operator withholds from the sponsor is never passed on — even scopes the policy adds', () => {
+  const anchorSponsor = { sub: 'human:discord:222', name: 'a', scopes: ['worlds:join', 'id:anchor'], withhold: ['music:upload', 'docs:use'] };
+  const plain = mintSponsoredInvite(invites, POLICY, anchorSponsor, 'x', { knownAudiences: KNOWN });
+  assert.ok(plain.ok);
+  assert.ok(!plain.invite.scopes.includes('music:upload')); // anchorGrantable
+  assert.ok(!plain.invite.scopes.includes('docs:use')); // baseline
+  assert.ok(plain.invite.scopes.includes('music:scribe'));
+  const anchored = mintSponsoredInvite(invites, POLICY, anchorSponsor, 'y', { anchorDomain: 'id.test', knownAudiences: KNOWN });
+  assert.ok(anchored.ok);
+  assert.ok(!anchored.invite.scopes.includes('music:upload')); // resident
+  assert.ok(!anchored.invite.scopes.includes('docs:use'));
+});

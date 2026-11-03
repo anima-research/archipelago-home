@@ -146,7 +146,10 @@ function accountsProblem(raw: unknown): string | null {
       if (passkeys.has(p.id)) return 'that passkey is already registered';
       passkeys.add(p.id);
     }
-    if (a.scopes !== undefined && (!Array.isArray(a.scopes) || !a.scopes.every((s) => typeof s === 'string'))) return 'bad scopes';
+    const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
+    if (a.scopes !== undefined && !strings(a.scopes)) return 'bad scopes';
+    if (a.ignoreRoles !== undefined && !strings(a.ignoreRoles)) return 'bad ignoreRoles';
+    if (a.withhold !== undefined && !strings(a.withhold)) return 'bad withhold';
   }
   return null;
 }

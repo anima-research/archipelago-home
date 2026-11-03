@@ -165,14 +165,20 @@ class Throttle {
   }
 }
 
-/** The Google link a sign-in writes. `verified` only when Google vouched for
- *  the address it sent just now — an address kept from before (`fallback`)
- *  is not re-vouched. */
+/** Restrictions an operator set (`hn user restrict`) hang on this row:
+ *  unlinking a sign-in method would let it come back unrestricted as an
+ *  identity of its own, so only an operator does that. */
+const restricted = (a: HumanAccount): boolean => Boolean(a.ignoreRoles?.length || a.withhold?.length);
+const RESTRICTED_UNLINK = 'an operator has set restrictions on this account — ask them to unlink it';
+
+/** The Google link a sign-in writes. `verified` only when Google is
+ *  authoritative for the address it sent just now (google.ts) — an address
+ *  kept from before (`fallback`) is not re-vouched. */
 function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<HumanAccount['google']> {
   return {
     sub: g.sub,
     email: g.email ?? fallback,
-    ...(g.email && g.emailVerified ? { verified: true } : {}),
+    ...(g.email && g.emailAuthoritative ? { verified: true } : {}),
     ...(g.name ? { name: g.name } : {}),
     linkedAt: now,
   };
@@ -575,13 +581,17 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       if (this.d.cfg.discordBotToken && this.d.roles.get().guildId) {
         try {
           const m = await botGuildMember(this.d.cfg.discordBotToken, this.d.roles.get().guildId, dc.id, this.d.fetchImpl);
-          discordGrant = m ? grantForRoles(effectiveRoles(m.roles, acct), this.d.roles.get()) : null;
           const name = m?.user ? displayNameOf(m.user, m) : dc.name;
-          account =
-            this.d.accounts.update(acct.sub, (a) => ({
-              ...a,
-              discord: { ...dc, name, grant: discordGrant, checkedAt: new Date().toISOString() },
-            })) ?? acct;
+          // The roles that count are read from the row as it is NOW, under
+          // the write: a restriction set while the bot call was out holds.
+          const checkedAt = new Date().toISOString();
+          const updated = this.d.accounts.update(acct.sub, (a) =>
+            a.discord?.id === dc.id
+              ? { ...a, discord: { ...a.discord, name, grant: m ? grantForRoles(effectiveRoles(m.roles, a), this.d.roles.get()) : null, checkedAt } }
+              : a,
+          );
+          account = updated ?? acct;
+          discordGrant = account.discord?.id === dc.id ? (account.discord.grant ?? null) : null;
           live = true;
         } catch (err) {
           console.error(`[hn] discord role re-check failed for ${acct.sub}: ${(err as Error).message} — using snapshot`);
@@ -902,6 +912,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (t.sub.startsWith('human:discord:')) {
       return json(res, 400, { error: 'this account IS your Discord identity — it can’t be unlinked' });
     }
+    if (restricted(a)) return json(res, 400, { error: RESTRICTED_UNLINK });
     if (loginMethods(a) <= 1) return json(res, 400, { error: 'that’s your only way to sign in — add another first' });
     this.d.accounts.update(t.sub, (x) => {
       const { discord: _d, ...rest } = x;
@@ -1011,6 +1022,13 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       if (other && other.sub !== st.sub) {
         return html(res, 409, page('already linked', `<p>That Google account (<b>${esc(label)}</b>) is already linked to another account here.</p>`));
       }
+      // An invitation to this address waits on another account: linking here
+      // would leave it unclaimable (every Google sign-in would land here).
+      const pending = g.email ? this.d.accounts.byGoogleInvite(g.email) : undefined;
+      if (pending && pending.sub !== st.sub) {
+        console.error(`[hn] google link refused for ${st.sub}: ${g.email} has an invitation on ${pending.sub}`);
+        return html(res, 409, page('invitation waiting', `<p>There’s an invitation here for <b>${esc(g.email!)}</b> on another account. To take it up, use <b>Continue with Google</b> on the sign-in page instead of linking; to have one account, ask an operator.</p>`));
+      }
       let acct: HumanAccount | undefined;
       try {
         acct = this.d.accounts.update(st.sub, (a) => {
@@ -1027,10 +1045,26 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
 
     let acct = this.d.accounts.byGoogle(g.sub);
-    if (!acct && g.email && g.emailVerified) {
-      // An operator invite by address: the first verified sign-in claims it.
-      const inv = this.d.accounts.byGoogleInvite(g.email);
-      if (inv && !inv.disabled) {
+    if (!acct) {
+      // A row keyed on this Google account that no longer links it: Google
+      // was unlinked there, which took it away as a way in — codes and open
+      // audiences don't bring it back.
+      const keyed = this.d.accounts.bySub(`human:google:${g.sub}`);
+      if (keyed) {
+        console.error(`[hn] login refused: google:${g.sub} (${label}) — no longer linked to ${keyed.sub}`);
+        return html(res, 403, page('not linked', `<p>Hi <b>${esc(label)}</b> — this Google account was unlinked from its account here, so it doesn’t sign in any more. Sign in another way, and link it again under <a href="/login?audience=account">sign-in settings</a> if you want it back.</p>`));
+      }
+    }
+    const inv = !acct && g.email ? this.d.accounts.byGoogleInvite(g.email) : undefined;
+    if (inv && !inv.disabled && !g.emailAuthoritative) {
+      // Google only vouches for Gmail and Workspace addresses (google.ts): an
+      // invitation to anything else can't be claimed by a Google sign-in.
+      console.error(`[hn] login refused: google:${g.sub} (${label}) — invite on ${inv.sub} needs an address Google is authoritative for`);
+      return html(res, 403, page('invitation', `<p>There’s an invitation here for <b>${esc(g.email!)}</b>, but Google can only vouch that an address is yours for Gmail and Google Workspace accounts. Ask whoever invited you for a setup link instead.</p>`));
+    }
+    if (inv) {
+      // An operator invite by address: the first sign-in Google vouches for claims it.
+      if (!inv.disabled) {
         try {
           acct = this.d.accounts.update(inv.sub, (a) => {
             if (a.disabled || !a.google || a.google.sub || emailKey(a.google.email) !== emailKey(g.email!)) throw new Error('changed');
@@ -1040,7 +1074,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         } catch {
           acct = undefined;
         }
-      } else if (inv) acct = inv; // disabled: refused just below
+      } else acct = inv; // disabled: refused just below
     }
     let fresh = false;
     if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
@@ -1057,7 +1091,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         });
         console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
       } catch {
-        acct = this.d.accounts.bySub(`human:google:${g.sub}`) ?? this.d.accounts.byGoogle(g.sub);
+        // another tab made it a moment ago — only if it really is this Google account's
+        acct = this.d.accounts.byGoogle(g.sub);
       }
       fresh = true;
     }
@@ -1065,6 +1100,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // Signing up: a Google account we don't know, with an access code.
       const r = this.signUp(`human:google:${g.sub}`, st.code, { google: googleLink(g, now) });
       if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}.</p>`));
+      if (r.account.google?.sub !== g.sub) return html(res, 403, page('not linked', '<p>That account no longer signs in with this Google account.</p>'));
       acct = r.account;
       fresh = true;
     }
@@ -1085,7 +1121,7 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     const seen = acct.google;
     if (
       seen?.sub === g.sub &&
-      ((g.email && (g.email !== seen.email || g.emailVerified !== Boolean(seen.verified))) || (g.name && g.name !== seen.name))
+      ((g.email && (g.email !== seen.email || g.emailAuthoritative !== Boolean(seen.verified))) || (g.name && g.name !== seen.name))
     ) {
       try {
         acct = this.d.accounts.update(acct.sub, (a) => {
@@ -1093,7 +1129,7 @@ If you were given an access code, enter it on the sign-in page first. If you hav
           const next = { ...a.google, ...(g.name ? { name: g.name } : {}) };
           if (g.email) {
             next.email = g.email;
-            if (g.emailVerified) next.verified = true;
+            if (g.emailAuthoritative) next.verified = true;
             else delete next.verified;
           }
           return { ...a, google: next };
@@ -1124,6 +1160,10 @@ If you were given an access code, enter it on the sign-in page first. If you hav
   private googleUnlink(res: ServerResponse, t: Aid1Payload): void {
     const a = this.d.accounts.bySub(t.sub);
     if (!a?.google) return json(res, 400, { error: 'no Google account linked' });
+    if (a.google.sub && t.sub === `human:google:${a.google.sub}`) {
+      return json(res, 400, { error: 'this account IS your Google identity — it can’t be unlinked' });
+    }
+    if (restricted(a)) return json(res, 400, { error: RESTRICTED_UNLINK });
     if (loginMethods(a) <= 1) return json(res, 400, { error: 'that’s your only way to sign in — add another first' });
     this.d.accounts.update(t.sub, (x) => {
       const { google: _g, ...rest } = x;

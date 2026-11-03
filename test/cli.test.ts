@@ -89,3 +89,20 @@ test('cli: a fresh address is still an invite on a new local account', () => {
   assert.deepEqual(f.google, { email: 'fresh@gmail.com' });
   assert.deepEqual(f.scopes, ['docs:use']);
 });
+
+test('cli: restrict with a bad flag writes nothing — no stray row for a new Discord id', () => {
+  const { hn, rows } = scratch([]);
+  const r = hn('restrict', '139758639064390000', '--ignore-roles', 'team');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /role ids/);
+  assert.deepEqual(rows(), []);
+  const ok = hn('restrict', '139758639064390000', '--ignore-roles', '1391615830604779520');
+  assert.equal(ok.status, 0, ok.out);
+  assert.deepEqual(rows().map((a) => [a.sub, a.ignoreRoles]), [['human:discord:139758639064390000', ['1391615830604779520']]]);
+});
+
+test('cli: an invite to a non-Gmail address says how to do it when it isn’t Workspace', () => {
+  const { hn } = scratch([]);
+  assert.match(hn('add', 'cora', '--google', 'cora@corp.example').out, /only a Gmail or Google Workspace address/);
+  assert.doesNotMatch(hn('add', 'gail', '--google', 'gail@gmail.com').out, /only a Gmail/);
+});

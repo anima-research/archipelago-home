@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { grantForRoles, InviteStore, mcplDirectory, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
+import { audiencesStore, grantForRoles, InviteStore, mcplDirectory, openSites, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'hn-stores-'));
@@ -98,4 +98,19 @@ test('service directory refuses bases a bearer credential must not be attached t
     notAString: { redirect: 'https://d/auth', api: 42 as unknown as string },
   });
   assert.deepEqual(dir, {});
+});
+
+test('audiences: a malformed signup is refused (the last good file stays); openSites falls back to the redirect', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aud-'));
+  const path = join(dir, 'audiences.json');
+  const good = { notes: { redirect: 'https://notes.test/auth', api: '', requiredScopes: ['notes:use'], signup: {} } };
+  writeFileSync(path, JSON.stringify(good));
+  const store = audiencesStore(path);
+  assert.deepEqual(store.get(), good);
+  assert.deepEqual(openSites(store.get()), [{ audience: 'notes', url: 'https://notes.test', host: 'notes.test' }]);
+  for (const signup of [[], { scopes: ['notes:use', 7] }, { scopes: 'notes:use' }, { scopes: [''] }, null]) {
+    writeFileSync(path, JSON.stringify({ notes: { ...good.notes, signup } }));
+    const s = audiencesStore(path);
+    assert.deepEqual(s.get(), {}, JSON.stringify(signup)); // refused at load: the fallback, not an open audience
+  }
 });

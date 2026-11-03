@@ -146,6 +146,7 @@ $('pw').onsubmit = async (e) => {
   const username = $('u').value.trim(), password = $('p').value;
   if (!username || !password) return err('Enter your username and password.');
   busy($('pw'), true);
+  await codePending;
   const r = await post('/login/password', { state: S.state, username, password }).catch(() => ({ body: { error: 'Network error.' } }));
   busy($('pw'), false);
   if (go(r)) return;
@@ -170,10 +171,17 @@ function restart() { ticket = null; $('step2').hidden = true; $('step1').hidden 
 $('back').onclick = () => { err(''); restart(); };
 
 const SIGNUP = ${scriptJson([o.google && 'Google', o.discord && 'Discord'].filter(Boolean))};
-async function useCode(code) {
+// Every way to finish signing in waits for a code check still in flight,
+// so the code is on the sign-in before it completes.
+let codePending = Promise.resolve();
+function useCode(code) { codePending = checkCode(code); return codePending; }
+document.querySelectorAll('a[href^="/login/google"],a[href^="/login/discord"]').forEach((a) => {
+  a.addEventListener('click', async (e) => { e.preventDefault(); await codePending; location.assign(a.href); });
+});
+async function checkCode(code) {
   err('');
-  const r = await post('/login/code', { state: S.state, code }).catch(() => ({ body: { error: 'Network error.' } }));
-  if (!r.body.label) return err(r.body.error || 'That code didn’t work.');
+  const r = await post('/login/code', { state: S.state, code }).catch(() => ({ status: 0, body: { error: 'Network error.' } }));
+  if (r.status !== 200) return err(r.body.error || 'That code didn’t work.');
   $('code-box').hidden = true; $('code-box').open = false;
   const ok = $('code-ok'); ok.hidden = false;
   ok.textContent = 'Code accepted — ' + r.body.label + ' (access to ' + r.body.audiences.join(', ') + '). Now sign in' +
@@ -196,6 +204,7 @@ async function passkey(mode) {
   catch (e) { if (mode === 'modal') err(webauthnError(e)); return; }
   if (!cred) return;
   err('');
+  await codePending;
   const r = await post('/login/passkey/finish', { state: S.state, credential: credJSON(cred) }).catch(() => ({ body: { error: 'Network error.' } }));
   if (!go(r)) err(r.body.error || 'Passkey sign-in failed.');
 }

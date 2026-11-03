@@ -46,6 +46,9 @@ export interface SponsorIdentity {
   sub: string; // human:discord:…
   name: string;
   scopes: string[];
+  /** Scopes the operator withholds from this person (`hn user restrict
+   *  --withhold`): never passed on either, whatever the policy adds. */
+  withhold?: string[];
 }
 
 export function activeSponsorInvites(invites: InviteStore, sponsorSub: string, nowMs = Date.now()): Invite[] {
@@ -103,7 +106,9 @@ export function mintSponsoredInvite(
   // can delegate. Either way, plus the baseline every invite carries.
   const union = (...lists: string[][]) => [...new Set(lists.flat())];
   const baseline = scopesWithRole(policy, 'baseline');
-  const scopes = anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline);
+  const withhold = sponsor.withhold ?? [];
+  const scopes = (anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline))
+    .filter((s) => !withhold.includes(s));
   const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences);
   // An empty list would be saved as "no audience allowed": enrollment would
   // consume the invite and every token request after it would fail.

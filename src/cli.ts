@@ -297,6 +297,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       console.error(`[hn] account human:local:${username} created [${(scopesFlag ?? []).join(' ') || 'no scopes yet — hn user set --scopes'}]`);
       if (google) {
         console.error(`[hn] they sign in with "Continue with Google" as ${google.email} (the first sign-in links it). For a password too: hn user reset ${username}`);
+        if (!/@(gmail|googlemail)\.com$/i.test(google.email)) {
+          console.error(`[hn] note: only a Gmail or Google Workspace address can be claimed this way (Google vouches for nothing else). If ${google.email.split('@')[1]} isn't on Workspace: hn user set ${username} --google none && hn user reset ${username} — a setup link — and they link Google after.`);
+        }
         return;
       }
       console.error(`[hn] send them this one-time link (valid 72h) to set a password:`);
@@ -361,6 +364,10 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     }
     case 'restrict': {
       // A Discord person with no row yet gets one (their sub stays human:discord:<id>).
+      // flags first: a bad one must not leave a fresh row behind
+      const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
+      const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
+      if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
       let a = rawName ? (accounts.byUsername(rawName) ?? accounts.bySub(rawName) ?? accounts.byDiscord(rawName.replace(/^human:discord:/, ''))) : undefined;
       if (!a && rawName && /^(human:discord:)?\d{15,22}$/.test(rawName)) {
         const id = rawName.replace(/^human:discord:/, '');
@@ -368,9 +375,6 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         console.error(`[hn] made a row for ${a.sub} (their name fills in at their next Discord sign-in)`);
       }
       if (!a) die('usage: hn user restrict <username | sub | discord-id> [--ignore-roles <role id>,…] [--withhold a,b] [--clear]');
-      const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
-      const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
-      if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
       const next = accounts.update(a.sub, (x) => {
         const n: HumanAccount = { ...x, ...(ign ? { ignoreRoles: ign } : {}), ...(wh ? { withhold: wh } : {}) };
         // the last Discord check's grant predates the restriction: drop it, so only a fresh check counts

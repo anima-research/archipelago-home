@@ -97,3 +97,11 @@ test('grant merge: union of scopes, later claims win, all-null → null', () => 
   });
   assert.deepEqual(mergeGrants(null, { scopes: [] }), { scopes: [] });
 });
+
+test('store: restriction fields must be string lists — a bad hand edit is refused', () => {
+  const { store } = fresh();
+  store.add({ sub: 'human:local:w', createdAt: '' });
+  assert.throws(() => store.update('human:local:w', (x) => ({ ...x, withhold: 'worlds:join' as unknown as string[] })), /bad withhold/);
+  assert.throws(() => store.update('human:local:w', (x) => ({ ...x, ignoreRoles: [42] as unknown as string[] })), /bad ignoreRoles/);
+  assert.equal(store.bySub('human:local:w')!.withhold, undefined);
+});
