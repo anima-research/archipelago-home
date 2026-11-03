@@ -45,6 +45,11 @@ export interface ServerConfig {
   discordBotToken?: string;
   googleClientId?: string;
   googleClientSecret?: string;
+  /** A header the fronting proxy overwrites with the client address (e.g.
+   *  `x-real-ip` on Railway), trusted from any peer — only for deployments
+   *  where every request arrives through that proxy. Unset: X-Real-IP is
+   *  trusted from loopback only. */
+  clientIpHeader?: string;
 }
 
 export function configFromEnv(env = process.env): ServerConfig {
@@ -68,13 +73,16 @@ export function configFromEnv(env = process.env): ServerConfig {
  * The client address for rate limiting. Behind the local reverse proxy every
  * request arrives from loopback, which would put the whole internet in one
  * bucket; the proxy overwrites X-Real-IP with the real client, so it is trusted
- * only when the connection itself comes from loopback.
+ * only when the connection itself comes from loopback. On a platform whose
+ * edge proxy is not on loopback (Railway), `trustedHeader` names the header
+ * that proxy overwrites, and it is trusted from any peer.
  */
-export function clientIp(req: Pick<IncomingMessage, 'headers' | 'socket'>): string {
+export function clientIp(req: Pick<IncomingMessage, 'headers' | 'socket'>, trustedHeader?: string): string {
   const peer = req.socket.remoteAddress ?? 'unknown';
   const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
-  const real = req.headers['x-real-ip'];
-  if (loopback && typeof real === 'string' && real.trim() && real.length <= 64) return real.trim();
+  const header = trustedHeader ?? 'x-real-ip';
+  const real = req.headers[header];
+  if ((loopback || trustedHeader) && typeof real === 'string' && real.trim() && real.length <= 64) return real.trim();
   return peer;
 }
 
@@ -177,7 +185,7 @@ export class HomeNode {
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const ip = clientIp(req);
+    const ip = clientIp(req, this.cfg.clientIpHeader);
     try {
       if (req.method === 'GET' && url.pathname === '/.well-known/mcpl-identity') {
         return json(res, 200, { scheme: 'ed25519', domain: this.cfg.iss, publicKey: this.issuer.id });

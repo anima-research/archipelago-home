@@ -1,0 +1,13 @@
+#!/bin/sh
+# `hn` inside the Railway image: the operator CLI against the volume.
+# A root shell (`railway ssh`) is dropped to the service user first — the CLI
+# refuses to run as root, since a root-owned 0600 accounts.json would lock the
+# service out.
+set -eu
+export HN_DATA_DIR="${HN_DATA_DIR:-/data/hn/data}"
+export HN_CONFIG_DIR="${HN_CONFIG_DIR:-/data/hn/config}"
+SVC_USER="${HN_USER:-hn}"
+if [ "$(id -u)" = 0 ] && id -u "$SVC_USER" >/dev/null 2>&1; then
+  exec setpriv --reuid="$SVC_USER" --regid="$SVC_USER" --init-groups node /app/dist/src/cli.js "$@"
+fi
+exec node /app/dist/src/cli.js "$@"
