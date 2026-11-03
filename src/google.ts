@@ -5,8 +5,13 @@
  * Google carries no roles, so a Google login grants nothing by itself: it
  * opens an account that already exists here — one that linked Google under
  * sign-in settings, or one the operator made with `hn user add <name>
- * --google <email>`, which the first sign-in with that verified address
- * claims. A Google account we don't know is refused; there is no sign-up.
+ * --google <email>`, which the first sign-in claims if Google is
+ * AUTHORITATIVE for that address (below). A Google account we don't know
+ * gets an empty row only while some audience is open to newcomers.
+ *
+ * Authoritative = Gmail, or a Google Workspace account (`hd` set). For any
+ * other address `email_verified` only says the address was checked once —
+ * the mailbox may have changed hands since — so nothing is granted by it.
  *
  * The id_token comes straight from Google's token endpoint over TLS in
  * exchange for our client secret, so its signature isn't checked here
@@ -26,7 +31,17 @@ export interface GoogleIdentity {
   sub: string;
   email?: string;
   emailVerified: boolean;
+  /** Google vouches for this address now: verified, and Gmail or Workspace. */
+  emailAuthoritative: boolean;
   name?: string;
+}
+
+/** Is Google authoritative for this address (Google's own guidance for
+ *  using `email` as more than a label)? */
+export function authoritativeEmail(email: string | undefined, verified: boolean, hd: unknown): boolean {
+  if (!email || !verified) return false;
+  const domain = email.trim().toLowerCase().split('@').pop() ?? '';
+  return domain === 'gmail.com' || domain === 'googlemail.com' || (typeof hd === 'string' && hd.length > 0);
 }
 
 export function newPkceVerifier(): string {
@@ -84,10 +99,13 @@ export function identityFromIdToken(idToken: string, clientId: string, nowS = Ma
   if (!aud.includes(clientId)) throw new Error('google id_token: not for this client');
   if (typeof c.exp !== 'number' || c.exp < nowS - 60) throw new Error('google id_token: expired');
   if (typeof c.sub !== 'string' || !c.sub) throw new Error('google id_token: no sub');
+  const email = typeof c.email === 'string' ? c.email : undefined;
+  const emailVerified = c.email_verified === true || c.email_verified === 'true';
   return {
     sub: c.sub,
-    ...(typeof c.email === 'string' ? { email: c.email } : {}),
-    emailVerified: c.email_verified === true || c.email_verified === 'true',
+    ...(email ? { email } : {}),
+    emailVerified,
+    emailAuthoritative: authoritativeEmail(email, emailVerified, c.hd),
     ...(typeof c.name === 'string' && c.name ? { name: c.name.slice(0, 64) } : {}),
   };
 }

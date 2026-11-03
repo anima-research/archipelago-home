@@ -264,7 +264,8 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (who) {
         json(res, 200, {
-          sub: who.sub, name: who.name, delegable: delegableScopes(this.invitePolicy.get(), who.scopes),
+          sub: who.sub, name: who.name,
+          delegable: delegableScopes(this.invitePolicy.get(), who.scopes).filter((s) => !this.accounts.bySub(who.sub)?.withhold?.includes(s)),
           canAnchor: who.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
           ...(who.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: residentScopes(this.invitePolicy.get()) } : {}),
         });
@@ -280,7 +281,8 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
-      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), { sub: who.sub, name: who.name, scopes: who.scopes },
+      const withhold = this.accounts.bySub(who.sub)?.withhold;
+      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), { sub: who.sub, name: who.name, scopes: who.scopes, ...(withhold ? { withhold } : {}) },
         typeof body?.label === 'string' ? body.label : undefined,
         { anchorDomain: body?.anchor === true ? this.cfg.iss : null,
           knownAudiences: Object.keys(this.audiences.get()) });

@@ -64,6 +64,9 @@ export interface HumanAccount {
   google?: {
     sub?: string;
     email: string;
+    /** Google vouched for `email` (email_verified) when it was last seen.
+     *  Absent = not known to be theirs — nothing may be granted by address. */
+    verified?: boolean;
     name?: string;
     linkedAt?: string;
   };
@@ -128,6 +131,7 @@ function accountsProblem(raw: unknown): string | null {
     }
     if (a.google) {
       if (typeof a.google.email !== 'string') return 'bad google email';
+      if (a.google.verified !== undefined && typeof a.google.verified !== 'boolean') return 'bad google verified';
       if (a.google.sub !== undefined) {
         if (typeof a.google.sub !== 'string' || !a.google.sub) return 'bad google sub';
         if (googles.has(a.google.sub)) return 'that Google account is linked elsewhere';
@@ -142,7 +146,10 @@ function accountsProblem(raw: unknown): string | null {
       if (passkeys.has(p.id)) return 'that passkey is already registered';
       passkeys.add(p.id);
     }
-    if (a.scopes !== undefined && (!Array.isArray(a.scopes) || !a.scopes.every((s) => typeof s === 'string'))) return 'bad scopes';
+    const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
+    if (a.scopes !== undefined && !strings(a.scopes)) return 'bad scopes';
+    if (a.ignoreRoles !== undefined && !strings(a.ignoreRoles)) return 'bad ignoreRoles';
+    if (a.withhold !== undefined && !strings(a.withhold)) return 'bad withhold';
   }
   return null;
 }

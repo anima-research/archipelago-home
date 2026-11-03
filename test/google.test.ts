@@ -8,7 +8,7 @@ const NOW = 1_800_000_000;
 const good = { iss: 'https://accounts.google.com', aud: 'cid', exp: NOW + 300, sub: '123', email: 'a@b.co', email_verified: true, name: 'A' };
 
 test('id_token: iss, aud, exp and sub are checked', () => {
-  assert.deepEqual(identityFromIdToken(jwt(good), 'cid', NOW), { sub: '123', email: 'a@b.co', emailVerified: true, name: 'A' });
+  assert.deepEqual(identityFromIdToken(jwt(good), 'cid', NOW), { sub: '123', email: 'a@b.co', emailVerified: true, emailAuthoritative: false, name: 'A' });
   assert.equal(identityFromIdToken(jwt({ ...good, iss: 'accounts.google.com' }), 'cid', NOW).sub, '123');
   assert.throws(() => identityFromIdToken(jwt({ ...good, iss: 'https://evil.example' }), 'cid', NOW), /issuer/);
   assert.throws(() => identityFromIdToken(jwt({ ...good, aud: 'other' }), 'cid', NOW), /client/);
@@ -16,6 +16,16 @@ test('id_token: iss, aud, exp and sub are checked', () => {
   assert.throws(() => identityFromIdToken(jwt({ ...good, sub: '' }), 'cid', NOW), /sub/);
   assert.throws(() => identityFromIdToken('garbage', 'cid', NOW), /unreadable/);
   assert.equal(identityFromIdToken(jwt({ ...good, email_verified: false }), 'cid', NOW).emailVerified, false);
+});
+
+test('authoritative: Gmail, or a Workspace account (hd) — verified alone is not enough', () => {
+  const id = (claims: Record<string, unknown>) => identityFromIdToken(jwt({ ...good, ...claims }), 'cid', NOW);
+  assert.equal(id({ email: 'x@gmail.com' }).emailAuthoritative, true);
+  assert.equal(id({ email: 'X@GoogleMail.com' }).emailAuthoritative, true);
+  assert.equal(id({ email: 'x@corp.example', hd: 'corp.example' }).emailAuthoritative, true);
+  assert.equal(id({ email: 'x@corp.example' }).emailAuthoritative, false); // a consumer Google account on someone's address
+  assert.equal(id({ email: 'x@gmail.com', email_verified: false }).emailAuthoritative, false);
+  assert.equal(id({ email: undefined, hd: 'corp.example' }).emailAuthoritative, false);
 });
 
 test('emailKey: case-insensitive; Gmail ignores dots and +suffix; other domains keep them', () => {
