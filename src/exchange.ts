@@ -165,6 +165,7 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
     ...(inv.claims ? { claims: inv.claims } : {}),
     ...(inv.audiences ? { audiences: inv.audiences } : {}),
     tokenTtl: inv.tokenTtl ?? DEFAULT_ENROLL_TTL,
+    ...(inv.ticket ? { sponsorTicket: inv.ticket } : {}),
     notes: `enrolled via invite ${inv.code}${inv.label ? ` (${inv.label})` : ''}`,
   };
   if (deps.principals.bySub(p.sub)) return fail(403, 'name taken'); // slug collision

@@ -34,9 +34,9 @@ import { loadOrCreateIssuerKey } from './keys.js';
 import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './token.js';
 import { audiencesStore, InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
 import { CodeStore } from './codes.js';
-import { clean, ticketDefaultsStore, ticketGrantProblem, TicketStore, usableEmail } from './tickets.js';
+import { clean, noDefaultsMessage, takeBackTicket, ticketDefaultsStore, ticketGrantProblem, TicketStore, usableEmail } from './tickets.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
-import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
+import { AccountStore, displayName, nameProblem, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
 
 function flags(args: string[]): { flag: Map<string, string>; pos: string[] } {
@@ -87,7 +87,7 @@ function main(): void {
     case 'code':
       return codeCmd(cfg, pos, flag);
     case 'ticket':
-      return ticketCmd(cfg, pos, flag);
+      return ticketCmd(cfg, principals, invites, pos, flag);
 
     case 'mint': {
       const name = flag.get('name') ?? die('--name required');
@@ -468,7 +468,7 @@ function codeCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): v
 }
 
 /** `hn ticket …` — addresses that may sign up by email (tickets.ts). */
-function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): void {
+function ticketCmd(cfg: ServerConfig, principals: PrincipalStore, invites: InviteStore, pos: string[], flag: Map<string, string>): void {
   try {
     if (process.getuid?.() === 0 && statSync(cfg.dataDir).uid !== 0) {
       die(`run as the service user, not root (e.g. sudo -u ${userInfoName(statSync(cfg.dataDir).uid)} …) — tickets.json is 0600`);
@@ -486,10 +486,15 @@ function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>):
       const audiences = list(flag.get('audiences')) ?? defaults.audiences;
       const scopes = list(flag.get('scopes')) ?? defaults.scopes;
       // the one check the ticket site's POST /tickets makes (tickets.ts)
+      if (!defaults.configured) die(noDefaultsMessage(cfg.configDir));
       const bad = ticketGrantProblem(defaults, Object.keys(audiencesStore(join(cfg.configDir, 'audiences.json')).get()), audiences, scopes);
-      if (bad) die(`${bad}${defaults.configured ? '' : ` — copy config/ticket-defaults.example.json to ${join(cfg.configDir, 'ticket-defaults.json')}`}`);
+      if (bad) die(bad);
       const who = process.env.SUDO_USER || process.env.USER || userInfoName(process.getuid?.() ?? -1);
       const name = clean(flag.get('name'), 32);
+      if (name) {
+        const nameBad = nameProblem(name, new AccountStore(join(cfg.dataDir, 'accounts.json')), (n) => principals.nameTaken(n), '');
+        if (nameBad) die(`--name: ${nameBad}`);
+      }
       const note = clean(flag.get('note'), 120);
       const r = tickets.add({ email, source: `admin:${who}`, audiences, scopes, ...(name ? { name } : {}), ...(note ? { note } : {}) });
       if (!r.created) die(`${email} already holds a ticket (${r.ticket.source}, ${r.ticket.addedAt.slice(0, 10)})${r.ticket.claimedBy ? `, taken up by ${r.ticket.claimedBy}` : ''}`);
@@ -512,20 +517,12 @@ function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>):
     }
     case 'rm': {
       if (!email) die('usage: hn ticket rm <email>');
-      const t = tickets.remove(email) ?? die(`no ticket for ${email}`);
-      let stripped = false;
-      if (t.claimedBy) {
-        new AccountStore(join(cfg.dataDir, 'accounts.json')).update(t.claimedBy, (a) => {
-          if (!a.ticket) return a;
-          stripped = true;
-          const { ticket: _t, ...rest } = a;
-          return rest;
-        });
-      }
-      console.error(`[hn] ticket for ${t.email} removed — no more sign-ups with it.` +
-        (t.claimedBy
-          ? ` Its account (${t.claimedBy}) ${stripped ? 'loses what the ticket gave and ' : ''}stays, with its other ways in; a new ticket for the address gives it back.`
-          : ' It had not been taken up.'));
+      const t = tickets.byEmail(email) ?? die(`no ticket for ${email}`);
+      // what it gave goes first; if that fails the ticket stays and this can be run again
+      const back = takeBackTicket(t, { accounts: new AccountStore(join(cfg.dataDir, 'accounts.json')), invites, principals });
+      tickets.remove(email);
+      console.error(`[hn] ticket ${t.id} for ${t.email} removed — no more sign-ups with it; taken back from ${back.accounts} account(s), ${back.invites} unclaimed invite(s), ${back.agents} agent(s).` +
+        (t.claimedBy ? ` Its account (${t.claimedBy}) stays, with its other ways in; a new ticket for the address gives the grant back.` : ''));
       return;
     }
     default:

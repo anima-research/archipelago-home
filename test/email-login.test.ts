@@ -18,7 +18,7 @@ import type { EmailSender } from '../src/email.js';
 import { emailKey } from '../src/google.js';
 
 const TOKEN = 'tickets-token-test-0123456789abcdef'; // ≥ 32 characters
-const DEFAULTS = { audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members', 'gate'], scopes: ['members:member', 'extra:use'] } };
+const DEFAULTS = { audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members', 'gate'], scopes: ['members:member', 'extra:use', 'docs:use'] } };
 let node: HomeNode;
 let base: string;
 let ipSeq = 0;
@@ -215,34 +215,26 @@ test('begin: the same answer whether or not the address holds a ticket; a code g
   await new Promise((r) => setImmediate(r));
   assert.equal(outbox.filter((m) => m.to === 'Re.Send@example.org').length, 2);
   assert.equal(lastCode('Re.Send@example.org'), before);
-  for (let i = 0; i < 3; i++) assert.equal((await post('/login/email/finish', { state, email: 're.send@example.org', code: '000000' })).status, 401);
-  // the fifth wrong try — the one before was kept across the re-send — spends it
-  assert.equal((await post('/login/email/finish', { state, email: 're.send@example.org', code: '000000' })).body.restart, true);
-  assert.equal((await post('/login/email/finish', { state, email: 're.send@example.org', code: before })).status, 401);
+  // wrong guesses never knock out the live code: after six of them the right one still works
+  for (let i = 0; i < 5; i++) assert.equal((await post('/login/email/finish', { state, email: 're.send@example.org', code: '000000' })).status, 401);
+  const ok = await post('/login/email/finish', { state, email: 're.send@example.org', code: before });
+  assert.equal(ok.status, 200, JSON.stringify(ok.body));
 });
 
-test('finish: five wrong codes spend it (holder and stranger alike); the right code makes a human:email: account, claims the ticket and signs in — for the ticket’s audiences only', async () => {
+test('finish: wrong guesses answer alike for holder and stranger and spend nothing; the right code makes a human:email: account, claims the ticket and signs in — for the ticket’s audiences only', async () => {
   const state = await loginState('members');
-  // the previous test left one wrong try on the holder's live code; a stranger's decoy runs the same course
   await post('/login/email/begin', { state, email: 'pat.buyer@gmail.com' });
   await post('/login/email/begin', { state, email: 'stranger2@example.org' });
-  const code = lastCode('Pat.Buyer+x@gmail.com');
-  for (let i = 0; i < 4; i++) {
-    const r = await post('/login/email/finish', { state, email: 'stranger2@example.org', code: '000000' });
-    assert.equal(r.status, 401);
-    assert.equal(r.body.restart, undefined);
+  for (let i = 0; i < 6; i++) {
+    const h = await post('/login/email/finish', { state, email: 'pat.buyer@gmail.com', code: '000000' });
+    const s = await post('/login/email/finish', { state, email: 'stranger2@example.org', code: '000000' });
+    assert.deepEqual(h, s);
+    assert.deepEqual(h, { status: 401, body: { error: 'wrong or expired code' } });
   }
-  for (let i = 0; i < 3; i++) assert.equal((await post('/login/email/finish', { state, email: 'pat.buyer@gmail.com', code: '000000' })).status, 401);
-  const fifth = await post('/login/email/finish', { state, email: 'pat.buyer@gmail.com', code: '000000' });
-  assert.deepEqual(fifth, await post('/login/email/finish', { state, email: 'stranger2@example.org', code: '000000' }));
-  assert.equal(fifth.status, 401);
-  assert.equal(fifth.body.restart, true);
-  const spent = await post('/login/email/finish', { state, email: 'pat.buyer@gmail.com', code });
-  assert.deepEqual(spent, { status: 401, body: { error: 'wrong or expired code' } }); // the right code no longer counts
   assert.equal(node.accounts.byEmail('pat.buyer@gmail.com'), undefined);
 
-  // a fresh code: in — the row carries the ticket's spelling of the address and the holder's name
-  const done = await emailLogin('Pat.Buyer@gmail.com', 'members');
+  // the live code: in — the row carries the ticket's spelling of the address and the holder's name
+  const done = await post('/login/email/finish', { state, email: 'Pat.Buyer@gmail.com', code: lastCode('pat.buyer@gmail.com') });
   assert.equal(done.status, 200, JSON.stringify(done.body));
   const p = tokenFrom(done.body.redirect, 'members');
   assert.match(p.sub, /^human:email:[A-Za-z0-9_-]{12}$/);
@@ -258,8 +250,9 @@ test('finish: five wrong codes spend it (holder and stranger alike); the right c
   assert.equal(row.scopes, undefined); // the grant lives on the ticket snapshot, audience-bound
   assert.equal(node.tickets.byEmail('patbuyer@gmail.com')!.claimedBy, p.sub);
   assert.deepEqual((await api('GET', '/tickets/patbuyer%40gmail.com')).body, { held: true, addedAt: node.tickets.byEmail('patbuyer@gmail.com')!.addedAt, claimedBy: p.sub });
-  // the code is single-use
-  assert.equal((await post('/login/email/finish', { state, email: 'Pat.Buyer@gmail.com', code: lastCode('Pat.Buyer+x@gmail.com') })).status, 401);
+  // the code is single-use (and the sign-in state was spent with it)
+  assert.equal((await post('/login/email/finish', { state, email: 'Pat.Buyer@gmail.com', code: lastCode('Pat.Buyer+x@gmail.com') })).status, 400);
+  assert.equal((await post('/login/email/finish', { state: await loginState('members'), email: 'Pat.Buyer@gmail.com', code: lastCode('Pat.Buyer+x@gmail.com') })).status, 401);
   // the ticket's scopes count for its audiences only
   const elsewhere = await emailLogin('pat.buyer@gmail.com', 'gate');
   assert.equal(elsewhere.status, 403);
@@ -293,20 +286,24 @@ test('a ticket without a name signs in as "Ticket holder" — the address never 
   assert.equal(tokenFrom(r.body.redirect, 'members').name, 'Ticket holder');
 });
 
-test('ten wrong codes in a day lock the address out of email sign-in, begin and finish alike', async () => {
+test('ten wrong codes from one client address lock THAT source out for the address; the holder elsewhere still gets in', async () => {
   await addTicket('locked@example.org', 'tickets:human:locked');
   const state = await loginState('members');
   await post('/login/email/begin', { state, email: 'locked@example.org' });
+  const attacker = { 'x-real-ip': '198.51.100.9' };
   for (let i = 0; i < 10; i++) {
-    if (i === 5) await post('/login/email/begin', { state, email: 'locked@example.org' }); // a fresh code after the first was spent
-    assert.equal((await post('/login/email/finish', { state, email: 'locked@example.org', code: '000000' })).status, 401, String(i));
+    assert.equal((await post('/login/email/finish', { state, email: 'locked@example.org', code: String(100000 + i) }, undefined, attacker)).status, 401, String(i));
   }
   const right = lastCode('locked@example.org');
-  const fin = await post('/login/email/finish', { state, email: 'locked@example.org', code: right });
+  const fin = await post('/login/email/finish', { state, email: 'locked@example.org', code: right }, undefined, attacker);
   assert.equal(fin.status, 429);
-  assert.match(fin.body.error, /try again tomorrow/);
-  assert.equal((await post('/login/email/begin', { state, email: 'Locked@example.org' })).status, 429);
-  assert.equal(node.accounts.byEmail('locked@example.org'), undefined);
+  assert.match(fin.body.error, /from here .* try again tomorrow/);
+  assert.equal((await post('/login/email/begin', { state, email: 'Locked@example.org' }, undefined, attacker)).status, 429);
+  // the attacker's lock is theirs alone: another address of theirs, and the holder from home, are untouched
+  assert.equal((await post('/login/email/begin', { state, email: 'other@example.org' }, undefined, attacker)).status, 200);
+  const home = await post('/login/email/finish', { state, email: 'locked@example.org', code: right });
+  assert.equal(home.status, 200, JSON.stringify(home.body));
+  assert.ok(node.accounts.byEmail('locked@example.org'));
 });
 
 test('a second sign-up with the same mailbox is the same account; a refund takes the grant back, a new purchase gives it back; a second purchase widens it on the account', async () => {
@@ -314,7 +311,7 @@ test('a second sign-up with the same mailbox is the same account; a refund takes
   const again = await emailLogin('PAT.BUYER+other@gmail.com', 'members');
   assert.equal(again.status, 200, JSON.stringify(again.body));
   assert.equal(tokenFrom(again.body.redirect, 'members').sub, first.sub);
-  assert.equal(node.accounts.all().filter((a) => a.sub.startsWith('human:email:')).length, 2); // pat, anon
+  assert.equal(node.accounts.all().filter((a) => a.email && emailKey(a.email.address) === 'patbuyer@gmail.com').length, 1); // no second row
   // a refund (DELETE): the address still signs in to the account, which now holds nothing from the ticket
   assert.equal((await api('DELETE', '/tickets/' + encodeURIComponent('pat.buyer@gmail.com'))).status, 204);
   assert.equal(node.accounts.bySub(first.sub)!.ticket, undefined);
@@ -407,7 +404,7 @@ test('link an address under sign-in settings: the code proves the mailbox, and a
   const p = tokenFrom(viaEmail.body.redirect, 'members');
   assert.equal(p.sub, 'human:local:dee');
   assert.deepEqual(p.scopes, ['members:member']);
-  assert.equal(node.accounts.all().filter((a) => a.sub.startsWith('human:email:')).length, 2); // pat and anon only
+  assert.equal(node.accounts.all().filter((a) => a.email && emailKey(a.email.address) === 'dee.holder@example.org').map((a) => a.sub).join(), 'human:local:dee');
   // an address that already signs in elsewhere can't be linked twice
   await node.accounts.add({ sub: 'human:local:eve', username: 'eve', password: await hashPassword('eve password 1'), createdAt: '' });
   const etok = rawToken((await post('/login/password', { state: await loginState('account'), username: 'eve', password: 'eve password 1' })).body.redirect);
@@ -507,10 +504,12 @@ test('invites: a ticket holder (signed in or not) sponsors agents under the invi
   assert.equal(minted.body!.agentsMd, 'https://id.test/agents.md');
   assert.ok(Date.parse(minted.body!.expiresAt) - Date.now() > 13 * 86_400_000);
   const inv = node.invites.all().find((i) => i.code === minted.body!.code)!;
-  assert.equal(inv.sponsor, 'ticket:tickets:human:sp');
-  assert.deepEqual([...inv.scopes].sort(), ['docs:use', 'members:member']); // delegable ∩ ticket, plus baseline
-  assert.deepEqual(inv.audiences, ['members']); // by the policy's rules, never the ticket's own list
-  assert.deepEqual(inv.claims, { tier: 'sponsored', sponsor: 'ticket:tickets:human:sp', sponsorName: 'Sam Sponsor' });
+  const tid = node.tickets.byEmail('sponsor@example.org')!.id;
+  assert.equal(inv.sponsor, `ticket:${tid}`);
+  assert.equal(inv.ticket, tid);
+  assert.deepEqual([...inv.scopes].sort(), ['docs:use', 'members:member']); // delegable ∩ ticket, plus baseline ∩ allowed
+  assert.deepEqual(inv.audiences, ['members']); // the policy's rules ∩ the ticket's audiences
+  assert.deepEqual(inv.claims, { tier: 'sponsored', sponsor: `ticket:${tid}`, sponsorName: 'Sam Sponsor' });
   assert.equal(inv.maxUses, 1);
   // by ref alone works too; the list shows the code while unclaimed
   assert.equal((await api('POST', '/tickets/invites', { ref: 'tickets:human:sp' })).status, 201);
@@ -524,7 +523,8 @@ test('invites: a ticket holder (signed in or not) sponsors agents under the invi
   assert.equal(agent.status, 200, JSON.stringify(agent.body));
   const principal = node.principals.bySub(agent.body.sub)!;
   assert.deepEqual(principal.audiences, ['members']);
-  assert.deepEqual(principal.claims?.sponsor, 'ticket:tickets:human:sp');
+  assert.deepEqual(principal.claims?.sponsor, `ticket:${tid}`);
+  assert.equal(principal.sponsorTicket, tid);
   const after = (await api('GET', '/tickets/invites?email=sponsor%40example.org')).body!.invites.find((i: { agentName: string }) => i.agentName === 'Ferro');
   assert.equal(after.code, undefined);
   assert.equal(after.claimedBy, agent.body.sub);
@@ -532,7 +532,7 @@ test('invites: a ticket holder (signed in or not) sponsors agents under the invi
   assert.equal((await api('POST', '/tickets/invites', { email: 'sponsor@example.org', ref: 'tickets:human:sp' })).status, 201);
   assert.equal((await api('POST', '/tickets/invites', { email: 'sponsor@example.org', ref: 'tickets:human:sp' })).status, 201);
   const full = await api('POST', '/tickets/invites', { email: 'sponsor@example.org', ref: 'tickets:human:sp' });
-  assert.deepEqual(full, { status: 409, body: { error: 'budget' } });
+  assert.deepEqual(full, { status: 409, body: { error: 'budget', reason: 'active' } });
 
   // signed in: the account is the sponsor, and the console and the API draw on one pool
   await node.accounts.add({ sub: 'human:local:cal', username: 'cal', password: await hashPassword('cal password 1'), scopes: ['members:member'], createdAt: '' });

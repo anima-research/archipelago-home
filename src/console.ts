@@ -72,17 +72,34 @@ export function residentScopes(policy: InvitePolicy): string[] {
 
 export type ConsoleMintResult =
   | { ok: true; invite: Invite }
-  | { ok: false; status: 403 | 429; error: string };
+  | { ok: false; status: 403 | 429; error: string; budget?: 'active' | 'lifetime' };
+
+export interface MintOptions {
+  anchorDomain?: string | null;
+  knownAudiences?: string[];
+  /** `false` — the sponsor was admitted some other way (a ticket holder at
+   *  the ticket site, server.ts): the console's sign-in gate doesn't apply,
+   *  the delegation rules still do. */
+  gate?: boolean;
+  /** The most the invite may carry, whatever the policy's rules add: a
+   *  ticket's own audiences and scopes (an `always` rule must not open the
+   *  rest of the home to a members-only ticket). */
+  restrict?: { audiences: string[]; scopes: string[] };
+  /** Active (unclaimed, unexpired) invites at a time. Default: the console's. */
+  budget?: { active: number };
+  /** Subs whose active invites share one budget (a ticket's placeholder
+   *  and the account that took it up). Default: the sponsor's alone. */
+  sponsorSubs?: string[];
+  /** The ticket this invite is minted for (tickets.ts `id`). */
+  ticket?: string;
+}
 
 export function mintSponsoredInvite(
   invites: InviteStore,
   policy: InvitePolicy,
   sponsor: SponsorIdentity,
   label: string | undefined,
-  /** `gate: false` — the sponsor was admitted some other way (a ticket
-   *  holder at the ticket site, server.ts): the console's sign-in gate
-   *  doesn't apply, the delegation rules still do. */
-  opts?: { anchorDomain?: string | null; knownAudiences?: string[]; gate?: boolean },
+  opts?: MintOptions,
   nowMs = Date.now(),
 ): ConsoleMintResult {
   const gate = consoleRequiredScopes(policy);
@@ -95,14 +112,18 @@ export function mintSponsoredInvite(
   if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
     return { ok: false, status: 403, error: 'anchoring at the home domain requires the id:anchor grant' };
   }
-  const active = activeSponsorInvites(invites, sponsor.sub, nowMs);
-  if (active.length >= SPONSOR_BUDGET) {
+  const subs = opts?.sponsorSubs ?? [sponsor.sub];
+  const active = subs.flatMap((s) => activeSponsorInvites(invites, s, nowMs));
+  const budget = opts?.budget?.active ?? SPONSOR_BUDGET;
+  if (active.length >= budget) {
     return {
       ok: false,
       status: 429,
+      budget: 'active',
       error: `you already have ${active.length} unclaimed invites — revoke one or wait for a claim/expiry`,
     };
   }
+
   const anchored = Boolean(opts?.anchorDomain);
   // Anchored: the resident grant, plus anything else the sponsor could pass
   // down anyway — never less than a plain invite. Plain: what the sponsor
@@ -110,9 +131,11 @@ export function mintSponsoredInvite(
   const union = (...lists: string[][]) => [...new Set(lists.flat())];
   const baseline = scopesWithRole(policy, 'baseline');
   const withhold = sponsor.withhold ?? [];
+  const restrict = opts?.restrict;
   const scopes = (anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline))
-    .filter((s) => !withhold.includes(s));
-  const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences);
+    .filter((s) => !withhold.includes(s))
+    .filter((s) => !restrict || restrict.scopes.includes(s));
+  const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences).filter((a) => !restrict || restrict.audiences.includes(a));
   // An empty list would be saved as "no audience allowed": enrollment would
   // consume the invite and every token request after it would fail.
   if (!audiences.length) {
@@ -127,6 +150,7 @@ export function mintSponsoredInvite(
     audiences,
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
+    ...(opts?.ticket ? { ticket: opts.ticket } : {}),
     ...(anchored ? { domain: opts!.anchorDomain! } : {}),
     // Rides into the enrolled principal and thence into every token it is
     // ever issued: audiences can see (and render) who vouched.

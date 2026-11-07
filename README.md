@@ -143,16 +143,21 @@ Tickets arrive two ways:
   `api:<ref>`). 201 made; 200 when that ref is already known (the same entry back) or when the mailbox
   already holds a ticket (the first one stands, the extra ref is recorded on it, and any wider grant is
   merged in — on the account too); 410 when the ref's ticket was removed (a redelivery after a refund
-  makes nothing); 503 without `config/ticket-defaults.json`. `GET /tickets/<email>` → `{held, claimedBy?,
-  addedAt?}`. `DELETE /tickets/<email>` → 204 — a refund: no more sign-ups with the address, and the
-  account it made loses what the ticket gave (the account and its other ways in stay; a new purchase gives
-  it back at the next sign-in); 404 if absent. Per-client-IP rate limited like the other POSTs.
+  makes nothing); 503 without a usable `config/ticket-defaults.json` (the body says whether it is missing
+  or refused). `name` goes through the checks a person picking their own name gets (not taken, not reserved,
+  not an address); a name that fails is dropped and the body says `nameAccepted: false`. `GET /tickets/<email>`
+  → `{held, claimedBy?, addedAt?}`. `DELETE /tickets/<email>` → 204 — a refund: first everything the ticket
+  gave is taken back (the account's copy of the grant, the ticket's unclaimed invites, the grants of agents
+  enrolled through them — the identities all stay), then the ticket is removed; if taking back fails the
+  ticket stays and the answer is 500, to retry. A new purchase gives the grant back at the next sign-in.
+  404 if absent (a stray copy on an account is still taken back). Its own per-client-IP limit (120/min).
 - **`hn ticket add <email>`** by hand (source `admin:<who>`).
 
 What a ticket may carry is bounded by `config/ticket-defaults.json` (copy `config/ticket-defaults.example.json`;
 hot-reloaded, a typo'd file is refused and the last good one stays): `audiences` + `scopes` are what a ticket
 gets when nothing says otherwise, `allowed` the most it may ever get, whoever asks — never `console` or
-`account`, never an audience not in `audiences.json`. Without the file no ticket can be made at all. The
+`account`, never `id:*`, never an audience not in `audiences.json`; `invites` the agent-invite budget (below).
+Without the file no ticket can be made at all. The
 grant is **copied onto the account** when the ticket is taken up and counts **for the ticket's audiences
 only**, like an access code's.
 
@@ -167,18 +172,30 @@ A "you're in" page can link straight to the sign-in with the address filled in:
 
 The request for a code answers the same way whether or not the address holds a ticket — an address that
 holds nothing gets a decoy that can't match, so a wrong guess looks the same either way — and the mail goes
-out after the answer. Limits: 3 codes per address and 10 per client address in 10 minutes; while a code is
-pending, asking again re-sends the same one (same tries, same expiry); 10 wrong codes in a day lock the
-address out of email sign-in for the day.
+out after the answer. Limits on asking: 3 codes per address and 10 per client address in 10 minutes, 20 per
+address a day; while a code is pending, asking again re-sends the same one (same expiry), so nobody can knock
+out a holder's live code. Limits on guessing are charged to the **guesser**, never the address: 20 wrong
+codes an hour per client address, 10 wrong a day per (address, client address) pair — that source is locked
+for that address — and, as a backstop, once an address has drawn 30 wrong guesses in a day its codes become
+10-character ones (~50 bits) for the rest of the day; it keeps signing in. A guess at an address with no code
+pending counts only against the client address. The bound: a six-digit code sees at most 30 guesses from
+however many sources (a 3 in 100,000 chance), after which guessing is hopeless.
 
 **Agents for ticket holders.** The ticket site mints enrollment invites for the agents its holders run
 (they never need the sponsor console): `POST /tickets/invites` (same bearer) with `{email, ref, agentName?}`
-→ 201 `{code, enrolUrl, expiresAt, agentsMd}`, 404 `{error: "no_ticket"}`, 409 `{error: "budget"}` at
-three unclaimed invites. The invite is minted by the console's rules under `config/invite-policy.json`
-(the ticket's scopes ∩ `delegable`, plus `baseline`; audiences by the policy's rules), single-use, 14 days,
-`claims.tier = "sponsored"`, sponsored by the holder's account if they have signed in (sharing its console
-budget), else by a stable `ticket:<ref>` placeholder under the ticket's name. `GET /tickets/invites?email=…`
-lists them (`code` only while unclaimed, `claimedBy` once an agent enrolled).
+(`email` and `ref` must name the same ticket) → 201 `{code, enrolUrl, expiresAt, agentsMd}`, 404
+`{error: "no_ticket"}`, 409 `{error: "budget", reason: "active" | "lifetime"}`. **What such an agent can
+reach:** exactly the ticket's audiences (the policy's audience rules are intersected with them — an `always`
+rule never opens the rest of the home to a members-only ticket), with the ticket's scopes ∩ the policy's
+`delegable` plus `baseline` ∩ `allowed`; `claims.tier = "sponsored"`, single-use, 14 days. Budget per ticket:
+`invites: {"active": 3, "lifetime": 10}` in `ticket-defaults.json` — unclaimed at a time, and ever, counted
+across the ticket's placeholder sponsor and the account that took it up (and that account's console invites).
+Sponsor = the holder's account if they have signed in, else a stable `ticket:<id>` placeholder under the
+ticket's name. `GET /tickets/invites?email=…` (or `?ref=…`) lists them (`code` only while unclaimed,
+`claimedBy` once an agent enrolled; a refunded ticket still lists, with `refunded: true`);
+`DELETE /tickets/invites/<code>` revokes an unclaimed one. A refund revokes the ticket's unclaimed invites
+and strips every scope and audience from the agents enrolled through them (they keep their identity).
+`GET /enroll` is a short page pointing at `/agents.md`, so `enrolUrl` is usable in a browser.
 
 Sending mail: `EMAIL_PROVIDER=resend` with `RESEND_API_KEY` and `EMAIL_FROM` (e.g.
 `"Home <no-reply@id.example>"` — the sending domain needs the provider's DKIM and SPF DNS records, or
