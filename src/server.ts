@@ -17,8 +17,11 @@ import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './p
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import { CodeStore } from './codes.js';
+import { maskEmail, ticketDefaultsStore, TicketStore, type TicketDefaults } from './tickets.js';
+import { emailSenderFromConfig, type EmailSender } from './email.js';
+import { parseStripeEvent, ticketEmailFromEvent, verifyStripeSignature } from './stripe.js';
 import type { FetchLike } from './oauth.js';
-import { esc, html, json, page, readJson } from './http.js';
+import { esc, html, json, page, readBody, readJson } from './http.js';
 import {
   audiencesStore,
   InviteStore,
@@ -45,6 +48,12 @@ export interface ServerConfig {
   discordBotToken?: string;
   googleClientId?: string;
   googleClientSecret?: string;
+  /** `resend` | `log` (email.ts); unset = no email sign-in. */
+  emailProvider?: string;
+  resendApiKey?: string;
+  emailFrom?: string;
+  /** The Stripe endpoint's signing secret (stripe.ts); unset = no webhook (404). */
+  stripeWebhookSecret?: string;
 }
 
 export function configFromEnv(env = process.env): ServerConfig {
@@ -61,6 +70,10 @@ export function configFromEnv(env = process.env): ServerConfig {
     discordBotToken: env.HN_BOT_TOKEN,
     googleClientId: env.GOOGLE_CLIENT_ID,
     googleClientSecret: env.GOOGLE_CLIENT_SECRET,
+    emailProvider: env.EMAIL_PROVIDER,
+    resendApiKey: env.RESEND_API_KEY,
+    emailFrom: env.EMAIL_FROM,
+    stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
   };
 }
 
@@ -105,11 +118,16 @@ export class HomeNode {
   readonly mintLog: MintLog;
   readonly accounts: AccountStore;
   readonly codes: CodeStore;
+  /** Ticket holders (tickets.ts) and what a ticket grants by default. */
+  readonly tickets: TicketStore;
+  readonly ticketDefaults: JsonStore<TicketDefaults>;
+  /** Null = email sign-in off. */
+  readonly email: EmailSender | null;
   readonly human: HumanAuth;
   private limiter = new RateLimit();
   private server = createServer((req, res) => void this.route(req, res));
 
-  constructor(readonly cfg: ServerConfig, opts: { fetchImpl?: FetchLike } = {}) {
+  constructor(readonly cfg: ServerConfig, opts: { fetchImpl?: FetchLike; email?: EmailSender } = {}) {
     this.issuer = loadOrCreateIssuerKey(join(cfg.dataDir, 'issuer-key.pem'));
     this.principals = new PrincipalStore(join(cfg.dataDir, 'principals.json'));
     this.invites = new InviteStore(join(cfg.dataDir, 'invites.json'));
@@ -119,8 +137,13 @@ export class HomeNode {
     this.mintLog = new MintLog(join(cfg.dataDir, 'minted.jsonl'));
     this.accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
     this.codes = new CodeStore(join(cfg.dataDir, 'codes.json'));
+    this.tickets = new TicketStore(join(cfg.dataDir, 'tickets.json'));
+    this.ticketDefaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json'));
+    this.email = opts.email ?? emailSenderFromConfig(cfg, opts.fetchImpl);
     this.human = new HumanAuth({
       codes: this.codes,
+      tickets: this.tickets,
+      email: this.email,
       cfg,
       issuer: this.issuer,
       accounts: this.accounts,
@@ -148,7 +171,7 @@ export class HomeNode {
 
   /** Resolves with the bound port (useful with port 0 in tests). */
   start(): Promise<number> {
-    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts, this.codes]) s.startWatching();
+    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts, this.codes, this.tickets, this.ticketDefaults]) s.startWatching();
     return new Promise((resolve) =>
       this.server.listen(this.cfg.port, this.cfg.bind, () => {
         const addr = this.server.address();
@@ -156,6 +179,12 @@ export class HomeNode {
         console.error(`[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${port} — issuer ${this.issuer.id}`);
         if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
         if (!this.cfg.googleClientId) console.error('[hn] GOOGLE_CLIENT_ID unset — Google login off');
+        if (!this.email) console.error('[hn] EMAIL_PROVIDER unset — email sign-in off');
+        if (!this.cfg.stripeWebhookSecret) console.error('[hn] STRIPE_WEBHOOK_SECRET unset — /stripe/webhook off');
+        else if (!this.email) console.error('[hn] note: tickets arrive from Stripe, but with no email sign-in nobody can use one');
+        if ((this.email || this.cfg.stripeWebhookSecret) && !this.ticketDefaults.get().configured) {
+          console.error('[hn] no config/ticket-defaults.json — a ticket grants nothing unless `hn ticket add` says what');
+        }
         if (!this.invitePolicy.get().configured) console.error('[hn] no config/invite-policy.json — the sponsor console is off');
         resolve(port);
       }),
@@ -171,6 +200,8 @@ export class HomeNode {
     this.invitePolicy.stopWatching();
     this.accounts.stopWatching();
     this.codes.stopWatching();
+    this.tickets.stopWatching();
+    this.ticketDefaults.stopWatching();
   }
 
   // ── routing ──
@@ -207,6 +238,7 @@ export class HomeNode {
         return markdown(res, agentsGuide());
       }
       if (await this.human.route(req, url, res, ip)) return;
+      if (req.method === 'POST' && url.pathname === '/stripe/webhook') return this.stripeWebhook(req, res);
       if (url.pathname.startsWith('/console')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
         if (await this.consoleRoute(req, url, res)) return;
@@ -232,6 +264,39 @@ export class HomeNode {
       console.error(`[hn] ${req.method} ${url.pathname} error: ${(err as Error).message}`);
       json(res, 500, { error: 'internal error' });
     }
+  }
+
+  // ── Stripe → tickets (stripe.ts, tickets.ts) ──
+
+  /** A paid checkout gives its address a ticket. Signature-gated rather
+   *  than rate-limited: Stripe retries in bursts, and the check is one HMAC.
+   *  Always 200 once the signature holds, so Stripe stops redelivering;
+   *  ignored event types say so in the body. */
+  private async stripeWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const secret = this.cfg.stripeWebhookSecret;
+    if (!secret) return json(res, 404, { error: 'not found' });
+    const raw = await readBody(req);
+    const sig = req.headers['stripe-signature'];
+    const v = verifyStripeSignature(raw, typeof sig === 'string' ? sig : undefined, secret);
+    if (!v.ok) {
+      console.error(`[hn] stripe webhook refused: ${v.reason}`);
+      return json(res, 400, { error: `bad signature: ${v.reason}` });
+    }
+    const ev = parseStripeEvent(raw);
+    if (!ev) return json(res, 400, { error: 'not a Stripe event' });
+    const email = ticketEmailFromEvent(ev);
+    if (!email) return json(res, 200, { received: true, ignored: ev.type });
+    if (!this.tickets.stripeEventOnce(ev.id)) return json(res, 200, { received: true, duplicate: ev.id });
+    const d = this.ticketDefaults.get();
+    let r: ReturnType<TicketStore['add']>;
+    try {
+      r = this.tickets.add({ email, source: `stripe:${ev.id}`, audiences: d.audiences, scopes: d.scopes });
+    } catch (err) {
+      console.error(`[hn] stripe ${ev.id}: ${(err as Error).message}`);
+      return json(res, 200, { received: true, ignored: 'no usable email' });
+    }
+    console.error(`[hn] ticket ${r.created ? 'added' : 'already held'} for ${maskEmail(email)} (${ev.type} ${ev.id})`);
+    json(res, 200, { received: true, ticket: r.created ? 'added' : 'existing' });
   }
 
   // ── sponsor console (see console.ts header for the design) ──

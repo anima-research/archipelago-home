@@ -51,7 +51,8 @@ export function esc(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 }
 
-export function readJson(req: IncomingMessage): Promise<unknown> {
+/** The raw body as text (for a signature check over the exact bytes). */
+export function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -64,13 +65,16 @@ export function readJson(req: IncomingMessage): Promise<unknown> {
       }
       chunks.push(c);
     });
-    req.on('end', () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch {
-        resolve(null); // handlers reject malformed bodies with a reason
-      }
-    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
+}
+
+export async function readJson(req: IncomingMessage): Promise<unknown> {
+  try {
+    return JSON.parse(await readBody(req));
+  } catch (err) {
+    if ((err as Error).message === 'body too large') throw err;
+    return null; // handlers reject malformed bodies with a reason
+  }
 }

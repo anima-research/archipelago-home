@@ -91,7 +91,9 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings
 
 // ── /login ──
 
-export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; open?: boolean; nonce: string }): string {
+export function loginPage(o: {
+  iss: string; audience: string; state: string; discord: boolean; google: boolean; email?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
+}): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
   const body = `
 <h1>Sign in</h1>
@@ -109,6 +111,13 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
     <button class="btn primary block" type="submit">Sign in</button>
   </form>
   <button id="pk" class="btn block" type="button" hidden>Sign in with a passkey</button>
+  ${o.email ? `<div class="or">or</div>
+  <form id="em" novalidate>
+    <label for="e">Email</label>
+    <input id="e" name="email" type="email" autocomplete="email" autocapitalize="none" autocorrect="off" spellcheck="false" required>
+    <button class="btn block" type="submit">Email me a sign-in code</button>
+    <p class="dim small">For ticket holders: the address the ticket was bought with, no password needed.</p>
+  </form>` : ''}
   <p id="code-ok" class="ok" role="status" hidden></p>
   <details id="code-box" style="margin-top:1rem">
     <summary class="dim small" style="cursor:pointer">Have an access code?</summary>
@@ -127,9 +136,21 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
   </form>
   <button id="back" class="btn block" type="button">Start over</button>
 </section>
+<section id="step3" hidden>
+  <p id="em-sent" role="status"></p>
+  <form id="emc" novalidate>
+    <label for="ec">Code from the email</label>
+    <input id="ec" name="code" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required>
+    <p class="dim small">Six digits, good for 10 minutes. Nothing arrived? Check spam, or start over and try again.</p>
+    <button class="btn primary block" type="submit">Sign in</button>
+  </form>
+  <button id="em-back" class="btn block" type="button">Start over</button>
+</section>
 <p class="dim small" style="margin-top:2rem">${
     o.open && (o.google || o.discord)
       ? `New here? ${o.google ? 'Continue with Google' : 'Continue with Discord'} — this one is open to everyone, and your account is made as you sign in.`
+      : o.email
+      ? 'Hold a ticket? Enter the email address it was bought with and a sign-in code is sent there — no password needed. You can add a passkey or password afterwards under <a href="/login?audience=account">sign-in settings</a>.'
       : o.discord
       ? 'No username yet? Continue with Discord, then add a password or passkey under <a href="/login?audience=account">sign-in settings</a>.'
       : 'Accounts are created by this home’s operator.'
@@ -216,6 +237,36 @@ if (passkeysSupported()) {
     PublicKeyCredential.isConditionalMediationAvailable().then((ok) => ok && passkey('conditional')).catch(() => {});
 }
 $('u').focus();
+
+// Email: a one-time code to the address (ticket holders, or an address linked under sign-in settings).
+if ($('em')) {
+  const emailRestart = () => { $('step3').hidden = true; $('step1').hidden = false; $('ec').value = ''; };
+  $('em').onsubmit = async (e) => {
+    e.preventDefault(); err('');
+    const email = $('e').value.trim(); if (!email) return err('Enter your email address.');
+    busy($('em'), true);
+    const r = await post('/login/email/begin', { state: S.state, email }).catch(() => ({ status: 0, body: { error: 'Network error.' } }));
+    busy($('em'), false);
+    if (r.status !== 200) return err(r.body.error || 'Could not send a code.');
+    if (conditional) conditional.abort();
+    $('em-sent').textContent = r.body.message + ' Enter it here:';
+    $('step1').hidden = true; $('step3').hidden = false; $('ec').focus();
+  };
+  $('emc').onsubmit = async (e) => {
+    e.preventDefault(); err('');
+    const code = $('ec').value.trim(); if (!code) return err('Enter the code.');
+    busy($('emc'), true);
+    await codePending;
+    const r = await post('/login/email/finish', { state: S.state, email: $('e').value.trim(), code }).catch(() => ({ body: { error: 'Network error.' } }));
+    busy($('emc'), false);
+    if (go(r)) return;
+    err(r.body.error || 'Wrong code.'); $('ec').select();
+    if (r.body.restart) emailRestart();
+  };
+  $('em-back').onclick = () => { err(''); emailRestart(); };
+  const prefill = ${scriptJson(o.prefillEmail ?? '')};
+  if (prefill) { $('e').value = prefill; $('e').focus(); }
+}
 `;
   return shell(`sign in — ${o.iss}`, o.nonce, body, script);
 }
@@ -233,6 +284,7 @@ const app = $('app');
 let token = new URLSearchParams(location.hash.slice(1)).get('token');
 if (token) history.replaceState(null, '', '/account');
 let me = null;
+let emailPending = null; // the address a link code went to
 const msg = (m, cls) => { $('msg').className = cls || 'ok'; $('msg').textContent = m || ''; };
 
 async function api(path, body) {
@@ -331,6 +383,22 @@ function render(extra) {
   s += '<form id="f-code" class="row"><input id="code-in" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="xxxx-xxxx-xxxx" aria-label="Access code">' +
     '<button class="btn primary" type="submit">Redeem</button></form></div>';
 
+  // email (and the ticket it took up)
+  if (me.email || me.canLinkEmail || me.ticket) {
+    s += '<div class="card"><h2>Email</h2>';
+    if (me.email && !me.email.canUnlink) s += '<p>This account is your email identity (<b>' + h(me.email.address) + '</b>) — a code sent there always signs you in.</p>';
+    else if (me.email) s += '<p>Linked to <b>' + h(me.email.address) + '</b>. A code sent there signs in here.</p><button id="e-off" class="btn sm danger" type="button">Remove</button>';
+    else if (extra && extra.emailPending) s += '<p>' + h(extra.emailMessage || 'Code sent') + ' Enter it here to link <b>' + h(extra.emailPending) + '</b>:</p>' +
+      '<form id="f-ec" class="row"><input id="ec-in" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" aria-label="Code from the email" required>' +
+      '<button class="btn primary" type="submit">Link</button></form>';
+    else if (me.canLinkEmail) s += '<p class="dim">Link an email address so a code sent there signs in here. If a ticket was bought with that address, this account takes it up.</p>' +
+      '<form id="f-em" class="row"><input id="em-in" type="email" autocomplete="email" placeholder="you@example.com" aria-label="Email address" required>' +
+      '<button class="btn primary" type="submit">Send a code</button></form>';
+    if (me.ticket) s += '<p><b>Ticket:</b> held since ' + fmt(me.ticket.since) + ' · access to ' + h(me.ticket.audiences.join(', ') || 'nothing yet') +
+      (me.ticket.scopes.length ? ' <span class="dim small mono">[' + h(me.ticket.scopes.join(' ')) + ']</span>' : '') + '</p>';
+    s += '</div>';
+  }
+
   // google
   if (me.google || me.canLinkGoogle) {
     s += '<div class="card"><h2>Google</h2>';
@@ -401,6 +469,21 @@ function wire() {
     const r = await act('/account/code', { code: $('code-in').value.trim() });
     if (r) { render(); msg('Code redeemed — ' + r.redeemed.label + ': access to ' + r.redeemed.audiences.join(', ') + '.'); }
   });
+  on('f-em', 'submit', async (e) => {
+    e.preventDefault();
+    const email = $('em-in').value.trim();
+    const r = await act('/account/email/begin', { email });
+    if (r) { emailPending = email; render({ emailPending: email, emailMessage: r.message }); $('ec-in').focus(); }
+  });
+  on('f-ec', 'submit', async (e) => {
+    e.preventDefault();
+    const r = await act('/account/email/finish', { email: emailPending, code: $('ec-in').value.trim() }, 'Email linked.');
+    if (r) { emailPending = null; render(); if (r.note) msg(r.note); }
+  });
+  on('e-off', 'click', async () => {
+    if (!confirm('Remove this email address? A code sent there will stop signing in here.')) return;
+    if (await act('/account/email/unlink', {}, 'Email removed.')) render();
+  });
   on('g-link', 'click', async () => { const r = await act('/account/google/link', {}); if (r && r.url) location.assign(r.url); });
   on('g-off', 'click', async () => {
     if (!confirm('Unlink Google? Continue with Google will stop signing in here.')) return;
@@ -414,7 +497,7 @@ function wire() {
 }
 
 (async () => {
-  if (!token) return signIn('Sign in to manage how you sign in: username & password, a two-factor code, passkeys.');
+  if (!token) return signIn('Sign in to manage how you sign in: username & password, a two-factor code, passkeys, email.');
   try { const r = await api('/account/me'); me = r.body; render(); } catch {}
 })();
 `;

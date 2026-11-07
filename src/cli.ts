@@ -22,6 +22,10 @@
  *   hn code ls                      who redeemed what
  *   hn code close <id>              no new redemptions (what it gave stays)
  *   hn code revoke <id>             and take back what it gave, from everyone
+ *
+ *   hn ticket add <email> [--note "…"] [--scopes x,y] [--audiences a,b]   → may sign up by email (tickets.ts)
+ *   hn ticket ls                    who holds one, and which account took it up
+ *   hn ticket rm <email>            no more sign-ups with it; an account it made keeps what it was given
  */
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
@@ -30,6 +34,7 @@ import { loadOrCreateIssuerKey } from './keys.js';
 import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './token.js';
 import { audiencesStore, InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
 import { CodeStore } from './codes.js';
+import { ticketDefaultsStore, TicketStore } from './tickets.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
 import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
@@ -81,6 +86,8 @@ function main(): void {
       return userCmd(cfg, principals, pos, flag);
     case 'code':
       return codeCmd(cfg, pos, flag);
+    case 'ticket':
+      return ticketCmd(cfg, pos, flag);
 
     case 'mint': {
       const name = flag.get('name') ?? die('--name required');
@@ -182,7 +189,7 @@ function main(): void {
     }
 
     default:
-      die(`unknown command "${cmd}" — serve | fingerprint | mint | invite | ls | revoke | revoke-invite | user`);
+      die(`unknown command "${cmd}" — serve | fingerprint | mint | invite | ls | revoke | revoke-invite | user | code | ticket`);
   }
 }
 
@@ -217,6 +224,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `  ${a.username ?? '—'}  ${a.sub}  "${displayName(a)}"` +
     `  pw:${a.password ? 'y' : 'n'} 2fa:${a.totp ? 'y' : 'n'} passkeys:${a.passkeys?.length ?? 0}` +
     `${a.discord ? `  discord:${a.discord.id}` : ''}${a.google ? `  google:${a.google.email}${a.google.sub ? '' : '(invited)'}` : ''}` +
+    `${a.email ? `  email:${a.email.address}` : ''}${a.ticket ? `  ticket:${a.ticket.audiences.join(',') || '-'}[${a.ticket.scopes.join(' ')}]` : ''}` +
     `${a.scopes?.length ? `  [${a.scopes.join(' ')}]` : ''}` +
     `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
@@ -456,6 +464,63 @@ function codeCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): v
     }
     default:
       die('usage: hn code add | ls | close | revoke');
+  }
+}
+
+/** `hn ticket …` — addresses that may sign up by email (tickets.ts). */
+function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): void {
+  try {
+    if (process.getuid?.() === 0 && statSync(cfg.dataDir).uid !== 0) {
+      die(`run as the service user, not root (e.g. sudo -u ${userInfoName(statSync(cfg.dataDir).uid)} …) — tickets.json is 0600`);
+    }
+  } catch {
+    /* data dir missing: first run */
+  }
+  const tickets = new TicketStore(join(cfg.dataDir, 'tickets.json'));
+  const [sub, email] = pos;
+  const list = (v?: string) => v?.split(',').map((x) => x.trim()).filter(Boolean);
+  switch (sub) {
+    case 'add': {
+      if (!email || !looksLikeEmail(email)) die('usage: hn ticket add <email> [--note "…"] [--scopes x,y] [--audiences a,b]');
+      const defaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json')).get();
+      const audiences = list(flag.get('audiences')) ?? defaults.audiences;
+      const scopes = list(flag.get('scopes')) ?? defaults.scopes;
+      if (!audiences.length) {
+        die(`a ticket needs audiences to count for — --audiences a,b, or defaults in ${join(cfg.configDir, 'ticket-defaults.json')} (see config/ticket-defaults.example.json)`);
+      }
+      const known = audiencesStore(join(cfg.configDir, 'audiences.json')).get();
+      for (const a of audiences) if (!known[a]) die(`no audience "${a}" in ${join(cfg.configDir, 'audiences.json')}`);
+      const who = process.env.SUDO_USER || process.env.USER || userInfoName(process.getuid?.() ?? -1);
+      const r = tickets.add({ email, source: `admin:${who}`, audiences, scopes, ...(flag.get('note') ? { note: flag.get('note')!.slice(0, 120) } : {}) });
+      if (!r.created) die(`${email} already holds a ticket (${r.ticket.source}, ${r.ticket.addedAt.slice(0, 10)})${r.ticket.claimedBy ? `, taken up by ${r.ticket.claimedBy}` : ''}`);
+      console.error(`[hn] ticket for ${email} → ${audiences.join(', ')} [${scopes.join(' ') || 'no scopes'}]`);
+      console.error(`[hn] they sign in at ${cfg.publicUrl}/login?audience=${audiences[0]}&email=${encodeURIComponent(email)} — a code goes to that address, no password needed`);
+      return;
+    }
+    case 'ls': {
+      const all = tickets.all();
+      if (flag.has('json')) {
+        console.log(JSON.stringify(all, null, 2));
+        return;
+      }
+      console.log(`tickets (${all.length}):`);
+      for (const t of all) {
+        console.log(`  ${t.email}  ${t.source}  ${t.addedAt.slice(0, 10)}  → ${t.audiences.join(', ') || '-'} [${t.scopes.join(' ')}]` +
+          `${t.claimedBy ? `  taken up by ${t.claimedBy} ${t.claimedAt?.slice(0, 10) ?? ''}` : '  unused'}${t.note ? `  "${t.note}"` : ''}`);
+      }
+      return;
+    }
+    case 'rm': {
+      if (!email) die('usage: hn ticket rm <email>');
+      const t = tickets.remove(email) ?? die(`no ticket for ${email}`);
+      console.error(`[hn] ticket for ${t.email} removed — no more sign-ups with it.` +
+        (t.claimedBy
+          ? ` The account it made (${t.claimedBy}) keeps what the ticket gave: hn user disable ${t.claimedBy} to shut it.`
+          : ' It had not been taken up.'));
+      return;
+    }
+    default:
+      die('usage: hn ticket add | ls | rm');
   }
 }
 

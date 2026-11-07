@@ -23,7 +23,8 @@ DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… npm start   # binds 127.0.0.1:73
 Env: `HN_DOMAIN` (default `id.animalabs.ai`), `HN_PUBLIC_URL`, `HN_BIND`, `HN_PORT`,
 `HN_DATA_DIR`, `HN_CONFIG_DIR`, `HN_BOT_TOKEN` (optional; also re-checks Discord roles live
 when a Discord-linked person signs in another way), `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`
-(optional; Google login). First run generates `data/issuer-key.pem`
+(optional; Google login), `EMAIL_PROVIDER` + `RESEND_API_KEY` + `EMAIL_FROM` and
+`STRIPE_WEBHOOK_SECRET` (optional; ticket holders' email sign-in, below). First run generates `data/issuer-key.pem`
 (0600) — **the** issuer key; guard it, never commit it. `data/accounts.json` (0600) holds
 password hashes, TOTP secrets and passkey keys — back it up with the issuer key, and guard it
 the same way.
@@ -52,8 +53,9 @@ identity, as `human:discord:` rows are for Discord. Nor can an account the opera
 ## Human sign-in
 
 `/login?audience=…` is a chooser: **Continue with Discord**, **Continue with Google**,
-**username + password** (then a TOTP code if they turned one on), or **passkey** (also offered
-as autofill in the username field). Every path ends the same way — a 10-minute aid1 token in the audience's URL fragment —
+**username + password** (then a TOTP code if they turned one on), **passkey** (also offered
+as autofill in the username field), or **Email** (a one-time code, for ticket holders — below).
+Every path ends the same way — a 10-minute aid1 token in the audience's URL fragment —
 so audiences change nothing. `?via=discord` / `?via=google` skips the chooser.
 
 People manage their own sign-in at **`/account`**: set a username + password (a Discord person
@@ -116,6 +118,50 @@ hn code revoke <id>                    # and take back what it gave, at each hol
 A code can ride a link: `https://<HN_DOMAIN>/login?audience=<aud>#code=<code>` (fragment, so it
 stays out of logs). `--expires` and `--max-uses` limit redeeming, not access once redeemed.
 
+## Ticket holders: email sign-in
+
+Someone who holds a **ticket** — an email address on the ticket list — makes an account and signs
+in with just that address: the sign-in page's **Email** method sends a 6-digit code (good for 10
+minutes, 5 tries), and the first code that comes back makes their row (`human:email:<random id>`,
+never the address) with the address as a verified sign-in method and the ticket's grant on it.
+No password; they can add a passkey, password or two-factor code afterwards under sign-in settings.
+Later sign-ins with the same mailbox (case, and for Gmail dots and `+tags`, don't matter) open the
+same account; one ticket is one account. Someone who already has an account links the address there
+instead (**Email → Send a code** on `/account`) and the ticket is taken up by that account.
+
+Tickets arrive two ways:
+
+- **Stripe**: register `https://<HN_DOMAIN>/stripe/webhook` in the Stripe dashboard for the
+  `checkout.session.completed` event (also honoured: `payment_intent.succeeded` when it carries a
+  `receipt_email`), and set its signing secret as `STRIPE_WEBHOOK_SECRET`. A paid checkout's address
+  gets a ticket (source `stripe:<event id>`; redeliveries are recognised by event id). Nothing else
+  about the payment is kept. Unset = the route is 404.
+- **`hn ticket add <email>`** by hand.
+
+What a ticket grants comes from `config/ticket-defaults.json` (copy `config/ticket-defaults.example.json`; hot-reloaded,
+a typo'd file is refused and the last good one stays) unless `hn ticket add` says otherwise. The grant
+is **copied onto the account** when the ticket is taken up and counts **for the ticket's audiences only**,
+like an access code's — so `hn ticket rm` only stops future sign-ups with that address; an account
+already made keeps what it was given (`hn user disable <sub>` shuts it).
+
+```sh
+hn ticket add pat@example.org [--note "…"] [--scopes a,b] [--audiences x,y]   # defaults: config/ticket-defaults.json
+hn ticket ls                                                                   # holders, and which account took each up
+hn ticket rm pat@example.org
+```
+
+A "you're in" page can link straight to the sign-in with the address filled in:
+`https://<HN_DOMAIN>/login?audience=<aud>&email=<address>` (nothing is sent until they ask).
+
+The request for a code answers the same way whether or not the address holds a ticket, and is limited to
+3 codes per address and 10 per client address in 10 minutes. The answer never says who holds one.
+
+Sending mail: `EMAIL_PROVIDER=resend` with `RESEND_API_KEY` and `EMAIL_FROM` (e.g.
+`"Home <no-reply@id.example>"` — the sending domain needs the provider's DKIM and SPF DNS records, or
+nothing is delivered), or `EMAIL_PROVIDER=log`, which prints the code to the server log (development
+only; refused on an `https://` public URL). Unset = the Email method isn't offered and its routes are
+404. `data/tickets.json` (0600) is the ticket list — back it up with the rest of `data/`.
+
 ## The deployment's policy (config/)
 
 What the node knows about *your* services is configuration, hot-reloaded (edit, save, no
@@ -126,6 +172,7 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 | `audiences.json` | the services: login redirect, scopes a login must hold, API and MCPL endpoints (`/services`) |
 | `roles.json` | Discord guild roles → scopes (only with Discord on) |
 | `invite-policy.json` | the sponsor console: who may open it, which scopes a sponsor may pass to their agent, what every invite and every anchored invite carries, which audiences follow from which scopes |
+| `ticket-defaults.json` | what a ticket grants by default (audiences + scopes), for the Stripe webhook and `hn ticket add` without flags |
 
 `invite-policy.json` is optional — without it the console is off and says so. Anima's is
 `config/invite-policy.example.json`; the format, in full, is at the top of `src/policy.ts`. In short:
