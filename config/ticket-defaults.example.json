@@ -1,0 +1,7 @@
+{
+  "_": "What a ticket grants unless `hn ticket add` or the ticket site's POST /tickets says otherwise; (allowed) the most a ticket may ever carry — never console or account, never id:*, only audiences in audiences.json; (invites) agent invites per ticket, unclaimed at a time and ever. Copy to config/ticket-defaults.json. Without this file no ticket can be made.",
+  "audiences": ["members"],
+  "scopes": ["members:member"],
+  "allowed": { "audiences": ["members"], "scopes": ["members:member"] },
+  "invites": { "active": 3, "lifetime": 10 }
+}

@@ -12,11 +12,17 @@
  *   human:local:<username>      row made by the operator (`hn user add`)
  *   human:google:<google sub>   row made by signing up with Google and an
  *                               access code (codes.ts)
+ *   human:email:<random id>     row made by signing up with an email address
+ *                               that holds a ticket (tickets.ts) — the id is
+ *                               opaque, never the address, so the address
+ *                               can change and the sub can't be guessed
  *
  * The sub is fixed at creation. Login methods attach to it and come and go;
- * a Discord-anchored row can't drop its Discord link (that link IS its sub).
- * Google grants nothing by itself (google.ts); a Google login makes a row
- * only when it comes with an access code.
+ * a Discord-anchored row can't drop its Discord link (that link IS its sub),
+ * and an email-anchored row can't drop its email. Google grants nothing by
+ * itself (google.ts); a Google login makes a row only when it comes with an
+ * access code. Email makes a row only for a ticket holder, and the ticket's
+ * grant is copied onto the row (`ticket`), counting for its audiences only.
  *
  * Scopes: the Discord leg still decides what a Discord-linked person holds
  * (roles → scopes, read live at Discord login, or by bot lookup / a recent
@@ -70,6 +76,14 @@ export interface HumanAccount {
     name?: string;
     linkedAt?: string;
   };
+  /** Email login (a one-time code to this address, human.ts). Only ever a
+   *  verified address: it is written when the code comes back. */
+  email?: { address: string; verifiedAt: string };
+  /** The ticket this account took up (tickets.ts) — a copy of its grant,
+   *  kept in step by the ticket site's API: widened by a further purchase,
+   *  taken away by a refund (the account stays). Its scopes count for its
+   *  audiences only, like a code's. */
+  ticket?: { email: string; source: string; claimedAt: string; audiences: string[]; scopes: string[] };
   /** `scrypt$<logN>$<r>$<p>$<salt>$<hash>` */
   password?: string;
   totp?: { secret: string; lastStep?: number; enabledAt: string };
@@ -115,7 +129,9 @@ function accountsProblem(raw: unknown): string | null {
   const discords = new Set<string>();
   const googles = new Set<string>();
   const invited = new Set<string>();
+  const emails = new Set<string>();
   const passkeys = new Set<string>();
+  const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
   for (const a of f.accounts) {
     if (typeof a.sub !== 'string' || !a.sub.startsWith('human:')) return 'bad sub';
     if (subs.has(a.sub)) return `duplicate sub ${a.sub}`;
@@ -142,11 +158,20 @@ function accountsProblem(raw: unknown): string | null {
         invited.add(k);
       }
     }
+    if (a.email) {
+      if (typeof a.email.address !== 'string' || !a.email.address.includes('@') || typeof a.email.verifiedAt !== 'string') return 'bad email';
+      const k = emailKey(a.email.address);
+      if (emails.has(k)) return 'that email address signs in to another account';
+      emails.add(k);
+    }
+    if (a.ticket) {
+      if (typeof a.ticket.email !== 'string' || typeof a.ticket.source !== 'string' || typeof a.ticket.claimedAt !== 'string') return 'bad ticket';
+      if (!strings(a.ticket.audiences) || !strings(a.ticket.scopes)) return 'bad ticket';
+    }
     for (const p of a.passkeys ?? []) {
       if (passkeys.has(p.id)) return 'that passkey is already registered';
       passkeys.add(p.id);
     }
-    const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
     if (a.scopes !== undefined && !strings(a.scopes)) return 'bad scopes';
     if (a.ignoreRoles !== undefined && !strings(a.ignoreRoles)) return 'bad ignoreRoles';
     if (a.withhold !== undefined && !strings(a.withhold)) return 'bad withhold';
@@ -194,6 +219,11 @@ export class AccountStore {
   byGoogleInvite(email: string): HumanAccount | undefined {
     const k = emailKey(email);
     return this.all().find((a) => a.google && !a.google.sub && emailKey(a.google.email) === k);
+  }
+  /** The row this address signs in to (matched as mail is delivered: emailKey). */
+  byEmail(address: string): HumanAccount | undefined {
+    const k = emailKey(address);
+    return this.all().find((a) => a.email && emailKey(a.email.address) === k);
   }
   byPasskey(credentialId: string): { account: HumanAccount; passkey: Passkey } | undefined {
     for (const account of this.all()) {
@@ -395,20 +425,54 @@ export function operatorGrant(a: HumanAccount | undefined): RoleGrant | null {
   return { scopes: a.scopes ?? [], ...(a.claims ? { claims: a.claims } : {}) };
 }
 
+/** What the ticket this account took up grants for this one audience
+ *  (null = nothing): its scopes, for its own audiences only. */
+export function ticketGrant(a: HumanAccount | undefined, audience: string): RoleGrant | null {
+  if (!a?.ticket || !a.ticket.audiences.includes(audience)) return null;
+  return { scopes: [...a.ticket.scopes] };
+}
+
+/** `human:email:<random id>` for a row made by an email sign-up. */
+export function newEmailSub(): string {
+  return `human:email:${randomBytes(9).toString('base64url')}`;
+}
+
+/** A row made by email with no name yet: the address is never used as one
+ *  (a name rides into every token, to every audience). */
+export const TICKET_HOLDER_NAME = 'Ticket holder';
+
+/** C0/C1 controls, bidi overrides and isolates, line/paragraph separators:
+ *  what must never ride in a name, a note or a reference. */
+export const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/g;
+
 /** Override → the anchor's own name (Discord name for a Discord-anchored
  *  row, Google name for a Google one, username for a local one) → whatever
- *  else there is. */
+ *  else there is. An email-anchored row has only its override, else a
+ *  neutral default. */
 export function displayName(a: HumanAccount): string {
   const anchored = a.sub.startsWith('human:discord:')
     ? a.discord?.name
     : a.sub.startsWith('human:google:')
       ? a.google?.name || a.google?.email?.split('@')[0]
       : a.username;
-  return (a.name || anchored || a.username || a.discord?.name || a.google?.name || a.sub).slice(0, 32);
+  const fallback = a.sub.startsWith('human:email:') ? TICKET_HOLDER_NAME : a.sub;
+  return (a.name || anchored || a.username || a.discord?.name || a.google?.name || fallback).slice(0, 32);
+}
+
+/** A display name a person may pick for themselves. */
+export function nameProblem(raw: unknown, accounts: AccountStore, takenElsewhere: (n: string) => boolean, forSub: string): string | null {
+  if (typeof raw !== 'string') return 'name required';
+  const n = raw.replace(INVISIBLE, '').trim();
+  if (n !== raw.trim()) return 'a name can’t carry control or direction characters';
+  if (n.length < 2 || n.length > 32) return 'names are 2–32 characters';
+  if (n.includes('@')) return 'a name can’t be an email address';
+  if (RESERVED.has(n.toLowerCase()) || n.toLowerCase() === TICKET_HOLDER_NAME.toLowerCase()) return 'that name is reserved';
+  if (accounts.nameTaken(n, forSub) || takenElsewhere(n)) return 'that name is taken';
+  return null;
 }
 
 /** Login methods still standing — an account must always keep one. (An
  *  unclaimed Google invite counts: it is how that person gets in.) */
 export function loginMethods(a: HumanAccount): number {
-  return (a.password ? 1 : 0) + (a.passkeys?.length ?? 0) + (a.discord ? 1 : 0) + (a.google ? 1 : 0);
+  return (a.password ? 1 : 0) + (a.passkeys?.length ?? 0) + (a.discord ? 1 : 0) + (a.google ? 1 : 0) + (a.email ? 1 : 0);
 }
