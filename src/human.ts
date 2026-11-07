@@ -14,8 +14,16 @@
  *   POST /login/totp              {ticket, code}  (6-digit code or a recovery code)
  *   POST /login/passkey/begin     {state} → WebAuthn request options (discoverable, UV required)
  *   POST /login/passkey/finish    {state, credential}
+ *   POST /login/email/begin       {state, email} → a 6-digit code by mail — to a ticket holder
+ *                                 (tickets.ts) or an address that already signs in; the answer
+ *                                 is the same 200 either way (`?email=` on /login prefills it)
+ *   POST /login/email/finish      {state, email, code} → redirect; a ticket holder's first
+ *                                 time makes their row (human:email:<id>) and claims the ticket
  *   GET  /account (+ /account/…)  self-service, a built-in audience like the console
- *                                 (POST /account/code redeems an access code there)
+ *                                 (POST /account/code redeems an access code there;
+ *                                 /account/email/begin + finish link an address the same way,
+ *                                 taking up a ticket held for it; /account/email/unlink;
+ *                                 /account/name for an email-made row's display name)
  *   GET  /account/setup#code=…    one-time setup link from `hn user add` / `hn user reset`
  *
  * Whatever the method, the result is the same as it always was: a 10-minute,
@@ -28,12 +36,14 @@
  * starting the sign-in again.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
 import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
 import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
+import { maskEmail, usableEmail, type Ticket, type TicketDefaults, type TicketStore } from './tickets.js';
+import { CODE_TTL_MIN, signInCodeMessage, type EmailSender } from './email.js';
 import {
   anyOpen,
   grantForRoles,
@@ -56,12 +66,15 @@ import {
   loginMethods,
   looksLikeRecoveryCode,
   mergeGrants,
+  nameProblem,
+  newEmailSub,
   newRecoveryCodes,
   normalizeRecovery,
   normalizeUsername,
   operatorGrant,
   passwordProblem,
   sha256hex,
+  ticketGrant,
   usernameProblem,
   verifyPassword,
   type AccountStore,
@@ -79,6 +92,14 @@ const STATE_TTL_MS = 10 * 60_000;
 const TICKET_TTL_MS = 5 * 60_000;
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const TOTP_SETUP_TTL_MS = 15 * 60_000;
+const EMAIL_CODE_TTL_MS = CODE_TTL_MIN * 60_000;
+const EMAIL_CODE_TRIES = 5;
+const EMAIL_WINDOW_MS = 10 * 60_000;
+const DAY_MS = 24 * 3_600_000;
+/** The one answer a wrong, spent, expired or never-sent code gets. */
+const EMAIL_CODE_WRONG = 'wrong or expired code';
+/** The one answer /login/email/begin gives: it must not say whether the address holds anything. */
+export const EMAIL_SENT_MESSAGE = 'If this address holds a ticket, a code is on its way.';
 const MAX_PENDING = 10_000;
 
 export interface HumanConfig {
@@ -96,6 +117,11 @@ export interface HumanDeps {
   issuer: IssuerKey;
   accounts: AccountStore;
   codes: CodeStore;
+  tickets: TicketStore;
+  /** Which audiences a ticket is for (the sign-in page's hint). */
+  ticketDefaults: JsonStore<TicketDefaults>;
+  /** Null = no email sign-in: the method isn't offered and its routes 404. */
+  email: EmailSender | null;
   principals: PrincipalStore;
   roles: JsonStore<RolesConfig>;
   audiences: JsonStore<AudiencesConfig>;
@@ -156,7 +182,10 @@ class Throttle {
   fail(k: string, now = Date.now()): void {
     const e = this.m.get(k);
     if (!e || e.until <= now) {
-      if (this.m.size > MAX_PENDING) this.m.clear();
+      if (this.m.size >= MAX_PENDING) {
+        for (const [key, val] of this.m) if (val.until <= now) this.m.delete(key); // the expired first
+        if (this.m.size >= MAX_PENDING) this.m.delete(this.m.keys().next().value!); // then the oldest
+      }
       this.m.set(k, { n: 1, until: now + this.windowMs });
     } else e.n += 1;
   }
@@ -192,8 +221,23 @@ export class HumanAuth {
     | { kind: 'register'; sub: string; userId: string; exp: number }
   >();
   private totpSetups = new Pending<{ secret: string; exp: number }>();
+  /** One-time email codes, keyed `<purpose>:<emailKey>`. While one is
+   *  pending, a new request re-sends IT (same code, tries and expiry): a
+   *  guesser can't reset their budget, and nobody can knock out a holder's
+   *  live code by asking for another. `decoy`: an address that holds
+   *  nothing gets an entry that can't match, so finishing against it looks
+   *  exactly like a wrong code. `email` is the stored address a code goes
+   *  to, never the typed spelling. */
+  private emailCodes = new Pending<{ code: string; email: string; exp: number; tries: number; decoy: boolean; sub?: string }>();
   private pwFailures = new Throttle(5, 15 * 60_000);
   private totpFailures = new Throttle(10, 15 * 60_000);
+  /** Codes REQUESTED (not failures): 3 per address and 10 per client address in 10 minutes. */
+  private emailPerAddress = new Throttle(3, EMAIL_WINDOW_MS);
+  private emailPerIp = new Throttle(10, EMAIL_WINDOW_MS);
+  /** Wrong codes per address, across codes: 10 in a day locks the address out of email sign-in. */
+  private emailWrong = new Throttle(10, DAY_MS);
+  /** Link codes per account: 3 a day — a signed-in person can't use this node to mail the world. */
+  private linkCodes = new Throttle(3, DAY_MS);
   readonly rp: RelyingParty;
 
   constructor(private d: HumanDeps) {
@@ -209,6 +253,9 @@ export class HumanAuth {
   }
   private get googleCallbackUrl(): string {
     return `${this.d.cfg.publicUrl}/oauth/google/callback`;
+  }
+  private get emailOn(): boolean {
+    return this.d.email !== null;
   }
 
   /** Built-in audiences of this very node — no config entry, no server
@@ -265,16 +312,22 @@ export class HumanAuth {
     const body = ((await readJson(req)) ?? {}) as Record<string, unknown>;
     const h = this.posts[p];
     if (!h) return false;
-    await h(req, res, body);
+    await h(req, res, body, ip);
     return true;
   }
 
-  private posts: Record<string, (req: IncomingMessage, res: ServerResponse, b: Record<string, unknown>) => Promise<void> | void> = {
+  private posts: Record<string, (req: IncomingMessage, res: ServerResponse, b: Record<string, unknown>, ip: string) => Promise<void> | void> = {
     '/login/code': (_q, res, b) => this.loginCode(res, b),
     '/login/password': (_q, res, b) => this.loginPassword(res, b),
     '/login/totp': (_q, res, b) => this.loginTotp(res, b),
     '/login/passkey/begin': (_q, res, b) => this.passkeyLoginBegin(res, b),
     '/login/passkey/finish': (_q, res, b) => this.passkeyLoginFinish(res, b),
+    '/login/email/begin': (_q, res, b, ip) => this.emailLoginBegin(res, b, ip),
+    '/login/email/finish': (_q, res, b) => this.emailLoginFinish(res, b),
+    '/account/email/begin': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkBegin(res, t, b, ip)),
+    '/account/email/finish': (q, res, b) => this.withAccount(q, res, (t) => this.emailLinkFinish(res, t, b)),
+    '/account/email/unlink': (q, res) => this.withAccount(q, res, (t) => this.emailUnlink(res, t)),
+    '/account/name': (q, res, b) => this.withAccount(q, res, (t) => this.setName(res, t, b)),
     '/account/setup/info': (_q, res, b) => this.setupInfo(res, b),
     '/account/setup': (_q, res, b) => this.setupFinish(res, b),
     '/account/password': (q, res, b) => this.withAccount(q, res, (t) => this.setPassword(res, t, b)),
@@ -308,8 +361,16 @@ export class HumanAuth {
     const state = this.newState({ intent: 'login', audience, exp: Date.now() + STATE_TTL_MS });
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
     if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
+    // `?email=` prefills the email field, so a ticket seller's "you're in"
+    // page can link straight here — nothing is sent until they ask.
+    const prefill = (url.searchParams.get('email') ?? '').trim().slice(0, 254);
     securePage(res, 200, (nonce) =>
-      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, open: !!signupGrant(this.d.audiences.get()[audience]), nonce }),
+      loginPage({
+        iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, email: this.emailOn,
+        ticketed: this.emailOn && this.d.ticketDefaults.get().audiences.includes(audience),
+        ...(this.emailOn && usableEmail(prefill) ? { prefillEmail: prefill } : {}),
+        open: !!signupGrant(this.d.audiences.get()[audience]), nonce,
+      }),
     );
   }
 
@@ -618,8 +679,11 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     // Codes count for their own audiences only (codes.ts) — read live, so a
     // revoked code stops working at the next sign-in.
     const live = this.d.accounts.bySub(who.sub);
-    // Codes, and an audience open to newcomers, count for that audience only.
-    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience), signupGrant(this.d.audiences.get()[audience])), live);
+    // Codes, a ticket, and an audience open to newcomers, count for that audience only.
+    const grant = withheld(
+      mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience), ticketGrant(live, audience), signupGrant(this.d.audiences.get()[audience])),
+      live,
+    );
     if (audience === 'account') {
       // Managing your own sign-in needs an account, or a Discord login that
       // would qualify for something (strangers don't get to create rows).
@@ -730,6 +794,12 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       canLinkDiscord: this.discordOn && !discordAnchored && !a?.discord,
       google: a?.google ? { email: a.google.email, linked: Boolean(a.google.sub) } : null,
       canLinkGoogle: this.googleOn && !a?.google?.sub,
+      // The address itself stays off the wire: the page shows a masked form.
+      email: a?.email ? { address: maskEmail(a.email.address), since: a.email.verifiedAt, canUnlink: !t.sub.startsWith('human:email:') } : null,
+      canLinkEmail: this.emailOn && !a?.email,
+      // an email-made row has no anchor to be named by: its name is its own to set
+      nameEditable: t.sub.startsWith('human:email:'),
+      ticket: a?.ticket ? { since: a.ticket.claimedAt, audiences: a.ticket.audiences, scopes: a.ticket.scopes } : null,
       codes: (a?.codes ?? []).flatMap((r) => {
         const c = this.d.codes.byId(r.id);
         return c && !c.revoked ? [{ label: c.label, audiences: c.audiences, at: r.at }] : [];
@@ -968,6 +1038,209 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
     console.error(`[hn] account: ${sub} signed up with ${c.id} (${c.label}) → ${c.audiences.join(', ')}`);
     return { code: c, account };
+  }
+
+  // ── email: a one-time code to a ticket holder's address (tickets.ts) ──
+
+  /**
+   * Request a code. The answer is the same 200 whether or not the address
+   * holds anything, the counters run either way, and the mail goes out
+   * after the answer — so neither the body nor the timing says who holds a
+   * ticket. A code is made only for an address that holds a ticket or
+   * already signs in (`login`), or whatever the signed-in person names
+   * (`link`: they must read that mailbox to finish).
+   */
+  private emailBegin(res: ServerResponse, b: Record<string, unknown>, ip: string, purpose: 'login' | 'link', sub?: string): void {
+    if (!this.emailOn) return json(res, 404, { error: 'email sign-in is not configured on this node' });
+    const typed = String(b.email ?? '').trim();
+    if (!usableEmail(typed)) return json(res, 400, { error: 'enter an email address' });
+    const key = emailKey(typed);
+    if (this.emailPerIp.locked(ip) || this.emailPerAddress.locked(key)) {
+      return json(res, 429, { error: 'too many codes requested — wait 10 minutes' });
+    }
+    if (this.emailWrong.locked(key)) return json(res, 429, { error: 'too many wrong codes for this address — try again tomorrow' });
+    if (purpose === 'link' && this.linkCodes.locked(sub!)) return json(res, 429, { error: 'too many link codes for this account today — try again tomorrow' });
+    this.emailPerIp.fail(ip);
+    this.emailPerAddress.fail(key);
+    if (purpose === 'link') this.linkCodes.fail(sub!);
+    // The stored address, never the typed spelling: a look-alike that keys
+    // the same (google.ts emailKey) must not be mailed instead.
+    const ticket = purpose === 'login' ? this.d.tickets.byEmail(typed) : undefined;
+    const acct = purpose === 'login' ? this.d.accounts.byEmail(typed) : undefined;
+    const entitled = purpose === 'link' || Boolean(ticket || acct);
+    const k = `${purpose}:${key}`;
+    let p = this.emailCodes.get(k);
+    if (!p || p.decoy !== !entitled || (sub !== undefined && p.sub !== sub)) {
+      p = {
+        code: entitled ? randomInt(0, 1_000_000).toString().padStart(6, '0') : randomBytes(32).toString('hex'),
+        email: acct?.email?.address ?? ticket?.email ?? typed,
+        exp: Date.now() + EMAIL_CODE_TTL_MS, tries: 0, decoy: !entitled, ...(sub ? { sub } : {}),
+      };
+      this.emailCodes.set(k, p);
+    }
+    json(res, 200, { ok: true, message: EMAIL_SENT_MESSAGE });
+    if (p.decoy) return;
+    // After the answer: neither the body nor its timing says who holds a ticket.
+    const { code, email } = p;
+    setImmediate(() => {
+      const m = signInCodeMessage(code);
+      this.d.email!.send(email, m.subject, m.text).then(
+        () => console.error(`[hn] email code sent to ${maskEmail(email)} (${purpose})`),
+        (err) => console.error(`[hn] email code to ${maskEmail(email)} failed: ${(err as Error).message}`),
+      );
+    });
+  }
+
+  /** The pending code for this address and purpose: spent on success, on
+   *  the fifth wrong try, or at its expiry. Missing, spent, expired, decoy
+   *  and wrong all get the one answer, so nothing here says whether the
+   *  address holds anything. */
+  private checkEmailCode(b: Record<string, unknown>, purpose: 'login' | 'link', sub?: string):
+    { email: string } | { status: number; body: { error: string; restart?: boolean } } {
+    const typed = String(b.email ?? '').trim();
+    const code = String(b.code ?? '').replace(/\s+/g, '');
+    const key = emailKey(typed);
+    const k = `${purpose}:${key}`;
+    if (this.emailWrong.locked(key)) return { status: 429, body: { error: 'too many wrong codes for this address — try again tomorrow' } };
+    const p = this.emailCodes.get(k);
+    if (!p || (sub !== undefined && p.sub !== sub)) {
+      this.emailWrong.fail(key);
+      return { status: 401, body: { error: EMAIL_CODE_WRONG } };
+    }
+    if (p.decoy || !/^\d{6}$/.test(code) || !safeEqual(sha256hex(code), sha256hex(p.code))) {
+      p.tries += 1;
+      this.emailWrong.fail(key);
+      if (p.tries >= EMAIL_CODE_TRIES) {
+        this.emailCodes.take(k);
+        return { status: 401, body: { error: `${EMAIL_CODE_WRONG} — too many tries, request a new one`, restart: true } };
+      }
+      return { status: 401, body: { error: EMAIL_CODE_WRONG } };
+    }
+    this.emailCodes.take(k);
+    // Reading the mailbox proved it is theirs: they may ask for codes again
+    // (a guesser never gets here, so the limits hold against them).
+    this.emailPerAddress.clear(key);
+    this.emailWrong.clear(key);
+    return { email: p.email };
+  }
+
+  private emailLoginBegin(res: ServerResponse, b: Record<string, unknown>, ip: string): void {
+    const st = this.states.get(String(b.state ?? ''));
+    if (!st || st.intent !== 'login') return json(res, 400, { error: 'this sign-in page expired — reload it' });
+    this.emailBegin(res, b, ip, 'login');
+  }
+
+  private async emailLoginFinish(res: ServerResponse, b: Record<string, unknown>): Promise<void> {
+    const state = String(b.state ?? '');
+    const st = this.states.get(state);
+    if (!st || st.intent !== 'login') return json(res, 400, { error: 'this sign-in page expired — reload it' });
+    if (!this.emailOn) return json(res, 404, { error: 'email sign-in is not configured on this node' });
+    const checked = this.checkEmailCode(b, 'login');
+    if ('status' in checked) return json(res, checked.status, checked.body);
+    const { email } = checked;
+    let acct = this.d.accounts.byEmail(email);
+    const ticket = this.d.tickets.byEmail(email);
+    if (!acct) {
+      // A first sign-in: the ticket (still there? it was when the code went
+      // out) makes the row and is claimed by it. One ticket = one account.
+      if (!ticket) return json(res, 403, { error: 'no ticket is held for this address' });
+      if (ticket.claimedBy && this.d.accounts.bySub(ticket.claimedBy)) {
+        return json(res, 403, { error: 'the account made with this ticket no longer signs in by email — sign in to it another way, then add the address back under sign-in settings' });
+      }
+      const now = new Date().toISOString();
+      try {
+        acct = this.d.accounts.add({
+          sub: newEmailSub(), email: { address: email, verifiedAt: now }, ticket: ticketSnapshot(ticket, now),
+          ...(ticket.name ? { name: ticket.name.slice(0, 32) } : {}),
+          createdAt: now, notes: `signed up by email with a ticket (${ticket.source})`,
+        });
+      } catch {
+        acct = this.d.accounts.byEmail(email); // another tab made it a moment ago
+        if (!acct) return json(res, 409, { error: 'that didn’t go through — try again' });
+      }
+      this.d.tickets.claim(email, acct.sub);
+      console.error(`[hn] account: ${acct.sub} signed up by email (${maskEmail(email)}, ticket ${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
+    } else if (ticket && !acct.ticket?.audiences.length && (!ticket.claimedBy || ticket.claimedBy === acct.sub)) {
+      // A ticket for the address, and nothing from it on the row (made
+      // before the ticket, or the grant was taken back and a new ticket
+      // bought): copied on now.
+      const now = new Date().toISOString();
+      acct = this.d.accounts.update(acct.sub, (a) => ({ ...a, ticket: ticketSnapshot(ticket, now) })) ?? acct;
+      this.d.tickets.claim(email, acct.sub);
+      console.error(`[hn] account: ${acct.sub} took up the ticket for ${maskEmail(email)} (${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
+    }
+    return this.respond(res, await this.finishLogin(state, acct, 'email'));
+  }
+
+  private setName(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a || !t.sub.startsWith('human:email:')) return json(res, 400, { error: 'this account is named by its sign-in provider' });
+    const bad = nameProblem(b.name, this.d.accounts, (n) => this.d.principals.nameTaken(n), t.sub);
+    if (bad) return json(res, 400, { error: bad });
+    const name = String(b.name).trim();
+    try {
+      this.d.accounts.update(t.sub, (x) => ({ ...x, name }));
+    } catch (err) {
+      return json(res, 409, { error: (err as Error).message });
+    }
+    console.error(`[hn] account: ${t.sub} set its name`);
+    json(res, 200, this.view(t));
+  }
+
+  private emailLinkBegin(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>, ip: string): void {
+    if (!this.emailOn) return json(res, 400, { error: 'email sign-in is not configured on this node' });
+    const a = this.ensureAccount(t);
+    if (!a) return json(res, 404, { error: 'no account' });
+    if (a.email) return json(res, 400, { error: 'an email address is already linked — remove it first' });
+    this.emailBegin(res, b, ip, 'link', a.sub);
+  }
+
+  /** The code came back: the address is theirs. It becomes a way in, and a
+   *  ticket held for it (not taken up elsewhere) is taken up by this account. */
+  private emailLinkFinish(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const checked = this.checkEmailCode(b, 'link', t.sub);
+    if ('status' in checked) return json(res, checked.status, checked.body);
+    const { email } = checked;
+    const other = this.d.accounts.byEmail(email);
+    if (other && other.sub !== t.sub) return json(res, 409, { error: 'that address already signs in to another account here' });
+    const ticket = this.d.tickets.byEmail(email);
+    const now = new Date().toISOString();
+    let took = false;
+    let acct: HumanAccount | undefined;
+    try {
+      acct = this.d.accounts.update(t.sub, (a) => {
+        if (a.disabled || a.email) throw new Error('an email address is already linked — remove it first');
+        took = Boolean(ticket && !a.ticket && (!ticket.claimedBy || ticket.claimedBy === a.sub));
+        return { ...a, email: { address: email, verifiedAt: now }, ...(took ? { ticket: ticketSnapshot(ticket!, now) } : {}) };
+      });
+    } catch (err) {
+      return json(res, 409, { error: (err as Error).message });
+    }
+    if (!acct) return json(res, 404, { error: 'no account' });
+    if (took) this.d.tickets.claim(email, acct.sub);
+    console.error(`[hn] account: ${acct.sub} linked email ${maskEmail(email)}${took ? ` and took up its ticket (${ticket!.source}) → ${ticket!.audiences.join(', ') || 'no audiences'}` : ''}`);
+    const note = ticket && !took
+      ? ticket.claimedBy === acct.sub
+        ? 'The ticket for this address was already this account’s — linked again.'
+        : acct.ticket
+          ? 'This account already holds a ticket; the one for this address stays unused.'
+          : 'The ticket for this address was taken up by another account.'
+      : undefined;
+    json(res, 200, { ...this.view(t), ...(note ? { note } : {}) });
+  }
+
+  private emailUnlink(res: ServerResponse, t: Aid1Payload): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a?.email) return json(res, 400, { error: 'no email address linked' });
+    if (t.sub.startsWith('human:email:')) return json(res, 400, { error: 'this account IS your email identity — it can’t be removed' });
+    if (restricted(a)) return json(res, 400, { error: RESTRICTED_UNLINK });
+    if (loginMethods(a) <= 1) return json(res, 400, { error: 'that’s your only way to sign in — add another first' });
+    this.d.accounts.update(t.sub, (x) => {
+      const { email: _e, ...rest } = x;
+      return rest; // a ticket it took up stays: what it gave was given
+    });
+    console.error(`[hn] account: ${t.sub} unlinked email ${maskEmail(a.email.address)}`);
+    json(res, 200, this.view(t));
   }
 
   // ── Google ──
@@ -1230,6 +1503,11 @@ If you were given an access code, enter it on the sign-in page first. If you hav
 }
 
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** What a claimed ticket leaves on the row (accounts.ts `ticket`). */
+function ticketSnapshot(t: Ticket, claimedAt: string): NonNullable<HumanAccount['ticket']> {
+  return { email: t.email, source: t.source, claimedAt, audiences: [...t.audiences], scopes: [...t.scopes] };
+}
 
 function cookie(req: IncomingMessage, name: string): string {
   for (const part of (req.headers.cookie ?? '').split(';')) {

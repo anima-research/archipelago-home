@@ -79,14 +79,17 @@ export function mintSponsoredInvite(
   policy: InvitePolicy,
   sponsor: SponsorIdentity,
   label: string | undefined,
-  opts?: { anchorDomain?: string | null; knownAudiences?: string[] },
+  /** `gate: false` — the sponsor was admitted some other way (a ticket
+   *  holder at the ticket site, server.ts): the console's sign-in gate
+   *  doesn't apply, the delegation rules still do. */
+  opts?: { anchorDomain?: string | null; knownAudiences?: string[]; gate?: boolean },
   nowMs = Date.now(),
 ): ConsoleMintResult {
   const gate = consoleRequiredScopes(policy);
   if (gate === null) {
     return { ok: false, status: 403, error: 'this home has no invite policy (config/invite-policy.json), so the console mints nothing' };
   }
-  const missing = gate.filter((s) => !sponsor.scopes.includes(s));
+  const missing = opts?.gate === false ? [] : gate.filter((s) => !sponsor.scopes.includes(s));
   if (missing.length) return { ok: false, status: 403, error: `minting requires ${missing.join(', ')}` };
   const delegable = delegableScopes(policy, sponsor.scopes);
   if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
@@ -118,6 +121,7 @@ export function mintSponsoredInvite(
   const invite = invites.mint({
     scopes,
     label: label?.slice(0, 60) || `agent of ${sponsor.name}`,
+    createdAt: new Date(nowMs).toISOString(),
     maxUses: 1,
     expiresAt: new Date(nowMs + INVITE_LIFETIME_MS).toISOString(),
     audiences,

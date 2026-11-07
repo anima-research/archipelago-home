@@ -271,6 +271,7 @@ export class PrincipalStore {
 export interface Invite {
   code: string;
   label?: string;
+  createdAt?: string;
   /** Scope stamp for principals enrolled through this invite. */
   scopes: string[];
   claims?: Record<string, unknown>;
@@ -533,7 +534,7 @@ export interface MintRecord {
   aud: string;
   scopes: string[];
   exp: number;
-  by: 'oauth' | 'google' | 'password' | 'passkey' | 'setup' | 'exchange' | 'enroll' | 'cli';
+  by: 'oauth' | 'google' | 'password' | 'passkey' | 'email' | 'setup' | 'exchange' | 'enroll' | 'cli' | 'tickets';
 }
 
 export class MintLog {
