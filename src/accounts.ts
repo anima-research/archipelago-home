@@ -436,18 +436,33 @@ export function newEmailSub(): string {
   return `human:email:${randomBytes(9).toString('base64url')}`;
 }
 
+/** A row made by email with no name yet: the address is never used as one
+ *  (a name rides into every token, to every audience). */
+export const TICKET_HOLDER_NAME = 'Ticket holder';
+
 /** Override → the anchor's own name (Discord name for a Discord-anchored
- *  row, Google name for a Google one, the mailbox name for an email one,
- *  username for a local one) → whatever else there is. */
+ *  row, Google name for a Google one, username for a local one) → whatever
+ *  else there is. An email-anchored row has only its override, else a
+ *  neutral default. */
 export function displayName(a: HumanAccount): string {
   const anchored = a.sub.startsWith('human:discord:')
     ? a.discord?.name
     : a.sub.startsWith('human:google:')
       ? a.google?.name || a.google?.email?.split('@')[0]
-      : a.sub.startsWith('human:email:')
-        ? a.email?.address.split('@')[0]
-        : a.username;
-  return (a.name || anchored || a.username || a.discord?.name || a.google?.name || a.email?.address.split('@')[0] || a.sub).slice(0, 32);
+      : a.username;
+  const fallback = a.sub.startsWith('human:email:') ? TICKET_HOLDER_NAME : a.sub;
+  return (a.name || anchored || a.username || a.discord?.name || a.google?.name || fallback).slice(0, 32);
+}
+
+/** A display name a person may pick for themselves. */
+export function nameProblem(raw: unknown, accounts: AccountStore, takenElsewhere: (n: string) => boolean, forSub: string): string | null {
+  if (typeof raw !== 'string') return 'name required';
+  const n = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (n.length < 2 || n.length > 32) return 'names are 2–32 characters';
+  if (n.includes('@')) return 'a name can’t be an email address';
+  if (RESERVED.has(n.toLowerCase())) return 'that name is reserved';
+  if (accounts.nameTaken(n, forSub) || takenElsewhere(n)) return 'that name is taken';
+  return null;
 }
 
 /** Login methods still standing — an account must always keep one. (An

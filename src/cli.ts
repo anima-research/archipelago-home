@@ -23,9 +23,9 @@
  *   hn code close <id>              no new redemptions (what it gave stays)
  *   hn code revoke <id>             and take back what it gave, from everyone
  *
- *   hn ticket add <email> [--note "…"] [--scopes x,y] [--audiences a,b]   → may sign up by email (tickets.ts)
+ *   hn ticket add <email> [--name "…"] [--note "…"] [--scopes x,y] [--audiences a,b]   → may sign up by email (tickets.ts)
  *   hn ticket ls                    who holds one, and which account took it up
- *   hn ticket rm <email>            no more sign-ups with it; an account it made keeps what it was given
+ *   hn ticket rm <email>            no more sign-ups with it, and what it gave its account goes (the account stays)
  */
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
@@ -34,7 +34,7 @@ import { loadOrCreateIssuerKey } from './keys.js';
 import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './token.js';
 import { audiencesStore, InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
 import { CodeStore } from './codes.js';
-import { ticketDefaultsStore, TicketStore } from './tickets.js';
+import { clean, ticketDefaultsStore, ticketGrantProblem, TicketStore, usableEmail } from './tickets.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
 import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
@@ -481,17 +481,17 @@ function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>):
   const list = (v?: string) => v?.split(',').map((x) => x.trim()).filter(Boolean);
   switch (sub) {
     case 'add': {
-      if (!email || !looksLikeEmail(email)) die('usage: hn ticket add <email> [--note "…"] [--scopes x,y] [--audiences a,b]');
+      if (!email || !usableEmail(email)) die('usage: hn ticket add <email> [--name "…"] [--note "…"] [--scopes x,y] [--audiences a,b]');
       const defaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json')).get();
       const audiences = list(flag.get('audiences')) ?? defaults.audiences;
       const scopes = list(flag.get('scopes')) ?? defaults.scopes;
-      if (!audiences.length) {
-        die(`a ticket needs audiences to count for — --audiences a,b, or defaults in ${join(cfg.configDir, 'ticket-defaults.json')} (see config/ticket-defaults.example.json)`);
-      }
-      const known = audiencesStore(join(cfg.configDir, 'audiences.json')).get();
-      for (const a of audiences) if (!known[a]) die(`no audience "${a}" in ${join(cfg.configDir, 'audiences.json')}`);
+      // the one check the ticket site's POST /tickets makes (tickets.ts)
+      const bad = ticketGrantProblem(defaults, Object.keys(audiencesStore(join(cfg.configDir, 'audiences.json')).get()), audiences, scopes);
+      if (bad) die(`${bad}${defaults.configured ? '' : ` — copy config/ticket-defaults.example.json to ${join(cfg.configDir, 'ticket-defaults.json')}`}`);
       const who = process.env.SUDO_USER || process.env.USER || userInfoName(process.getuid?.() ?? -1);
-      const r = tickets.add({ email, source: `admin:${who}`, audiences, scopes, ...(flag.get('note') ? { note: flag.get('note')!.slice(0, 120) } : {}) });
+      const name = clean(flag.get('name'), 32);
+      const note = clean(flag.get('note'), 120);
+      const r = tickets.add({ email, source: `admin:${who}`, audiences, scopes, ...(name ? { name } : {}), ...(note ? { note } : {}) });
       if (!r.created) die(`${email} already holds a ticket (${r.ticket.source}, ${r.ticket.addedAt.slice(0, 10)})${r.ticket.claimedBy ? `, taken up by ${r.ticket.claimedBy}` : ''}`);
       console.error(`[hn] ticket for ${email} → ${audiences.join(', ')} [${scopes.join(' ') || 'no scopes'}]`);
       console.error(`[hn] they sign in at ${cfg.publicUrl}/login?audience=${audiences[0]}&email=${encodeURIComponent(email)} — a code goes to that address, no password needed`);
@@ -513,9 +513,18 @@ function ticketCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>):
     case 'rm': {
       if (!email) die('usage: hn ticket rm <email>');
       const t = tickets.remove(email) ?? die(`no ticket for ${email}`);
+      let stripped = false;
+      if (t.claimedBy) {
+        new AccountStore(join(cfg.dataDir, 'accounts.json')).update(t.claimedBy, (a) => {
+          if (!a.ticket) return a;
+          stripped = true;
+          const { ticket: _t, ...rest } = a;
+          return rest;
+        });
+      }
       console.error(`[hn] ticket for ${t.email} removed — no more sign-ups with it.` +
         (t.claimedBy
-          ? ` The account it made (${t.claimedBy}) keeps what the ticket gave: hn user disable ${t.claimedBy} to shut it.`
+          ? ` Its account (${t.claimedBy}) ${stripped ? 'loses what the ticket gave and ' : ''}stays, with its other ways in; a new ticket for the address gives it back.`
           : ' It had not been taken up.'));
       return;
     }

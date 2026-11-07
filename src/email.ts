@@ -32,8 +32,10 @@ export function resendSender(apiKey: string, from: string, fetchImpl: FetchLike 
         method: 'POST',
         headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
         body: JSON.stringify({ from, to: [to], subject, text }),
+        signal: AbortSignal.timeout(10_000),
       });
-      if (!res.ok) throw new Error(`resend: ${res.status} ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      // status only: the provider's body may echo the address
+      if (!res.ok) throw new Error(`resend: ${res.status}`);
     },
   };
 }

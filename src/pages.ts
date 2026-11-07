@@ -92,7 +92,7 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings
 // ── /login ──
 
 export function loginPage(o: {
-  iss: string; audience: string; state: string; discord: boolean; google: boolean; email?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
+  iss: string; audience: string; state: string; discord: boolean; google: boolean; email?: boolean; ticketed?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
 }): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
   const body = `
@@ -149,7 +149,7 @@ export function loginPage(o: {
 <p class="dim small" style="margin-top:2rem">${
     o.open && (o.google || o.discord)
       ? `New here? ${o.google ? 'Continue with Google' : 'Continue with Discord'} — this one is open to everyone, and your account is made as you sign in.`
-      : o.email
+      : o.email && o.ticketed
       ? 'Hold a ticket? Enter the email address it was bought with and a sign-in code is sent there — no password needed. You can add a passkey or password afterwards under <a href="/login?audience=account">sign-in settings</a>.'
       : o.discord
       ? 'No username yet? Continue with Discord, then add a password or passkey under <a href="/login?audience=account">sign-in settings</a>.'
@@ -312,6 +312,8 @@ const fmt = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { year: '
 function render(extra) {
   const until = new Date(me.exp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   let s = '<div class="card"><p>Signed in as <b>' + h(me.name) + '</b></p><p class="dim small mono">' + h(me.sub) + '</p>' +
+    (me.nameEditable ? '<form id="f-name" class="row"><input id="name-in" maxlength="32" value="' + h(me.name) + '" aria-label="Display name">' +
+      '<button class="btn sm" type="submit">Set name</button></form><p class="dim small">What services see you as. 2–32 characters.</p>' : '') +
     '<p class="dim small">This page stays signed in until ' + until + '.</p>' +
     ((me.open || []).length ? '<p>Open to everyone: ' + me.open.map((o) => '<a href="' + h(o.url) + '">' + h(o.host) + '</a>').join(', ') + '</p>' : '') +
     '</div>';
@@ -468,6 +470,10 @@ function wire() {
     e.preventDefault();
     const r = await act('/account/code', { code: $('code-in').value.trim() });
     if (r) { render(); msg('Code redeemed — ' + r.redeemed.label + ': access to ' + r.redeemed.audiences.join(', ') + '.'); }
+  });
+  on('f-name', 'submit', async (e) => {
+    e.preventDefault();
+    if (await act('/account/name', { name: $('name-in').value.trim() }, 'Name set.')) render();
   });
   on('f-em', 'submit', async (e) => {
     e.preventDefault();

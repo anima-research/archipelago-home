@@ -22,7 +22,8 @@
  *   GET  /account (+ /account/…)  self-service, a built-in audience like the console
  *                                 (POST /account/code redeems an access code there;
  *                                 /account/email/begin + finish link an address the same way,
- *                                 taking up a ticket held for it; /account/email/unlink)
+ *                                 taking up a ticket held for it; /account/email/unlink;
+ *                                 /account/name for an email-made row's display name)
  *   GET  /account/setup#code=…    one-time setup link from `hn user add` / `hn user reset`
  *
  * Whatever the method, the result is the same as it always was: a 10-minute,
@@ -39,9 +40,9 @@ import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
-import { completeGoogle, emailKey, googleAuthorizeUrl, looksLikeEmail, newPkceVerifier, type GoogleIdentity } from './google.js';
+import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
 import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
-import { maskEmail, type Ticket, type TicketStore } from './tickets.js';
+import { maskEmail, usableEmail, type Ticket, type TicketDefaults, type TicketStore } from './tickets.js';
 import { CODE_TTL_MIN, signInCodeMessage, type EmailSender } from './email.js';
 import {
   anyOpen,
@@ -65,6 +66,7 @@ import {
   loginMethods,
   looksLikeRecoveryCode,
   mergeGrants,
+  nameProblem,
   newEmailSub,
   newRecoveryCodes,
   normalizeRecovery,
@@ -93,6 +95,9 @@ const TOTP_SETUP_TTL_MS = 15 * 60_000;
 const EMAIL_CODE_TTL_MS = CODE_TTL_MIN * 60_000;
 const EMAIL_CODE_TRIES = 5;
 const EMAIL_WINDOW_MS = 10 * 60_000;
+const DAY_MS = 24 * 3_600_000;
+/** The one answer a wrong, spent, expired or never-sent code gets. */
+const EMAIL_CODE_WRONG = 'wrong or expired code';
 /** The one answer /login/email/begin gives: it must not say whether the address holds anything. */
 export const EMAIL_SENT_MESSAGE = 'If this address holds a ticket, a code is on its way.';
 const MAX_PENDING = 10_000;
@@ -113,6 +118,8 @@ export interface HumanDeps {
   accounts: AccountStore;
   codes: CodeStore;
   tickets: TicketStore;
+  /** Which audiences a ticket is for (the sign-in page's hint). */
+  ticketDefaults: JsonStore<TicketDefaults>;
   /** Null = no email sign-in: the method isn't offered and its routes 404. */
   email: EmailSender | null;
   principals: PrincipalStore;
@@ -175,7 +182,10 @@ class Throttle {
   fail(k: string, now = Date.now()): void {
     const e = this.m.get(k);
     if (!e || e.until <= now) {
-      if (this.m.size > MAX_PENDING) this.m.clear();
+      if (this.m.size >= MAX_PENDING) {
+        for (const [key, val] of this.m) if (val.until <= now) this.m.delete(key); // the expired first
+        if (this.m.size >= MAX_PENDING) this.m.delete(this.m.keys().next().value!); // then the oldest
+      }
       this.m.set(k, { n: 1, until: now + this.windowMs });
     } else e.n += 1;
   }
@@ -211,13 +221,23 @@ export class HumanAuth {
     | { kind: 'register'; sub: string; userId: string; exp: number }
   >();
   private totpSetups = new Pending<{ secret: string; exp: number }>();
-  /** One-time email codes, keyed `<purpose>:<emailKey>`: a new request replaces the last. */
-  private emailCodes = new Pending<{ hash: string; email: string; exp: number; tries: number; sub?: string }>();
+  /** One-time email codes, keyed `<purpose>:<emailKey>`. While one is
+   *  pending, a new request re-sends IT (same code, tries and expiry): a
+   *  guesser can't reset their budget, and nobody can knock out a holder's
+   *  live code by asking for another. `decoy`: an address that holds
+   *  nothing gets an entry that can't match, so finishing against it looks
+   *  exactly like a wrong code. `email` is the stored address a code goes
+   *  to, never the typed spelling. */
+  private emailCodes = new Pending<{ code: string; email: string; exp: number; tries: number; decoy: boolean; sub?: string }>();
   private pwFailures = new Throttle(5, 15 * 60_000);
   private totpFailures = new Throttle(10, 15 * 60_000);
   /** Codes REQUESTED (not failures): 3 per address and 10 per client address in 10 minutes. */
   private emailPerAddress = new Throttle(3, EMAIL_WINDOW_MS);
   private emailPerIp = new Throttle(10, EMAIL_WINDOW_MS);
+  /** Wrong codes per address, across codes: 10 in a day locks the address out of email sign-in. */
+  private emailWrong = new Throttle(10, DAY_MS);
+  /** Link codes per account: 3 a day — a signed-in person can't use this node to mail the world. */
+  private linkCodes = new Throttle(3, DAY_MS);
   readonly rp: RelyingParty;
 
   constructor(private d: HumanDeps) {
@@ -307,6 +327,7 @@ export class HumanAuth {
     '/account/email/begin': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkBegin(res, t, b, ip)),
     '/account/email/finish': (q, res, b) => this.withAccount(q, res, (t) => this.emailLinkFinish(res, t, b)),
     '/account/email/unlink': (q, res) => this.withAccount(q, res, (t) => this.emailUnlink(res, t)),
+    '/account/name': (q, res, b) => this.withAccount(q, res, (t) => this.setName(res, t, b)),
     '/account/setup/info': (_q, res, b) => this.setupInfo(res, b),
     '/account/setup': (_q, res, b) => this.setupFinish(res, b),
     '/account/password': (q, res, b) => this.withAccount(q, res, (t) => this.setPassword(res, t, b)),
@@ -346,7 +367,8 @@ export class HumanAuth {
     securePage(res, 200, (nonce) =>
       loginPage({
         iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, email: this.emailOn,
-        ...(this.emailOn && looksLikeEmail(prefill) ? { prefillEmail: prefill } : {}),
+        ticketed: this.emailOn && this.d.ticketDefaults.get().audiences.includes(audience),
+        ...(this.emailOn && usableEmail(prefill) ? { prefillEmail: prefill } : {}),
         open: !!signupGrant(this.d.audiences.get()[audience]), nonce,
       }),
     );
@@ -775,6 +797,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // The address itself stays off the wire: the page shows a masked form.
       email: a?.email ? { address: maskEmail(a.email.address), since: a.email.verifiedAt, canUnlink: !t.sub.startsWith('human:email:') } : null,
       canLinkEmail: this.emailOn && !a?.email,
+      // an email-made row has no anchor to be named by: its name is its own to set
+      nameEditable: t.sub.startsWith('human:email:'),
       ticket: a?.ticket ? { since: a.ticket.claimedAt, audiences: a.ticket.audiences, scopes: a.ticket.scopes } : null,
       codes: (a?.codes ?? []).flatMap((r) => {
         const c = this.d.codes.byId(r.id);
@@ -1028,48 +1052,75 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
    */
   private emailBegin(res: ServerResponse, b: Record<string, unknown>, ip: string, purpose: 'login' | 'link', sub?: string): void {
     if (!this.emailOn) return json(res, 404, { error: 'email sign-in is not configured on this node' });
-    const email = String(b.email ?? '').trim();
-    if (!looksLikeEmail(email) || email.length > 254) return json(res, 400, { error: 'enter an email address' });
-    const key = emailKey(email);
+    const typed = String(b.email ?? '').trim();
+    if (!usableEmail(typed)) return json(res, 400, { error: 'enter an email address' });
+    const key = emailKey(typed);
     if (this.emailPerIp.locked(ip) || this.emailPerAddress.locked(key)) {
       return json(res, 429, { error: 'too many codes requested — wait 10 minutes' });
     }
+    if (this.emailWrong.locked(key)) return json(res, 429, { error: 'too many wrong codes for this address — try again tomorrow' });
+    if (purpose === 'link' && this.linkCodes.locked(sub!)) return json(res, 429, { error: 'too many link codes for this account today — try again tomorrow' });
     this.emailPerIp.fail(ip);
     this.emailPerAddress.fail(key);
-    const entitled = purpose === 'link' || Boolean(this.d.tickets.byEmail(email) || this.d.accounts.byEmail(email));
-    if (entitled) {
-      const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
-      this.emailCodes.set(`${purpose}:${key}`, { hash: sha256hex(code), email, exp: Date.now() + EMAIL_CODE_TTL_MS, tries: 0, ...(sub ? { sub } : {}) });
+    if (purpose === 'link') this.linkCodes.fail(sub!);
+    // The stored address, never the typed spelling: a look-alike that keys
+    // the same (google.ts emailKey) must not be mailed instead.
+    const ticket = purpose === 'login' ? this.d.tickets.byEmail(typed) : undefined;
+    const acct = purpose === 'login' ? this.d.accounts.byEmail(typed) : undefined;
+    const entitled = purpose === 'link' || Boolean(ticket || acct);
+    const k = `${purpose}:${key}`;
+    let p = this.emailCodes.get(k);
+    if (!p || p.decoy !== !entitled || (sub !== undefined && p.sub !== sub)) {
+      p = {
+        code: entitled ? randomInt(0, 1_000_000).toString().padStart(6, '0') : randomBytes(32).toString('hex'),
+        email: acct?.email?.address ?? ticket?.email ?? typed,
+        exp: Date.now() + EMAIL_CODE_TTL_MS, tries: 0, decoy: !entitled, ...(sub ? { sub } : {}),
+      };
+      this.emailCodes.set(k, p);
+    }
+    json(res, 200, { ok: true, message: EMAIL_SENT_MESSAGE });
+    if (p.decoy) return;
+    // After the answer: neither the body nor its timing says who holds a ticket.
+    const { code, email } = p;
+    setImmediate(() => {
       const m = signInCodeMessage(code);
       this.d.email!.send(email, m.subject, m.text).then(
         () => console.error(`[hn] email code sent to ${maskEmail(email)} (${purpose})`),
         (err) => console.error(`[hn] email code to ${maskEmail(email)} failed: ${(err as Error).message}`),
       );
-    }
-    json(res, 200, { ok: true, message: EMAIL_SENT_MESSAGE });
+    });
   }
 
   /** The pending code for this address and purpose: spent on success, on
-   *  the fifth wrong try, or at its expiry. */
+   *  the fifth wrong try, or at its expiry. Missing, spent, expired, decoy
+   *  and wrong all get the one answer, so nothing here says whether the
+   *  address holds anything. */
   private checkEmailCode(b: Record<string, unknown>, purpose: 'login' | 'link', sub?: string):
     { email: string } | { status: number; body: { error: string; restart?: boolean } } {
-    const email = String(b.email ?? '').trim();
+    const typed = String(b.email ?? '').trim();
     const code = String(b.code ?? '').replace(/\s+/g, '');
-    const k = `${purpose}:${emailKey(email)}`;
+    const key = emailKey(typed);
+    const k = `${purpose}:${key}`;
+    if (this.emailWrong.locked(key)) return { status: 429, body: { error: 'too many wrong codes for this address — try again tomorrow' } };
     const p = this.emailCodes.get(k);
-    if (!p || (sub !== undefined && p.sub !== sub)) return { status: 400, body: { error: 'no code is pending for that address — request one' } };
-    if (!/^\d{6}$/.test(code) || !safeEqual(sha256hex(code), p.hash)) {
+    if (!p || (sub !== undefined && p.sub !== sub)) {
+      this.emailWrong.fail(key);
+      return { status: 401, body: { error: EMAIL_CODE_WRONG } };
+    }
+    if (p.decoy || !/^\d{6}$/.test(code) || !safeEqual(sha256hex(code), sha256hex(p.code))) {
       p.tries += 1;
+      this.emailWrong.fail(key);
       if (p.tries >= EMAIL_CODE_TRIES) {
         this.emailCodes.take(k);
-        return { status: 401, body: { error: 'wrong code — too many tries, request a new one', restart: true } };
+        return { status: 401, body: { error: `${EMAIL_CODE_WRONG} — too many tries, request a new one`, restart: true } };
       }
-      return { status: 401, body: { error: 'wrong code' } };
+      return { status: 401, body: { error: EMAIL_CODE_WRONG } };
     }
     this.emailCodes.take(k);
     // Reading the mailbox proved it is theirs: they may ask for codes again
-    // (a guesser never gets here, so the limit holds against them).
-    this.emailPerAddress.clear(emailKey(email));
+    // (a guesser never gets here, so the limits hold against them).
+    this.emailPerAddress.clear(key);
+    this.emailWrong.clear(key);
     return { email: p.email };
   }
 
@@ -1088,10 +1139,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if ('status' in checked) return json(res, checked.status, checked.body);
     const { email } = checked;
     let acct = this.d.accounts.byEmail(email);
+    const ticket = this.d.tickets.byEmail(email);
     if (!acct) {
       // A first sign-in: the ticket (still there? it was when the code went
       // out) makes the row and is claimed by it. One ticket = one account.
-      const ticket = this.d.tickets.byEmail(email);
       if (!ticket) return json(res, 403, { error: 'no ticket is held for this address' });
       if (ticket.claimedBy && this.d.accounts.bySub(ticket.claimedBy)) {
         return json(res, 403, { error: 'the account made with this ticket no longer signs in by email — sign in to it another way, then add the address back under sign-in settings' });
@@ -1100,6 +1151,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       try {
         acct = this.d.accounts.add({
           sub: newEmailSub(), email: { address: email, verifiedAt: now }, ticket: ticketSnapshot(ticket, now),
+          ...(ticket.name ? { name: ticket.name.slice(0, 32) } : {}),
           createdAt: now, notes: `signed up by email with a ticket (${ticket.source})`,
         });
       } catch {
@@ -1108,8 +1160,31 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       }
       this.d.tickets.claim(email, acct.sub);
       console.error(`[hn] account: ${acct.sub} signed up by email (${maskEmail(email)}, ticket ${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
+    } else if (ticket && !acct.ticket?.audiences.length && (!ticket.claimedBy || ticket.claimedBy === acct.sub)) {
+      // A ticket for the address, and nothing from it on the row (made
+      // before the ticket, or the grant was taken back and a new ticket
+      // bought): copied on now.
+      const now = new Date().toISOString();
+      acct = this.d.accounts.update(acct.sub, (a) => ({ ...a, ticket: ticketSnapshot(ticket, now) })) ?? acct;
+      this.d.tickets.claim(email, acct.sub);
+      console.error(`[hn] account: ${acct.sub} took up the ticket for ${maskEmail(email)} (${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
     }
     return this.respond(res, await this.finishLogin(state, acct, 'email'));
+  }
+
+  private setName(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a || !t.sub.startsWith('human:email:')) return json(res, 400, { error: 'this account is named by its sign-in provider' });
+    const bad = nameProblem(b.name, this.d.accounts, (n) => this.d.principals.nameTaken(n), t.sub);
+    if (bad) return json(res, 400, { error: bad });
+    const name = String(b.name).trim();
+    try {
+      this.d.accounts.update(t.sub, (x) => ({ ...x, name }));
+    } catch (err) {
+      return json(res, 409, { error: (err as Error).message });
+    }
+    console.error(`[hn] account: ${t.sub} set its name`);
+    json(res, 200, this.view(t));
   }
 
   private emailLinkBegin(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>, ip: string): void {
@@ -1145,7 +1220,11 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (took) this.d.tickets.claim(email, acct.sub);
     console.error(`[hn] account: ${acct.sub} linked email ${maskEmail(email)}${took ? ` and took up its ticket (${ticket!.source}) → ${ticket!.audiences.join(', ') || 'no audiences'}` : ''}`);
     const note = ticket && !took
-      ? (acct.ticket && ticket.claimedBy !== acct.sub ? 'This account already holds a ticket; the one for this address stays unused.' : 'The ticket for this address was taken up by another account.')
+      ? ticket.claimedBy === acct.sub
+        ? 'The ticket for this address was already this account’s — linked again.'
+        : acct.ticket
+          ? 'This account already holds a ticket; the one for this address stays unused.'
+          : 'The ticket for this address was taken up by another account.'
       : undefined;
     json(res, 200, { ...this.view(t), ...(note ? { note } : {}) });
   }

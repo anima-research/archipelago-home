@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { maskEmail, ticketDefaultsProblem, ticketDefaultsStore, ticketsProblem, TicketStore } from '../src/tickets.js';
+import { clean, maskEmail, ticketDefaultsProblem, ticketDefaultsStore, ticketGrantProblem, ticketsProblem, TicketStore, usableEmail } from '../src/tickets.js';
 import { emailSenderFromConfig, logSender, signInCodeMessage } from '../src/email.js';
 
 const fresh = () => mkdtempSync(join(tmpdir(), 'hn-tickets-'));
@@ -27,6 +27,14 @@ test('tickets: one per mailbox — Gmail dots and +suffix, and case, are the sam
   assert.ok(store.byEmail('Jo.Anne+x@Example.org'));
   assert.equal((statSync(join(dir, 'tickets.json')).mode & 0o777), 0o600);
   assert.throws(() => store.add({ email: 'not-an-address', source: 'admin:test', audiences: [], scopes: [] }));
+  // printable ASCII only: a look-alike that keys the same must not be mailed instead
+  assert.throws(() => store.add({ email: '\u212Aim@example.org', source: 'admin:test', audiences: [], scopes: [] }));
+  assert.equal(usableEmail('kim@example.org'), true);
+  assert.equal(usableEmail('\u212Aim@example.org'), false);
+  assert.equal(usableEmail('k im@example.org'), false);
+  assert.equal(clean(' a\u0000b\nc ', 10), 'abc');
+  assert.equal(clean('x'.repeat(20), 5), 'xxxxx');
+  assert.equal(clean(7, 5), '');
 });
 
 test('tickets: claim is first-come and sticks; remove keeps nothing; refs find the ticket they were recorded on', () => {
@@ -45,10 +53,23 @@ test('tickets: claim is first-come and sticks; remove keeps nothing; refs find t
   assert.deepEqual(store.addRef('a@example.org', 'ref-a')!.refs, ['ref-b']); // the source ref: no-op
   assert.equal(store.byRef('ref-b')!.email, 'a@example.org');
   assert.equal(store.addRef('nobody@example.org', 'r'), undefined);
+  // a second purchase widens the grant (never narrows) and names an unnamed holder
+  const widened = store.addRef('a@example.org', 'ref-c', { audiences: ['members', 'extra'], scopes: [], name: 'Ann' })!;
+  assert.deepEqual([widened.audiences, widened.scopes, widened.name], [['members', 'extra'], ['members:member'], 'Ann']);
+  assert.equal(store.addRef('a@example.org', 'ref-d', { name: 'Other' })!.name, 'Ann');
+  // removal leaves tombstones for every ref that reached the ticket
   assert.equal(store.remove('a@example.org')!.email, 'a@example.org');
   assert.equal(store.remove('a@example.org'), undefined);
   assert.equal(store.byEmail('a@example.org'), undefined);
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8')), { tickets: [] });
+  for (const r of ['ref-a', 'ref-b', 'ref-c', 'ref-d']) assert.equal(store.removed(r), true, r);
+  assert.equal(store.removed('ref-z'), false);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8')), { tickets: [], tombstones: ['ref-a', 'ref-b', 'ref-c', 'ref-d'] });
+  // an admin ticket has no api ref to tombstone, only recorded ones
+  store.add({ email: 'b@example.org', source: 'admin:x', audiences: ['members'], scopes: [] });
+  store.addRef('b@example.org', 'ref-e');
+  store.remove('b@example.org');
+  assert.equal(store.removed('ref-e'), true);
+  assert.equal(store.removed('admin:x'), false);
 });
 
 test('tickets: a malformed file is refused (duplicate mailbox, bad shape)', () => {
@@ -63,18 +84,37 @@ test('tickets: a malformed file is refused (duplicate mailbox, bad shape)', () =
   assert.deepEqual(new TicketStore(join(dir, 'tickets.json')).all(), []);
 });
 
-test('ticket defaults (config/ticket-defaults.json): strict, hot-reloadable, absent = nothing', async () => {
+test('ticket defaults (config/ticket-defaults.json): strict, hot-reloadable, absent = nothing; the allowlist bounds every ticket', async () => {
   assert.equal(ticketDefaultsProblem({ audiences: ['members'], scopes: ['members:member'], _: 'note' }), null);
+  assert.equal(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['members', 'extra'], scopes: ['x:y'], _: 'c' } }), null);
   assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: ['members:member'], audience: [] })!, /unknown key "audience"/);
   assert.match(ticketDefaultsProblem({ audiences: 'members', scopes: [] })!, /audiences/);
-  assert.match(ticketDefaultsProblem({ audiences: [], scopes: [''] })!, /scopes/);
+  assert.match(ticketDefaultsProblem({ audiences: [], scopes: [] })!, /non-empty/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [''] })!, /scopes/);
+  assert.match(ticketDefaultsProblem({ audiences: ['console'], scopes: [] })!, /this node’s own/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: [] })!, /allowed must be an object/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['members'], scopes: [], scoeps: [] } })!, /allowed\.scoeps/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['account'], scopes: [] } })!, /this node’s own/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: ['a:b'], allowed: { audiences: ['members'], scopes: [] } })!, /"a:b" is not in allowed/);
   assert.match(ticketDefaultsProblem([])!, /not an object/);
+  // the one check behind POST /tickets and hn ticket add
+  const d = { configured: true, audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members', 'extra'], scopes: ['members:member', 'extra:use'] } };
+  const known = ['members', 'extra', 'eidoverse'];
+  assert.equal(ticketGrantProblem(d, known, ['members', 'extra'], ['extra:use']), null);
+  assert.match(ticketGrantProblem({ ...d, configured: false }, known, ['members'], [])!, /no config/);
+  assert.match(ticketGrantProblem(d, known, [], [])!, /at least one audience/);
+  assert.match(ticketGrantProblem(d, known, ['console'], [])!, /this node’s own/);
+  assert.match(ticketGrantProblem(d, known, ['account'], [])!, /this node’s own/);
+  assert.match(ticketGrantProblem(d, known, ['eidoverse'], [])!, /not one a ticket may carry/);
+  assert.match(ticketGrantProblem(d, ['members'], ['extra'], [])!, /no audience "extra" in audiences\.json/);
+  assert.match(ticketGrantProblem(d, known, ['members'], ['worlds:join'])!, /scope "worlds:join"/);
   const dir = fresh();
   const path = join(dir, 'ticket-defaults.json');
   assert.equal(ticketDefaultsStore(path).get().configured, false);
   writeFileSync(path, JSON.stringify({ audiences: ['members'], scopes: ['members:member'] }));
   const store = ticketDefaultsStore(path);
-  assert.deepEqual(store.get(), { configured: true, audiences: ['members'], scopes: ['members:member'] });
+  // allowed defaults to the defaults
+  assert.deepEqual(store.get(), { configured: true, audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members'], scopes: ['members:member'] } });
   store.startWatching(20);
   try {
     writeFileSync(path, JSON.stringify({ audiences: ['members'], scoeps: [] }));
