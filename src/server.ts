@@ -5,7 +5,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
@@ -18,9 +18,13 @@ import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './p
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import { CodeStore } from './codes.js';
-import { clean, maskEmail, ticketDefaultsStore, ticketGrantProblem, TicketStore, usableEmail, type Ticket, type TicketDefaults } from './tickets.js';
-import { displayName, TICKET_HOLDER_NAME } from './accounts.js';
+import {
+  clean, maskEmail, noDefaultsMessage, takeBackTicket, ticketDefaultsStore, ticketGrantProblem, ticketPlaceholderSub, ticketSponsorSubs,
+  TicketStore, usableEmail, type RemovedTicket, type Ticket, type TicketDefaults,
+} from './tickets.js';
+import { displayName, nameProblem, TICKET_HOLDER_NAME } from './accounts.js';
 import type { SponsorIdentity } from './console.js';
+import { emailKey } from './google.js';
 import { emailSenderFromConfig, type EmailSender } from './email.js';
 import type { FetchLike } from './oauth.js';
 import { esc, html, json, page, readJson } from './http.js';
@@ -127,6 +131,8 @@ export class HomeNode {
   readonly email: EmailSender | null;
   readonly human: HumanAuth;
   private limiter = new RateLimit();
+  /** The ticket site's calls come from one server in bursts: their own, wider window. */
+  private ticketsLimiter = new RateLimit(120, 60_000);
   private server = createServer((req, res) => void this.route(req, res));
 
   constructor(readonly cfg: ServerConfig, opts: { fetchImpl?: FetchLike; email?: EmailSender } = {}) {
@@ -245,8 +251,14 @@ export class HomeNode {
       }
       if (await this.human.route(req, url, res, ip)) return;
       if (url.pathname === '/tickets' || url.pathname.startsWith('/tickets/')) {
-        if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
+        if (!this.ticketsLimiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
         return await this.ticketsApi(req, url, res);
+      }
+      if (req.method === 'GET' && url.pathname === '/enroll') {
+        // the URL an invite hands an agent is usable in a browser too
+        return html(res, 200, page('enroll', `<p>This is the enrollment endpoint: an agent holding an invite code <b>POSTs</b> its key proof here
+(<code>POST ${esc(this.cfg.publicUrl)}/enroll</code>) and receives its identity and first token.</p>
+<p>The whole procedure, with the exact statement to sign: <a href="/agents.md">/agents.md</a>.</p>`));
       }
       if (url.pathname.startsWith('/console')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
@@ -283,12 +295,13 @@ export class HomeNode {
    * run. Bearer HN_TICKETS_TOKEN, compared in constant time; without the
    * token configured the routes don't exist.
    *
-   *   POST   /tickets           {email, ref, name?, note?, scopes?, audiences?} → 201 made, 200 known
-   *   GET    /tickets/<email>   {held, claimedBy?, addedAt?}
-   *   DELETE /tickets/<email>   204 — a refund: the entitlement goes, and so does what
-   *                             the ticket gave its account (the account stays)
-   *   POST   /tickets/invites   {email, ref, agentName?} → 201 {code, enrolUrl, expiresAt, agentsMd}
-   *   GET    /tickets/invites?email=…
+   *   POST   /tickets                 {email, ref, name?, note?, scopes?, audiences?} → 201 made, 200 known
+   *   GET    /tickets/<email>         {held, claimedBy?, addedAt?}
+   *   DELETE /tickets/<email>         204 — a refund: what the ticket gave goes (its account's copy,
+   *                                   its unclaimed invites, its agents' grants); the identities stay
+   *   POST   /tickets/invites         {email, ref, agentName?} → 201 {code, enrolUrl, expiresAt, agentsMd}
+   *   GET    /tickets/invites?email=…|ref=…
+   *   DELETE /tickets/invites/<code>  204 — revoke an unclaimed invite of a ticket
    */
   private async ticketsApi(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     const token = this.cfg.ticketsToken;
@@ -296,7 +309,7 @@ export class HomeNode {
     const m = /^bearer (.+)$/i.exec(req.headers.authorization ?? '');
     if (!m || !constantEqual(m[1]!, token)) return json(res, 401, { error: 'unauthorized' });
     const { tickets } = this;
-    if (url.pathname === '/tickets/invites') return this.ticketInvites(req, url, res);
+    if (url.pathname === '/tickets/invites' || url.pathname.startsWith('/tickets/invites/')) return this.ticketInvites(req, url, res);
     if (req.method === 'POST' && url.pathname === '/tickets') {
       const b = ((await readJson(req)) ?? {}) as Record<string, unknown>;
       const email = clean(b.email, 254);
@@ -305,7 +318,7 @@ export class HomeNode {
       const note = clean(b.note, 120);
       const list = (v: unknown, what: string): string[] | undefined | null => {
         if (v === undefined) return undefined;
-        return Array.isArray(v) && v.every((s) => typeof s === 'string' && s.length > 0) ? (v as string[]) : (json(res, 400, { error: `${what} must be a list of strings` }), null);
+        return Array.isArray(v) && v.every((s) => typeof s === 'string' && s.length > 0) ? [...new Set(v as string[])] : (json(res, 400, { error: `${what} must be a list of strings` }), null);
       };
       if (!usableEmail(email)) return json(res, 400, { error: 'email must be an address (printable ASCII)' });
       if (!ref) return json(res, 400, { error: 'ref required (the ticket site’s reference for this purchase)' });
@@ -317,22 +330,25 @@ export class HomeNode {
       if (known) return json(res, 200, { ticket: ticketView(known), created: false });
       if (tickets.removed(ref)) return json(res, 410, { error: 'removed', ref });
       const d = this.ticketDefaults.get();
-      if (!d.configured) return json(res, 503, { error: 'this node has no config/ticket-defaults.json — no ticket can be made' });
+      if (!d.configured) return json(res, 503, { error: `no ticket can be made: ${noDefaultsMessage(this.cfg.configDir)}` });
       const grant = { audiences: audiences ?? d.audiences, scopes: scopes ?? d.scopes };
       const bad = ticketGrantProblem(d, Object.keys(this.audiences.get()), grant.audiences, grant.scopes);
       if (bad) return json(res, 400, { error: bad });
-      const r = tickets.add({ email, source: `api:${ref}`, ...grant, ...(name ? { name } : {}), ...(note ? { note } : {}) });
+      // the holder's name goes through what a person picking one must
+      const nameOk = Boolean(name) && !nameProblem(name, this.accounts, (n) => this.principals.nameTaken(n), '');
+      const named = nameOk ? { name } : {};
+      const r = tickets.add({ email, source: `api:${ref}`, ...grant, ...named, ...(note ? { note } : {}) });
       if (!r.created) {
         // the mailbox already holds one (a second purchase): keep the first,
         // remember this ref, and let the new purchase widen the grant — on
         // the account too, if the ticket is taken up
-        const t = tickets.addRef(email, ref, { ...(audiences ? { audiences } : {}), ...(scopes ? { scopes } : {}), ...(name ? { name } : {}) }) ?? r.ticket;
+        const t = tickets.addRef(email, ref, { ...(audiences ? { audiences } : {}), ...(scopes ? { scopes } : {}), ...named }) ?? r.ticket;
         if (t.claimedBy) this.syncTicketGrant(t);
         console.error(`[hn] tickets api: ${maskEmail(email)} already holds a ticket — recorded ref ${ref}`);
-        return json(res, 200, { ticket: ticketView(t), created: false });
+        return json(res, 200, { ticket: ticketView(t), created: false, ...(name ? { nameAccepted: nameOk } : {}) });
       }
-      console.error(`[hn] tickets api: ticket added for ${maskEmail(email)} (${ref}) → ${r.ticket.audiences.join(', ')}`);
-      return json(res, 201, { ticket: ticketView(r.ticket), created: true });
+      console.error(`[hn] tickets api: ticket ${r.ticket.id} added for ${maskEmail(email)} (${ref}) → ${r.ticket.audiences.join(', ')}`);
+      return json(res, 201, { ticket: ticketView(r.ticket), created: true, ...(name ? { nameAccepted: nameOk } : {}) });
     }
     const em = /^\/tickets\/(.+)$/.exec(url.pathname);
     let email = '';
@@ -347,10 +363,24 @@ export class HomeNode {
       return json(res, 200, t ? { held: true, addedAt: t.addedAt, ...(t.claimedBy ? { claimedBy: t.claimedBy } : {}) } : { held: false });
     }
     if (req.method === 'DELETE') {
-      const t = tickets.remove(email);
-      if (!t) return json(res, 404, { error: 'no ticket for that address' });
-      const stripped = t.claimedBy ? this.stripTicketGrant(t.claimedBy) : false;
-      console.error(`[hn] tickets api: ticket removed for ${maskEmail(email)}${t.claimedBy ? ` — its account ${t.claimedBy} ${stripped ? 'loses what it gave and ' : ''}stays` : ''}`);
+      const t = tickets.byEmail(email);
+      // What the ticket gave goes FIRST; only then the ticket. A failure
+      // here (a held lock, a full disk) leaves the ticket to retry against.
+      // Without a ticket, a stray copy on an account is still taken back.
+      let back: ReturnType<typeof takeBackTicket>;
+      try {
+        back = takeBackTicket(t ?? { id: '', email }, { accounts: this.accounts, invites: this.invites, principals: this.principals });
+      } catch (err) {
+        console.error(`[hn] tickets api: refund of ${maskEmail(email)} failed: ${(err as Error).message}`);
+        return json(res, 500, { error: 'could not take the ticket’s grant back — try again' });
+      }
+      if (!t) {
+        if (!back.accounts) return json(res, 404, { error: 'no ticket for that address' });
+        console.error(`[hn] tickets api: no ticket for ${maskEmail(email)}, but a stray copy on ${back.accounts} account(s) taken back`);
+      } else {
+        tickets.remove(email);
+        console.error(`[hn] tickets api: ticket ${t.id} removed for ${maskEmail(email)} — taken back from ${back.accounts} account(s), ${back.invites} unclaimed invite(s), ${back.agents} agent(s)`);
+      }
       res.writeHead(204);
       res.end();
       return;
@@ -365,18 +395,6 @@ export class HomeNode {
     this.accounts.update(t.claimedBy, (a) => ({ ...a, ticket: { email: t.email, source: t.source, claimedAt: a.ticket?.claimedAt ?? claimedAt, audiences: [...t.audiences], scopes: [...t.scopes] } }));
   }
 
-  /** A refund: what the ticket gave goes; the account, and its other ways in, stay. */
-  private stripTicketGrant(sub: string): boolean {
-    let had = false;
-    this.accounts.update(sub, (a) => {
-      if (!a.ticket) return a;
-      had = true;
-      const { ticket: _t, ...rest } = a;
-      return rest;
-    });
-    return had;
-  }
-
   /** Who vouches for an agent minted from this ticket: the account that
    *  took it up, else a stable placeholder for the ticket until someone does.
    *  The sponsor's scopes are the ticket's — delegation stays within them. */
@@ -388,34 +406,72 @@ export class HomeNode {
     return { disabled: false, sponsor: { sub: ticketPlaceholderSub(t), name: t.name || TICKET_HOLDER_NAME, scopes: [...t.scopes] } };
   }
 
+  /** The ticket `email` and/or `ref` name — both, when both are given, must
+   *  name the same one. Also a refunded ticket, for the listing. */
+  private ticketFor(email: string, ref: string): { live?: Ticket; gone?: RemovedTicket } | null {
+    const byEmail = usableEmail(email) ? this.tickets.byEmail(email) : undefined;
+    const byRef = ref ? this.tickets.byRef(ref) : undefined;
+    if (email && ref && byEmail && byRef && byEmail.id !== byRef.id) return null;
+    if (usableEmail(email) && ref && ((byEmail && !byRef) || (byRef && !byEmail))) {
+      // one of them names a ticket, the other doesn't: not the same ticket
+      const live = byEmail ?? byRef!;
+      if (!(byRef || live.refs?.includes(ref) || live.source === `api:${ref}`) || !(byEmail || emailKey(live.email) === emailKey(email))) return null;
+    }
+    const live = byEmail ?? byRef;
+    if (live) return { live };
+    const gone = this.tickets.removedTicket({ ...(usableEmail(email) ? { email } : {}), ...(ref ? { ref } : {}) });
+    return gone ? { gone } : null;
+  }
+
   private async ticketInvites(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const code = /^\/tickets\/invites\/(.+)$/.exec(url.pathname)?.[1];
+    if (code !== undefined) {
+      if (req.method !== 'DELETE') return json(res, 404, { error: 'not found' });
+      const inv = this.invites.all().find((i) => i.code === decodeURIComponent(code) && i.ticket);
+      if (!inv || (inv.uses ?? 0) >= (inv.maxUses ?? 1)) return json(res, 404, { error: 'no such unclaimed invite' });
+      this.invites.revoke(inv.code);
+      console.error(`[hn] tickets api: invite ${inv.code} of ticket ${inv.ticket} revoked`);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (req.method === 'POST') {
       const b = ((await readJson(req)) ?? {}) as Record<string, unknown>;
       const email = clean(b.email, 254);
       const ref = clean(b.ref, 200);
       const agentName = clean(b.agentName, 60);
-      const t = (usableEmail(email) ? this.tickets.byEmail(email) : undefined) ?? (ref ? this.tickets.byRef(ref) : undefined);
+      const found = this.ticketFor(email, ref);
+      const t = found?.live;
       if (!t) return json(res, 404, { error: 'no_ticket' });
+      const d = this.ticketDefaults.get();
+      if (!d.configured) return json(res, 503, { error: `no invite can be made: ${noDefaultsMessage(this.cfg.configDir)}` });
       const { sponsor, disabled } = this.ticketSponsor(t);
       if (disabled) return json(res, 403, { error: 'account disabled' });
-      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), sponsor, agentName || undefined,
-        { gate: false, knownAudiences: Object.keys(this.audiences.get()) });
-      if (!r.ok) return json(res, r.status === 429 ? 409 : r.status, { error: r.status === 429 ? 'budget' : r.error });
+      // ever minted for this ticket — claimed, revoked, expired all count
+      if ((t.invitesMinted ?? 0) >= d.invites.lifetime) return json(res, 409, { error: 'budget', reason: 'lifetime' });
+      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), sponsor, agentName || undefined, {
+        gate: false, knownAudiences: Object.keys(this.audiences.get()),
+        // the ticket's own reach, whatever the policy's rules would add
+        restrict: { audiences: t.audiences, scopes: [...new Set([...t.scopes, ...d.allowed.scopes])] },
+        budget: { active: d.invites.active }, sponsorSubs: ticketSponsorSubs(t), ticket: t.id,
+      });
+      if (!r.ok) return json(res, r.status === 429 ? 409 : r.status, r.status === 429 ? { error: 'budget', reason: r.budget } : { error: r.error });
+      this.tickets.countInvite(t.id);
       this.mintLog.append({
         at: new Date().toISOString(), sub: sponsor.sub, aud: 'console',
         scopes: r.invite.scopes, exp: Math.floor(Date.parse(r.invite.expiresAt!) / 1000), by: 'tickets',
       });
-      console.error(`[hn] tickets api: ${sponsor.sub} (${sponsor.name}) minted invite ${r.invite.code} [${r.invite.scopes.join(' ')}]`);
+      console.error(`[hn] tickets api: ${sponsor.sub} (${sponsor.name}) minted invite ${r.invite.code} for ticket ${t.id} [${r.invite.scopes.join(' ')}] → ${r.invite.audiences!.join(', ')}`);
       return json(res, 201, {
         code: r.invite.code, enrolUrl: `${this.cfg.publicUrl}/enroll`, expiresAt: r.invite.expiresAt, agentsMd: `${this.cfg.publicUrl}/agents.md`,
       });
     }
     if (req.method === 'GET') {
-      const email = clean(url.searchParams.get('email'), 254);
-      const t = usableEmail(email) ? this.tickets.byEmail(email) : undefined;
+      const found = this.ticketFor(clean(url.searchParams.get('email'), 254), clean(url.searchParams.get('ref'), 200));
+      const t = found?.live ?? found?.gone;
       if (!t) return json(res, 404, { error: 'no_ticket' });
-      const subs = [ticketPlaceholderSub(t), ...(t.claimedBy ? [t.claimedBy] : [])];
-      const invites = this.invites.all().filter((i) => i.sponsor && subs.includes(i.sponsor)).map((i) => {
+      const subs = ticketSponsorSubs(t);
+      const invites = this.invites.all().filter((i) => i.ticket === t.id || (i.sponsor && subs.includes(i.sponsor) && !i.ticket)).map((i) => {
         const claimed = (i.uses ?? 0) >= (i.maxUses ?? 1);
         const enrolled = claimed ? this.principals.all().find((p) => p.notes?.includes(`invite ${i.code}`)) : undefined;
         return {
@@ -425,7 +481,7 @@ export class HomeNode {
           ...(i.label ? { agentName: i.label } : {}),
         };
       });
-      return json(res, 200, { invites });
+      return json(res, 200, { invites, ...(found?.gone ? { refunded: true, removedAt: found.gone.removedAt } : {}) });
     }
     json(res, 404, { error: 'not found' });
   }
@@ -513,29 +569,23 @@ function ticketView(t: Ticket): Record<string, unknown> {
   return rest;
 }
 
-/** The sponsor an agent carries until the ticket's holder has an account here. */
-function ticketPlaceholderSub(t: Ticket): string {
-  return `ticket:${t.source.startsWith('api:') ? t.source.slice(4) : t.source}`;
-}
 
 function markdown(res: ServerResponse, body: string): void {
   res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'public, max-age=300' });
   res.end(body);
 }
 
-/** `<config dir>/agents.md` when the deployment has its own wording, else
- *  docs/AGENTS.md, loaded once per process (fresh on restart, cheap always)
- *  — it ships in the repo so the served guide is versioned with the
- *  endpoints it documents. */
+/** `<config dir>/agents.md` when the deployment has its own wording (read
+ *  on each request, so an edit lands at once), else the repo's
+ *  docs/AGENTS.md, loaded once per process — it ships in the repo so the
+ *  served guide is versioned with the endpoints it documents. */
 let agentsGuideCache: string | null = null;
 function agentsGuide(configDir: string): string {
   const own = join(configDir, 'agents.md');
-  if (existsSync(own)) {
-    try {
-      return readFileSync(own, 'utf8');
-    } catch {
-      /* unreadable: the built-in one */
-    }
+  try {
+    if (statSync(own).isFile()) return readFileSync(own, 'utf8');
+  } catch {
+    /* absent or unreadable: the built-in one */
   }
   if (agentsGuideCache === null) {
     const here = dirname(fileURLToPath(import.meta.url));

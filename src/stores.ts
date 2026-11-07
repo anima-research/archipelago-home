@@ -189,6 +189,9 @@ export interface Principal {
   tokenTtl?: string;
   /** ISO — principal expired means no further token issuance. */
   expires?: string | null;
+  /** The ticket (tickets.ts `id`) whose invite enrolled this agent: a refund
+   *  of that ticket takes the grant back (the principal stays, stripped). */
+  sponsorTicket?: string;
   notes?: string;
 }
 
@@ -251,6 +254,17 @@ export class PrincipalStore {
     this.store.set({ principals: [...this.all(), p] });
   }
 
+  /** Replace one principal's record (`fn` returns the new one). False if absent. */
+  update(sub: string, fn: (p: Principal) => Principal): boolean {
+    const list = this.all();
+    const p = list.find((x) => x.sub === sub);
+    if (!p) return false;
+    const next = fn(structuredClone(p));
+    if (JSON.stringify(next) === JSON.stringify(p)) return true;
+    this.store.set({ principals: list.map((x) => (x.sub === sub ? next : x)) });
+    return true;
+  }
+
   /** Revocation = stop issuance (archipelago rule 2: no CRLs; outstanding
    *  tokens live out their exp). Record kept for audit. */
   revoke(sub: string, nowIso = new Date().toISOString()): boolean {
@@ -283,6 +297,9 @@ export interface Invite {
   expiresAt?: string;
   /** Sub of the human who minted this via the console — their vouch. */
   sponsor?: string;
+  /** The ticket (tickets.ts `id`) this was minted for, through the ticket
+   *  site's API: counted against that ticket's budget, revoked with its refund. */
+  ticket?: string;
   /**
    * Domain the enrolled principal is anchored to: `agent:<name>@<domain>`.
    * Absent = `guest` (invited, anchored nowhere). Setting it is the home

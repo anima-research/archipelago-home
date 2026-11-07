@@ -79,8 +79,9 @@ export interface HumanAccount {
   /** Email login (a one-time code to this address, human.ts). Only ever a
    *  verified address: it is written when the code comes back. */
   email?: { address: string; verifiedAt: string };
-  /** The ticket this account took up (tickets.ts) — a copy, so removing
-   *  the ticket later changes nothing here. Its scopes count for its
+  /** The ticket this account took up (tickets.ts) — a copy of its grant,
+   *  kept in step by the ticket site's API: widened by a further purchase,
+   *  taken away by a refund (the account stays). Its scopes count for its
    *  audiences only, like a code's. */
   ticket?: { email: string; source: string; claimedAt: string; audiences: string[]; scopes: string[] };
   /** `scrypt$<logN>$<r>$<p>$<salt>$<hash>` */
@@ -440,6 +441,10 @@ export function newEmailSub(): string {
  *  (a name rides into every token, to every audience). */
 export const TICKET_HOLDER_NAME = 'Ticket holder';
 
+/** C0/C1 controls, bidi overrides and isolates, line/paragraph separators:
+ *  what must never ride in a name, a note or a reference. */
+export const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u2028\u2029]/g;
+
 /** Override → the anchor's own name (Discord name for a Discord-anchored
  *  row, Google name for a Google one, username for a local one) → whatever
  *  else there is. An email-anchored row has only its override, else a
@@ -457,10 +462,11 @@ export function displayName(a: HumanAccount): string {
 /** A display name a person may pick for themselves. */
 export function nameProblem(raw: unknown, accounts: AccountStore, takenElsewhere: (n: string) => boolean, forSub: string): string | null {
   if (typeof raw !== 'string') return 'name required';
-  const n = raw.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  const n = raw.replace(INVISIBLE, '').trim();
+  if (n !== raw.trim()) return 'a name can’t carry control or direction characters';
   if (n.length < 2 || n.length > 32) return 'names are 2–32 characters';
   if (n.includes('@')) return 'a name can’t be an email address';
-  if (RESERVED.has(n.toLowerCase())) return 'that name is reserved';
+  if (RESERVED.has(n.toLowerCase()) || n.toLowerCase() === TICKET_HOLDER_NAME.toLowerCase()) return 'that name is reserved';
   if (accounts.nameTaken(n, forSub) || takenElsewhere(n)) return 'that name is taken';
   return null;
 }

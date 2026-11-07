@@ -71,9 +71,11 @@ test('cli: ticket ls shows holders and who took a ticket up; rm stops sign-ups a
   assert.equal(JSON.parse(hn('ls', '--json').out).length, 2);
   const rmUnused = hn('rm', 'A@example.org');
   assert.equal(rmUnused.status, 0, rmUnused.out);
-  assert.match(rmUnused.out, /had not been taken up/);
+  assert.match(rmUnused.out, /taken back from 0 account\(s\)/);
+  assert.doesNotMatch(rmUnused.out, /Its account/);
   const rmUsed = hn('rm', 'b@example.org');
   assert.match(rmUsed.out, /Its account \(human:email:abc\) stays/);
+  assert.match(rmUsed.out, /taken back from 0 account\(s\)/);
   assert.equal(store().all().length, 0);
   assert.notEqual(hn('rm', 'b@example.org').status, 0);
 });
@@ -88,7 +90,7 @@ test('cli: ticket rm takes back what the ticket gave its account (the account st
   store().claim('c@example.org', 'human:email:c1');
   const r = hn('rm', 'c@example.org');
   assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /loses what the ticket gave and stays/);
+  assert.match(r.out, /taken back from 1 account\(s\), 0 unclaimed invite\(s\), 0 agent\(s\)/);
   const a = accounts().bySub('human:email:c1')!;
   assert.equal(a.ticket, undefined);
   assert.equal(a.email!.address, 'c@example.org');
@@ -99,7 +101,7 @@ test('cli: without config/ticket-defaults.json no ticket can be made, flags or n
   for (const args of [['add', 'a@example.org'], ['add', 'a@example.org', '--audiences', 'members']]) {
     const r = hn(...args);
     assert.notEqual(r.status, 0);
-    assert.match(r.out, /no config\/ticket-defaults\.json/);
+    assert.match(r.out, /no .*ticket-defaults\.json — copy/);
   }
   assert.equal(store().all().length, 0);
 });

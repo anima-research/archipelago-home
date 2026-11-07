@@ -33,6 +33,7 @@ test('tickets: one per mailbox — Gmail dots and +suffix, and case, are the sam
   assert.equal(usableEmail('\u212Aim@example.org'), false);
   assert.equal(usableEmail('k im@example.org'), false);
   assert.equal(clean(' a\u0000b\nc ', 10), 'abc');
+  assert.equal(clean('a\u0085b\u202ec\u2066d\u2028e', 10), 'abcde'); // C1, bidi override, isolate, line separator
   assert.equal(clean('x'.repeat(20), 5), 'xxxxx');
   assert.equal(clean(7, 5), '');
 });
@@ -57,14 +58,22 @@ test('tickets: claim is first-come and sticks; remove keeps nothing; refs find t
   const widened = store.addRef('a@example.org', 'ref-c', { audiences: ['members', 'extra'], scopes: [], name: 'Ann' })!;
   assert.deepEqual([widened.audiences, widened.scopes, widened.name], [['members', 'extra'], ['members:member'], 'Ann']);
   assert.equal(store.addRef('a@example.org', 'ref-d', { name: 'Other' })!.name, 'Ann');
-  // removal leaves tombstones for every ref that reached the ticket
+  // removal keeps the ticket under `removed`: every ref that reached it is spent, and it can still be looked up
+  const id = store.byEmail('a@example.org')!.id;
+  assert.match(id, /^tk_[0-9a-f]{12}$/);
   assert.equal(store.remove('a@example.org')!.email, 'a@example.org');
   assert.equal(store.remove('a@example.org'), undefined);
   assert.equal(store.byEmail('a@example.org'), undefined);
+  assert.equal(store.byId(id), undefined);
   for (const r of ['ref-a', 'ref-b', 'ref-c', 'ref-d']) assert.equal(store.removed(r), true, r);
   assert.equal(store.removed('ref-z'), false);
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8')), { tickets: [], tombstones: ['ref-a', 'ref-b', 'ref-c', 'ref-d'] });
-  // an admin ticket has no api ref to tombstone, only recorded ones
+  assert.equal(store.removedTicket({ email: 'A@example.org' })!.id, id);
+  assert.equal(store.removedTicket({ ref: 'ref-c' })!.id, id);
+  assert.ok(store.removedTicket({ ref: 'ref-c' })!.removedAt);
+  const onDisk = JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8'));
+  assert.deepEqual(onDisk.tickets, []);
+  assert.equal(onDisk.removed.length, 1);
+  // an admin ticket has no api ref, only recorded ones
   store.add({ email: 'b@example.org', source: 'admin:x', audiences: ['members'], scopes: [] });
   store.addRef('b@example.org', 'ref-e');
   store.remove('b@example.org');
@@ -74,10 +83,15 @@ test('tickets: claim is first-come and sticks; remove keeps nothing; refs find t
 
 test('tickets: a malformed file is refused (duplicate mailbox, bad shape)', () => {
   assert.equal(ticketsProblem({ tickets: [] }), null);
-  assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: ['x'], scopes: [] }, { email: 'A@B.CO', source: 's', addedAt: 't', audiences: [], scopes: [] }] })!, /two tickets/);
-  assert.match(ticketsProblem({ tickets: [{ email: 'nope', source: 's', addedAt: 't', audiences: [], scopes: [] }] })!, /email/);
-  assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: [7], scopes: [] }] })!, /audiences/);
-  assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: [], scopes: [], refs: 'x' }] })!, /refs/);
+  const row = (x: Record<string, unknown>) => ({ id: 'tk_1', email: 'a@b.co', source: 's', addedAt: 't', audiences: [], scopes: [], ...x });
+  assert.match(ticketsProblem({ tickets: [row({ audiences: ['x'] }), row({ id: 'tk_2', email: 'A@B.CO' })] })!, /two tickets/);
+  assert.match(ticketsProblem({ tickets: [row({}), row({ email: 'c@d.co' })] })!, /id tk_1/);
+  assert.match(ticketsProblem({ tickets: [row({ id: undefined })] })!, /without an id/);
+  assert.match(ticketsProblem({ tickets: [row({ email: 'nope' })] })!, /email/);
+  assert.match(ticketsProblem({ tickets: [row({ audiences: [7] })] })!, /audiences/);
+  assert.match(ticketsProblem({ tickets: [row({ refs: 'x' })] })!, /refs/);
+  assert.match(ticketsProblem({ tickets: [], removed: [{ id: 'x' }] })!, /removed/);
+  assert.equal(ticketsProblem({ tickets: [row({})], removed: [{ ...row({ id: 'tk_9' }), removedAt: 't' }] }), null);
   assert.match(ticketsProblem({ tickets: {} })!, /not a tickets file/);
   const dir = fresh();
   writeFileSync(join(dir, 'tickets.json'), '{ nope');
@@ -96,6 +110,13 @@ test('ticket defaults (config/ticket-defaults.json): strict, hot-reloadable, abs
   assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['members'], scopes: [], scoeps: [] } })!, /allowed\.scoeps/);
   assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['account'], scopes: [] } })!, /this node’s own/);
   assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: ['a:b'], allowed: { audiences: ['members'], scopes: [] } })!, /"a:b" is not in allowed/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: ['id:anchor'] })!, /id:\*/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], allowed: { audiences: ['members'], scopes: ['id:anchor'] } })!, /id:\*/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], invites: [] })!, /invites must be an object/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], invites: { active: 3, lifetime: 2 } })!, /exceed/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], invites: { active: '3', lifetime: 10 } })!, /whole numbers/);
+  assert.match(ticketDefaultsProblem({ audiences: ['members'], scopes: [], invites: { active: 3, lifetime: 10, x: 1 } })!, /invites\.x/);
+  assert.equal(ticketDefaultsProblem({ audiences: ['members'], scopes: [], invites: { active: 1, lifetime: 1 } }), null);
   assert.match(ticketDefaultsProblem([])!, /not an object/);
   // the one check behind POST /tickets and hn ticket add
   const d = { configured: true, audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members', 'extra'], scopes: ['members:member', 'extra:use'] } };
@@ -108,13 +129,16 @@ test('ticket defaults (config/ticket-defaults.json): strict, hot-reloadable, abs
   assert.match(ticketGrantProblem(d, known, ['eidoverse'], [])!, /not one a ticket may carry/);
   assert.match(ticketGrantProblem(d, ['members'], ['extra'], [])!, /no audience "extra" in audiences\.json/);
   assert.match(ticketGrantProblem(d, known, ['members'], ['worlds:join'])!, /scope "worlds:join"/);
+  assert.match(ticketGrantProblem({ ...d, allowed: { ...d.allowed, scopes: ['id:anchor'] } }, known, ['members'], ['id:anchor'])!, /own authority/);
   const dir = fresh();
   const path = join(dir, 'ticket-defaults.json');
   assert.equal(ticketDefaultsStore(path).get().configured, false);
   writeFileSync(path, JSON.stringify({ audiences: ['members'], scopes: ['members:member'] }));
   const store = ticketDefaultsStore(path);
-  // allowed defaults to the defaults
-  assert.deepEqual(store.get(), { configured: true, audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members'], scopes: ['members:member'] } });
+  // allowed defaults to the defaults; the invite budget to 3 active / 10 ever
+  assert.deepEqual(store.get(), {
+    configured: true, audiences: ['members'], scopes: ['members:member'], allowed: { audiences: ['members'], scopes: ['members:member'] }, invites: { active: 3, lifetime: 10 },
+  });
   store.startWatching(20);
   try {
     writeFileSync(path, JSON.stringify({ audiences: ['members'], scoeps: [] }));
