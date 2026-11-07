@@ -4,6 +4,7 @@
  * default bind is loopback. The human sign-in routes live in human.ts.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,11 +18,11 @@ import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './p
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import { CodeStore } from './codes.js';
-import { maskEmail, ticketDefaultsStore, TicketStore, type TicketDefaults } from './tickets.js';
+import { maskEmail, ticketDefaultsStore, TicketStore, type Ticket, type TicketDefaults } from './tickets.js';
+import { looksLikeEmail } from './google.js';
 import { emailSenderFromConfig, type EmailSender } from './email.js';
-import { parseStripeEvent, ticketEmailFromEvent, verifyStripeSignature } from './stripe.js';
 import type { FetchLike } from './oauth.js';
-import { esc, html, json, page, readBody, readJson } from './http.js';
+import { esc, html, json, page, readJson } from './http.js';
 import {
   audiencesStore,
   InviteStore,
@@ -52,8 +53,8 @@ export interface ServerConfig {
   emailProvider?: string;
   resendApiKey?: string;
   emailFrom?: string;
-  /** The Stripe endpoint's signing secret (stripe.ts); unset = no webhook (404). */
-  stripeWebhookSecret?: string;
+  /** Bearer token the ticket site presents at /tickets; unset = the API is off (404). */
+  ticketsToken?: string;
 }
 
 export function configFromEnv(env = process.env): ServerConfig {
@@ -73,7 +74,7 @@ export function configFromEnv(env = process.env): ServerConfig {
     emailProvider: env.EMAIL_PROVIDER,
     resendApiKey: env.RESEND_API_KEY,
     emailFrom: env.EMAIL_FROM,
-    stripeWebhookSecret: env.STRIPE_WEBHOOK_SECRET,
+    ticketsToken: env.HN_TICKETS_TOKEN,
   };
 }
 
@@ -180,9 +181,9 @@ export class HomeNode {
         if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
         if (!this.cfg.googleClientId) console.error('[hn] GOOGLE_CLIENT_ID unset — Google login off');
         if (!this.email) console.error('[hn] EMAIL_PROVIDER unset — email sign-in off');
-        if (!this.cfg.stripeWebhookSecret) console.error('[hn] STRIPE_WEBHOOK_SECRET unset — /stripe/webhook off');
-        else if (!this.email) console.error('[hn] note: tickets arrive from Stripe, but with no email sign-in nobody can use one');
-        if ((this.email || this.cfg.stripeWebhookSecret) && !this.ticketDefaults.get().configured) {
+        if (!this.cfg.ticketsToken) console.error('[hn] HN_TICKETS_TOKEN unset — the /tickets API is off');
+        else if (!this.email) console.error('[hn] note: the /tickets API is on, but with no email sign-in nobody can use a ticket');
+        if ((this.email || this.cfg.ticketsToken) && !this.ticketDefaults.get().configured) {
           console.error('[hn] no config/ticket-defaults.json — a ticket grants nothing unless `hn ticket add` says what');
         }
         if (!this.invitePolicy.get().configured) console.error('[hn] no config/invite-policy.json — the sponsor console is off');
@@ -238,7 +239,10 @@ export class HomeNode {
         return markdown(res, agentsGuide());
       }
       if (await this.human.route(req, url, res, ip)) return;
-      if (req.method === 'POST' && url.pathname === '/stripe/webhook') return this.stripeWebhook(req, res);
+      if (url.pathname === '/tickets' || url.pathname.startsWith('/tickets/')) {
+        if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
+        return this.ticketsApi(req, url, res);
+      }
       if (url.pathname.startsWith('/console')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
         if (await this.consoleRoute(req, url, res)) return;
@@ -266,37 +270,74 @@ export class HomeNode {
     }
   }
 
-  // ── Stripe → tickets (stripe.ts, tickets.ts) ──
+  // ── the ticket site's API (tickets.ts) ──
 
-  /** A paid checkout gives its address a ticket. Signature-gated rather
-   *  than rate-limited: Stripe retries in bursts, and the check is one HMAC.
-   *  Always 200 once the signature holds, so Stripe stops redelivering;
-   *  ignored event types say so in the body. */
-  private async stripeWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const secret = this.cfg.stripeWebhookSecret;
-    if (!secret) return json(res, 404, { error: 'not found' });
-    const raw = await readBody(req);
-    const sig = req.headers['stripe-signature'];
-    const v = verifyStripeSignature(raw, typeof sig === 'string' ? sig : undefined, secret);
-    if (!v.ok) {
-      console.error(`[hn] stripe webhook refused: ${v.reason}`);
-      return json(res, 400, { error: `bad signature: ${v.reason}` });
+  /**
+   * The ticket site has verified the payment and holds the address; it tells
+   * this node who may sign up. Bearer HN_TICKETS_TOKEN, compared in constant
+   * time; without the token configured the routes don't exist.
+   *
+   *   POST   /tickets           {email, ref, note?, scopes?, audiences?} → 201 made, 200 known
+   *   GET    /tickets/<email>   {held, claimedBy?, addedAt?}
+   *   DELETE /tickets/<email>   204 — future sign-ups only; an account already made is untouched
+   */
+  private async ticketsApi(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const token = this.cfg.ticketsToken;
+    if (!token) return json(res, 404, { error: 'not found' });
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
+    if (!m || !constantEqual(m[1]!, token)) return json(res, 401, { error: 'unauthorized' });
+    const { tickets } = this;
+    if (req.method === 'POST' && url.pathname === '/tickets') {
+      const b = ((await readJson(req)) ?? {}) as Record<string, unknown>;
+      const email = typeof b.email === 'string' ? b.email.trim() : '';
+      const ref = typeof b.ref === 'string' ? b.ref.trim() : '';
+      const list = (v: unknown, name: string): string[] | undefined | null => {
+        if (v === undefined) return undefined;
+        return Array.isArray(v) && v.every((s) => typeof s === 'string' && s.length > 0) ? (v as string[]) : (json(res, 400, { error: `${name} must be a list of strings` }), null);
+      };
+      if (!looksLikeEmail(email) || email.length > 254) return json(res, 400, { error: 'email must be an address' });
+      if (!ref || ref.length > 200) return json(res, 400, { error: 'ref required (the ticket site’s reference for this purchase)' });
+      const scopes = list(b.scopes, 'scopes');
+      if (scopes === null) return;
+      const audiences = list(b.audiences, 'audiences');
+      if (audiences === null) return;
+      const known = tickets.byRef(ref);
+      if (known) return json(res, 200, { ticket: ticketView(known), created: false });
+      const d = this.ticketDefaults.get();
+      const r = tickets.add({
+        email, source: `api:${ref}`, audiences: audiences ?? d.audiences, scopes: scopes ?? d.scopes,
+        ...(typeof b.note === 'string' && b.note.trim() ? { note: b.note.trim().slice(0, 120) } : {}),
+      });
+      if (!r.created) {
+        // the mailbox already holds one (a second purchase): keep the first, remember this ref
+        const t = tickets.addRef(email, ref) ?? r.ticket;
+        console.error(`[hn] tickets api: ${maskEmail(email)} already holds a ticket — recorded ref ${ref}`);
+        return json(res, 200, { ticket: ticketView(t), created: false });
+      }
+      console.error(`[hn] tickets api: ticket added for ${maskEmail(email)} (${ref}) → ${r.ticket.audiences.join(', ') || 'no audiences'}`);
+      return json(res, 201, { ticket: ticketView(r.ticket), created: true });
     }
-    const ev = parseStripeEvent(raw);
-    if (!ev) return json(res, 400, { error: 'not a Stripe event' });
-    const email = ticketEmailFromEvent(ev);
-    if (!email) return json(res, 200, { received: true, ignored: ev.type });
-    if (!this.tickets.stripeEventOnce(ev.id)) return json(res, 200, { received: true, duplicate: ev.id });
-    const d = this.ticketDefaults.get();
-    let r: ReturnType<TicketStore['add']>;
+    const em = /^\/tickets\/(.+)$/.exec(url.pathname);
+    let email = '';
     try {
-      r = this.tickets.add({ email, source: `stripe:${ev.id}`, audiences: d.audiences, scopes: d.scopes });
-    } catch (err) {
-      console.error(`[hn] stripe ${ev.id}: ${(err as Error).message}`);
-      return json(res, 200, { received: true, ignored: 'no usable email' });
+      email = decodeURIComponent(em?.[1] ?? '');
+    } catch {
+      /* malformed escape: not an address */
     }
-    console.error(`[hn] ticket ${r.created ? 'added' : 'already held'} for ${maskEmail(email)} (${ev.type} ${ev.id})`);
-    json(res, 200, { received: true, ticket: r.created ? 'added' : 'existing' });
+    if (!em || !looksLikeEmail(email)) return json(res, req.method === 'GET' || req.method === 'DELETE' ? 400 : 404, { error: 'not an address' });
+    if (req.method === 'GET') {
+      const t = tickets.byEmail(email);
+      return json(res, 200, t ? { held: true, addedAt: t.addedAt, ...(t.claimedBy ? { claimedBy: t.claimedBy } : {}) } : { held: false });
+    }
+    if (req.method === 'DELETE') {
+      const t = tickets.remove(email);
+      if (!t) return json(res, 404, { error: 'no ticket for that address' });
+      console.error(`[hn] tickets api: ticket removed for ${maskEmail(email)}${t.claimedBy ? ` (its account ${t.claimedBy} stays)` : ''}`);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    json(res, 404, { error: 'not found' });
   }
 
   // ── sponsor console (see console.ts header for the design) ──
@@ -368,6 +409,19 @@ export class HomeNode {
 }
 
 // ── helpers ──
+
+/** Equal strings, in time that doesn't depend on where they differ. */
+function constantEqual(a: string, b: string): boolean {
+  const x = createHash('sha256').update(a).digest();
+  const y = createHash('sha256').update(b).digest();
+  return timingSafeEqual(x, y) && a.length === b.length;
+}
+
+/** What the API tells the ticket site about a ticket (it holds the address already). */
+function ticketView(t: Ticket): Record<string, unknown> {
+  const { note: _n, ...rest } = t;
+  return rest;
+}
 
 function markdown(res: ServerResponse, body: string): void {
   res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8', 'cache-control': 'public, max-age=300' });

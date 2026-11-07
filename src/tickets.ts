@@ -1,8 +1,10 @@
 /**
  * Tickets: addresses entitled to make an account by email alone (human.ts,
- * `/login/email/*`). A ticket arrives from a payment (the Stripe webhook,
- * stripe.ts) or the operator (`hn ticket add`), and says what the account it
- * makes holds: `audiences` + `scopes`, defaulting to config/ticket-defaults.json.
+ * `/login/email/*`). A ticket arrives from the ticket site (`POST /tickets`,
+ * server.ts — it has verified the payment; this node never talks to a
+ * payment provider) or the operator (`hn ticket add`), and says what the
+ * account it makes holds: `audiences` + `scopes`, defaulting to
+ * config/ticket-defaults.json.
  *
  * One ticket = one account: the first email sign-up with the address claims
  * it (`claimedBy`), and a later sign-in with the same address opens that
@@ -21,10 +23,13 @@ import { JsonStore } from './stores.js';
 import { emailKey, looksLikeEmail } from './google.js';
 
 export interface Ticket {
-  /** As typed / as Stripe sent it; matching is by emailKey. */
+  /** As typed / as the ticket site sent it; matching is by emailKey. */
   email: string;
-  /** `stripe:<event id>` or `admin:<who>`. */
+  /** `api:<ref>` (the ticket site's reference) or `admin:<who>`. */
   source: string;
+  /** Further refs the ticket site sent for the same mailbox (a second
+   *  purchase): recorded, so each ref answers idempotently. */
+  refs?: string[];
   addedAt: string;
   audiences: string[];
   scopes: string[];
@@ -36,16 +41,11 @@ export interface Ticket {
 
 export interface TicketsFile {
   tickets: Ticket[];
-  /** Stripe event ids already handled — a redelivered event adds nothing. */
-  stripeEvents: string[];
 }
-
-const STRIPE_EVENTS_KEPT = 2000;
 
 export function ticketsProblem(raw: unknown): string | null {
   const f = raw as TicketsFile;
   if (!f || typeof f !== 'object' || !Array.isArray(f.tickets)) return 'not a tickets file';
-  if (f.stripeEvents !== undefined && !(Array.isArray(f.stripeEvents) && f.stripeEvents.every((s) => typeof s === 'string'))) return 'bad stripeEvents';
   const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string' && s.length > 0);
   const keys = new Set<string>();
   for (const t of f.tickets) {
@@ -56,21 +56,21 @@ export function ticketsProblem(raw: unknown): string | null {
     if (typeof t.source !== 'string' || typeof t.addedAt !== 'string') return `bad ticket for ${t.email}`;
     if (!strings(t.audiences) || !strings(t.scopes)) return `bad audiences/scopes on the ticket for ${t.email}`;
     if (t.claimedBy !== undefined && typeof t.claimedBy !== 'string') return `bad claimedBy on the ticket for ${t.email}`;
+    if (t.refs !== undefined && !strings(t.refs)) return `bad refs on the ticket for ${t.email}`;
   }
   return null;
 }
 
 function validate(raw: unknown): TicketsFile | null {
   if (ticketsProblem(raw)) return null;
-  const f = raw as TicketsFile;
-  return { tickets: f.tickets, stripeEvents: f.stripeEvents ?? [] };
+  return { tickets: (raw as TicketsFile).tickets };
 }
 
 export class TicketStore {
   private store: JsonStore<TicketsFile>;
 
   constructor(path: string) {
-    this.store = new JsonStore(path, validate, { tickets: [], stripeEvents: [] }, 'tickets', 0o600);
+    this.store = new JsonStore(path, validate, { tickets: [] }, 'tickets', 0o600);
   }
   startWatching(): void {
     this.store.startWatching();
@@ -88,6 +88,11 @@ export class TicketStore {
   byEmail(email: string): Ticket | undefined {
     const k = emailKey(email);
     return this.all().find((t) => emailKey(t.email) === k);
+  }
+
+  /** The ticket the ticket site's reference made, or was recorded on. */
+  byRef(ref: string): Ticket | undefined {
+    return this.all().find((t) => t.source === `api:${ref}` || t.refs?.includes(ref));
   }
 
   /**
@@ -110,6 +115,23 @@ export class TicketStore {
       return { ...f, tickets: [...f.tickets, ticket] };
     });
     return out!;
+  }
+
+  /** Note a further reference on the mailbox's existing ticket (no-op if known). */
+  addRef(email: string, ref: string): Ticket | undefined {
+    const k = emailKey(email);
+    let out: Ticket | undefined;
+    this.store.update((f) => {
+      const t = f.tickets.find((x) => emailKey(x.email) === k);
+      if (!t) return f;
+      if (t.source === `api:${ref}` || t.refs?.includes(ref)) {
+        out = t;
+        return f;
+      }
+      out = { ...t, refs: [...(t.refs ?? []), ref] };
+      return { ...f, tickets: f.tickets.map((x) => (x === t ? out! : x)) };
+    });
+    return out;
   }
 
   /** Remove the entitlement; nothing happens to an account it already made. */
@@ -139,17 +161,6 @@ export class TicketStore {
       return { ...f, tickets: f.tickets.map((x) => (x === t ? out! : x)) };
     });
     return out;
-  }
-
-  /** True the first time a Stripe event id is seen (and records it); false on a redelivery. */
-  stripeEventOnce(id: string): boolean {
-    let fresh = false;
-    this.store.update((f) => {
-      if (f.stripeEvents.includes(id)) return f;
-      fresh = true;
-      return { ...f, stripeEvents: [...f.stripeEvents, id].slice(-STRIPE_EVENTS_KEPT) };
-    });
-    return fresh;
   }
 }
 

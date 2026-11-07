@@ -24,7 +24,7 @@ Env: `HN_DOMAIN` (default `id.animalabs.ai`), `HN_PUBLIC_URL`, `HN_BIND`, `HN_PO
 `HN_DATA_DIR`, `HN_CONFIG_DIR`, `HN_BOT_TOKEN` (optional; also re-checks Discord roles live
 when a Discord-linked person signs in another way), `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`
 (optional; Google login), `EMAIL_PROVIDER` + `RESEND_API_KEY` + `EMAIL_FROM` and
-`STRIPE_WEBHOOK_SECRET` (optional; ticket holders' email sign-in, below). First run generates `data/issuer-key.pem`
+`HN_TICKETS_TOKEN` (optional; ticket holders' email sign-in, below). First run generates `data/issuer-key.pem`
 (0600) — **the** issuer key; guard it, never commit it. `data/accounts.json` (0600) holds
 password hashes, TOTP secrets and passkey keys — back it up with the issuer key, and guard it
 the same way.
@@ -131,12 +131,15 @@ instead (**Email → Send a code** on `/account`) and the ticket is taken up by 
 
 Tickets arrive two ways:
 
-- **Stripe**: register `https://<HN_DOMAIN>/stripe/webhook` in the Stripe dashboard for the
-  `checkout.session.completed` event (also honoured: `payment_intent.succeeded` when it carries a
-  `receipt_email`), and set its signing secret as `STRIPE_WEBHOOK_SECRET`. A paid checkout's address
-  gets a ticket (source `stripe:<event id>`; redeliveries are recognised by event id). Nothing else
-  about the payment is kept. Unset = the route is 404.
-- **`hn ticket add <email>`** by hand.
+- **The ticket site calls `POST /tickets`.** It has verified the payment and holds the buyer's address;
+  this node never talks to a payment provider. The call carries `Authorization: Bearer <HN_TICKETS_TOKEN>`
+  (compared in constant time; unset = the routes are 404) and `{"email", "ref", "note"?, "scopes"?,
+  "audiences"?}` — `ref` is the site's own reference for the purchase (source `api:<ref>`). 201 made,
+  200 when that ref is already known (the same entry back), or when the mailbox already holds a ticket
+  (the first one stands; the extra ref is recorded on it). `GET /tickets/<email>` → `{held, claimedBy?,
+  addedAt?}`; `DELETE /tickets/<email>` → 204 removes the entitlement for future sign-ups only (an account
+  already made is untouched), 404 if absent. Per-client-IP rate limited like the other POSTs.
+- **`hn ticket add <email>`** by hand (source `admin:<who>`).
 
 What a ticket grants comes from `config/ticket-defaults.json` (copy `config/ticket-defaults.example.json`; hot-reloaded,
 a typo'd file is refused and the last good one stays) unless `hn ticket add` says otherwise. The grant
@@ -172,7 +175,7 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 | `audiences.json` | the services: login redirect, scopes a login must hold, API and MCPL endpoints (`/services`) |
 | `roles.json` | Discord guild roles → scopes (only with Discord on) |
 | `invite-policy.json` | the sponsor console: who may open it, which scopes a sponsor may pass to their agent, what every invite and every anchored invite carries, which audiences follow from which scopes |
-| `ticket-defaults.json` | what a ticket grants by default (audiences + scopes), for the Stripe webhook and `hn ticket add` without flags |
+| `ticket-defaults.json` | what a ticket grants by default (audiences + scopes), for the ticket site's `POST /tickets` and `hn ticket add` without flags |
 
 `invite-policy.json` is optional — without it the console is off and says so. Anima's is
 `config/invite-policy.example.json`; the format, in full, is at the top of `src/policy.ts`. In short:

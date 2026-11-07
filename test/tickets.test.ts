@@ -15,7 +15,7 @@ test('tickets: one per mailbox — Gmail dots and +suffix, and case, are the sam
   assert.equal(a.created, true);
   assert.equal(a.ticket.email, 'Jo.Anne+coev@GMail.com');
   assert.equal(a.ticket.note, 'x');
-  const again = store.add({ email: 'joanne@googlemail.com', source: 'stripe:evt_1', audiences: [], scopes: [] });
+  const again = store.add({ email: 'joanne@googlemail.com', source: 'api:ref-1', audiences: [], scopes: [] });
   assert.equal(again.created, false);
   assert.equal(again.ticket.source, 'admin:test'); // the first one stands
   assert.equal(store.all().length, 1);
@@ -29,22 +29,26 @@ test('tickets: one per mailbox — Gmail dots and +suffix, and case, are the sam
   assert.throws(() => store.add({ email: 'not-an-address', source: 'admin:test', audiences: [], scopes: [] }));
 });
 
-test('tickets: claim is first-come and sticks; remove keeps nothing; a replayed Stripe event id is seen once', () => {
+test('tickets: claim is first-come and sticks; remove keeps nothing; refs find the ticket they were recorded on', () => {
   const dir = fresh();
   const store = new TicketStore(join(dir, 'tickets.json'));
-  store.add({ email: 'a@example.org', source: 'stripe:evt_a', audiences: ['members'], scopes: ['members:member'] });
+  store.add({ email: 'a@example.org', source: 'api:ref-a', audiences: ['members'], scopes: ['members:member'] });
   assert.equal(store.claim('A@example.org', 'human:email:one')!.claimedBy, 'human:email:one');
   assert.equal(store.claim('a@example.org', 'human:email:two'), undefined); // someone else's now
   assert.equal(store.claim('a@example.org', 'human:email:one')!.claimedBy, 'human:email:one'); // idempotent
   assert.equal(store.claim('nobody@example.org', 'human:email:one'), undefined);
   assert.ok(store.byEmail('a@example.org')!.claimedAt);
+  assert.equal(store.byRef('ref-a')!.email, 'a@example.org');
+  assert.equal(store.byRef('ref-b'), undefined);
+  assert.deepEqual(store.addRef('A@example.org', 'ref-b')!.refs, ['ref-b']);
+  assert.deepEqual(store.addRef('a@example.org', 'ref-b')!.refs, ['ref-b']); // known: no-op
+  assert.deepEqual(store.addRef('a@example.org', 'ref-a')!.refs, ['ref-b']); // the source ref: no-op
+  assert.equal(store.byRef('ref-b')!.email, 'a@example.org');
+  assert.equal(store.addRef('nobody@example.org', 'r'), undefined);
   assert.equal(store.remove('a@example.org')!.email, 'a@example.org');
   assert.equal(store.remove('a@example.org'), undefined);
   assert.equal(store.byEmail('a@example.org'), undefined);
-  assert.equal(store.stripeEventOnce('evt_1'), true);
-  assert.equal(store.stripeEventOnce('evt_1'), false);
-  assert.equal(store.stripeEventOnce('evt_2'), true);
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8')).stripeEvents, ['evt_1', 'evt_2']);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'tickets.json'), 'utf8')), { tickets: [] });
 });
 
 test('tickets: a malformed file is refused (duplicate mailbox, bad shape)', () => {
@@ -52,6 +56,7 @@ test('tickets: a malformed file is refused (duplicate mailbox, bad shape)', () =
   assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: ['x'], scopes: [] }, { email: 'A@B.CO', source: 's', addedAt: 't', audiences: [], scopes: [] }] })!, /two tickets/);
   assert.match(ticketsProblem({ tickets: [{ email: 'nope', source: 's', addedAt: 't', audiences: [], scopes: [] }] })!, /email/);
   assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: [7], scopes: [] }] })!, /audiences/);
+  assert.match(ticketsProblem({ tickets: [{ email: 'a@b.co', source: 's', addedAt: 't', audiences: [], scopes: [], refs: 'x' }] })!, /refs/);
   assert.match(ticketsProblem({ tickets: {} })!, /not a tickets file/);
   const dir = fresh();
   writeFileSync(join(dir, 'tickets.json'), '{ nope');

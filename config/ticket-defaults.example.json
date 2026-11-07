@@ -1,5 +1,5 @@
 {
-  "_": "What a ticket grants unless `hn ticket add` says otherwise (the Stripe webhook always uses these). Copy to config/ticket-defaults.json; the audiences must be in audiences.json.",
+  "_": "What a ticket grants unless `hn ticket add` says otherwise (the ticket site's POST /tickets uses these unless it sends its own). Copy to config/ticket-defaults.json; the audiences must be in audiences.json.",
   "audiences": ["members"],
   "scopes": ["members:member"]
 }

@@ -1,6 +1,7 @@
 /**
  * Ticket holders sign in by email: a real HomeNode on a random port, the
- * mail caught at the EmailSender seam, Stripe's webhook signed for real.
+ * mail caught at the EmailSender seam, tickets arriving through the ticket
+ * site's API.
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,11 +11,10 @@ import { join } from 'node:path';
 import { HomeNode, type ServerConfig } from '../src/server.js';
 import { verifyToken, type Aid1Payload } from '../src/token.js';
 import { hashPassword } from '../src/accounts.js';
-import { signStripePayload } from '../src/stripe.js';
 import { EMAIL_SENT_MESSAGE } from '../src/human.js';
 import type { EmailSender } from '../src/email.js';
 
-const SECRET = 'whsec_test';
+const TOKEN = 'tickets-token-test';
 let node: HomeNode;
 let base: string;
 let ipSeq = 0;
@@ -34,7 +34,7 @@ function makeNode(extra: Partial<ServerConfig> = {}, opts: { email?: EmailSender
   }));
   if (opts.defaults !== null) writeFileSync(join(dir, 'ticket-defaults.json'), JSON.stringify(opts.defaults ?? { audiences: ['members'], scopes: ['members:member'] }));
   return new HomeNode(
-    { iss: 'id.test', publicUrl: 'https://id.test', bind: '127.0.0.1', port: 0, dataDir: dir, configDir: dir, stripeWebhookSecret: SECRET, ...extra },
+    { iss: 'id.test', publicUrl: 'https://id.test', bind: '127.0.0.1', port: 0, dataDir: dir, configDir: dir, ticketsToken: TOKEN, ...extra },
     { ...(opts.email === null ? {} : { email: opts.email ?? sender }) },
   );
 }
@@ -69,17 +69,16 @@ function tokenFrom(redirect: string, aud: string, n = node): Aid1Payload {
   return v.payload;
 }
 const rawToken = (redirect: string) => /#token=(.+)$/.exec(redirect)![1]!;
-async function webhook(event: unknown, opts: { secret?: string; t?: number; header?: string; b?: string } = {}) {
-  const body = JSON.stringify(event);
-  const r = await fetch((opts.b ?? base) + '/stripe/webhook', {
-    method: 'POST', body,
-    headers: hdrs({ 'content-type': 'application/json', 'stripe-signature': opts.header ?? signStripePayload(body, opts.secret ?? SECRET, opts.t) }),
+/** The ticket site's call. */
+async function api(method: 'POST' | 'GET' | 'DELETE', path: string, body?: unknown, opts: { token?: string | null; b?: string } = {}) {
+  const r = await fetch((opts.b ?? base) + path, {
+    method, ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    headers: hdrs({ 'content-type': 'application/json', ...(opts.token === null ? {} : { authorization: `Bearer ${opts.token ?? TOKEN}` }) }),
   });
-  return { status: r.status, body: (await r.json()) as Record<string, any> };
+  const text = await r.text();
+  return { status: r.status, body: (text ? JSON.parse(text) : null) as Record<string, any> | null };
 }
-const checkout = (id: string, email: string | null, type = 'checkout.session.completed') => ({
-  id, type, data: { object: { object: 'checkout.session', ...(email ? { customer_details: { email } } : {}) } },
-});
+const addTicket = (email: string, ref: string, extra: Record<string, unknown> = {}, b?: string) => api('POST', '/tickets', { email, ref, ...extra }, { b });
 async function emailLogin(email: string, audience: string, code?: string) {
   const state = await loginState(audience);
   const begin = await post('/login/email/begin', { state, email });
@@ -87,33 +86,59 @@ async function emailLogin(email: string, audience: string, code?: string) {
   return post('/login/email/finish', { state, email, code: code ?? lastCode(email) });
 }
 
-test('stripe webhook: a signed checkout adds a ticket with the configured defaults; redeliveries, bad signatures and other events add nothing', async () => {
-  const ok = await webhook(checkout('evt_1', 'Pat.Buyer+x@gmail.com'));
-  assert.deepEqual(ok, { status: 200, body: { received: true, ticket: 'added' } });
+test('tickets API: bearer-gated; POST makes a ticket with the configured defaults (201), knows a ref again (200), keeps the first ticket per mailbox; GET and DELETE', async () => {
+  // no token, a wrong one, the wrong shape: 401, nothing made
+  for (const token of [null, 'nope', `${TOKEN}x`, TOKEN.slice(0, -1)]) {
+    assert.equal((await api('POST', '/tickets', { email: 'x@y.co', ref: 'r' }, { token })).status, 401, String(token));
+  }
+  assert.equal((await api('GET', '/tickets/x%40y.co', undefined, { token: null })).status, 401);
+  assert.equal(node.tickets.byEmail('x@y.co'), undefined);
+
+  const made = await addTicket('Pat.Buyer+x@gmail.com', 'tickets:human:1', { note: 'front row' });
+  assert.equal(made.status, 201, JSON.stringify(made.body));
+  assert.equal(made.body!.created, true);
+  assert.equal(made.body!.ticket.note, undefined); // the view keeps the note to the operator
   const t = node.tickets.byEmail('patbuyer@gmail.com')!;
   assert.equal(t.email, 'Pat.Buyer+x@gmail.com');
-  assert.equal(t.source, 'stripe:evt_1');
+  assert.equal(t.source, 'api:tickets:human:1');
+  assert.equal(t.note, 'front row');
   assert.deepEqual(t.audiences, ['members']);
   assert.deepEqual(t.scopes, ['members:member']);
-  // the same event again (Stripe retries): seen, nothing added
-  assert.deepEqual((await webhook(checkout('evt_1', 'pat.buyer@gmail.com'))).body, { received: true, duplicate: 'evt_1' });
-  // a second purchase with the same mailbox: still the one ticket
-  assert.deepEqual((await webhook(checkout('evt_2', 'patbuyer@googlemail.com'))).body, { received: true, ticket: 'existing' });
+  // the same ref again (a retry): 200, the same entry
+  const again = await addTicket('pat.buyer@gmail.com', 'tickets:human:1');
+  assert.equal(again.status, 200);
+  assert.deepEqual(again.body, { ticket: made.body!.ticket, created: false });
+  // the same mailbox with a new ref (a second purchase): 200, the first ticket stands, the ref is recorded
+  const second = await addTicket('patbuyer@googlemail.com', 'tickets:human:2');
+  assert.equal(second.status, 200);
+  assert.equal(second.body!.ticket.source, 'api:tickets:human:1');
+  assert.deepEqual(second.body!.ticket.refs, ['tickets:human:2']);
+  assert.equal((await addTicket('other@example.org', 'tickets:human:2')).body!.ticket.email, 'Pat.Buyer+x@gmail.com'); // that ref is spoken for
   assert.equal(node.tickets.all().length, 1);
-  // refused: wrong secret, stale timestamp, no header, garbage body
-  assert.equal((await webhook(checkout('evt_3', 'x@y.co'), { secret: 'whsec_wrong' })).status, 400);
-  assert.equal((await webhook(checkout('evt_3', 'x@y.co'), { t: Math.floor(Date.now() / 1000) - 600 })).status, 400);
-  assert.equal((await webhook(checkout('evt_3', 'x@y.co'), { header: '' })).status, 400);
-  assert.equal(node.tickets.byEmail('x@y.co'), undefined);
-  const garbage = await fetch(base + '/stripe/webhook', { method: 'POST', body: 'nope', headers: hdrs({ 'stripe-signature': signStripePayload('nope', SECRET) }) });
-  assert.equal(garbage.status, 400);
-  // other events, and a payment without an address: 200, ignored
-  assert.deepEqual((await webhook({ id: 'evt_4', type: 'customer.created', data: { object: { email: 'c@d.co' } } })).body, { received: true, ignored: 'customer.created' });
-  assert.deepEqual((await webhook(checkout('evt_5', null, 'payment_intent.succeeded'))).body, { received: true, ignored: 'payment_intent.succeeded' });
-  assert.equal(node.tickets.all().length, 1);
-  // a payment intent that does carry an address
-  assert.deepEqual((await webhook({ id: 'evt_6', type: 'payment_intent.succeeded', data: { object: { receipt_email: 'pi@example.org' } } })).body, { received: true, ticket: 'added' });
-  assert.equal(node.tickets.byEmail('pi@example.org')!.source, 'stripe:evt_6');
+  // its own grant
+  const own = await addTicket('vip@example.org', 'tickets:human:3', { scopes: ['members:member', 'extra:use'], audiences: ['members', 'gate'] });
+  assert.equal(own.status, 201);
+  assert.deepEqual(node.tickets.byEmail('vip@example.org')!.audiences, ['members', 'gate']);
+  // bad input
+  assert.equal((await addTicket('not-an-address', 'r')).status, 400);
+  assert.equal((await api('POST', '/tickets', { email: 'a@b.co' })).status, 400);
+  assert.equal((await addTicket('a@b.co', 'r', { scopes: 'members:member' })).status, 400);
+  assert.equal((await api('POST', '/tickets', undefined)).status, 400);
+  // GET: held or not, and who took it up
+  assert.deepEqual((await api('GET', '/tickets/' + encodeURIComponent('pat.buyer@gmail.com'))).body, { held: true, addedAt: t.addedAt });
+  assert.deepEqual((await api('GET', '/tickets/nobody%40example.org')).body, { held: false });
+  assert.equal((await api('GET', '/tickets/nope')).status, 400);
+  assert.equal((await api('GET', '/tickets/%E0%A4%A')).status, 400);
+  // DELETE: gone for future sign-ups; 404 when absent
+  assert.equal((await addTicket('gone@example.org', 'tickets:human:4')).status, 201);
+  assert.equal((await api('DELETE', '/tickets/gone%40example.org')).status, 204);
+  assert.equal(node.tickets.byEmail('gone@example.org'), undefined);
+  assert.equal((await api('DELETE', '/tickets/gone%40example.org')).status, 404);
+  assert.equal((await api('DELETE', '/tickets/nope')).status, 400);
+  outbox.length = 0;
+  const state = await loginState('members');
+  assert.equal((await post('/login/email/begin', { state, email: 'gone@example.org' })).status, 200);
+  assert.equal(outbox.length, 0); // no code for a removed ticket
 });
 
 test('begin: the same answer whether or not the address holds a ticket; a code goes out only to a holder', async () => {
@@ -167,9 +192,10 @@ test('finish: five wrong codes spend it; the right code makes a human:email: acc
   assert.equal(row.email!.address, 'Pat.Buyer@gmail.com');
   assert.ok(row.email!.verifiedAt);
   assert.deepEqual(row.ticket!.audiences, ['members']);
-  assert.equal(row.ticket!.source, 'stripe:evt_1');
+  assert.equal(row.ticket!.source, 'api:tickets:human:1');
   assert.equal(row.scopes, undefined); // the grant lives on the ticket snapshot, audience-bound
   assert.equal(node.tickets.byEmail('patbuyer@gmail.com')!.claimedBy, p.sub);
+  assert.deepEqual((await api('GET', '/tickets/patbuyer%40gmail.com')).body, { held: true, addedAt: node.tickets.byEmail('patbuyer@gmail.com')!.addedAt, claimedBy: p.sub });
   // the code is single-use
   assert.equal((await post('/login/email/finish', { state, email: 'Pat.Buyer@gmail.com', code: lastCode('Pat.Buyer@gmail.com') })).status, 400);
   // the ticket's scopes count for its audiences only
@@ -208,7 +234,7 @@ test('a second sign-up with the same mailbox is the same account; spelling, case
 });
 
 test('a ticket without an account yet, removed before the code comes back: refused; a ticket whose account dropped its email can’t make a second account', async () => {
-  await webhook(checkout('evt_7', 'late@example.org'));
+  await addTicket('late@example.org', 'tickets:human:7');
   const state = await loginState('members');
   await post('/login/email/begin', { state, email: 'late@example.org' });
   node.tickets.remove('late@example.org');
@@ -240,7 +266,7 @@ test('rate limits: three codes per address and ten per client address in ten min
 
 test('link an address under sign-in settings: the code proves the mailbox, and a ticket held for it is taken up by the existing account', async () => {
   outbox.length = 0;
-  await webhook(checkout('evt_8', 'Dee.Holder@example.org'));
+  await addTicket('Dee.Holder@example.org', 'tickets:human:8');
   await node.accounts.add({ sub: 'human:local:dee', username: 'dee', password: await hashPassword('dee password 1'), createdAt: '' });
   const s = await post('/login/password', { state: await loginState('account'), username: 'dee', password: 'dee password 1' });
   const tok = rawToken(s.body.redirect);
@@ -300,8 +326,8 @@ test('the sign-in page: the Email method, prefilled from ?email= for a ticket se
   assert.doesNotMatch(junk.text, /alert\(1\)/);
 });
 
-test('no EMAIL_PROVIDER: the method is hidden and its routes are off; no STRIPE_WEBHOOK_SECRET: the webhook is 404', async () => {
-  const n2 = makeNode({ stripeWebhookSecret: undefined }, { email: null });
+test('no EMAIL_PROVIDER: the method is hidden and its routes are off; no HN_TICKETS_TOKEN: the tickets API is 404', async () => {
+  const n2 = makeNode({ ticketsToken: undefined }, { email: null });
   const b2 = `http://127.0.0.1:${await n2.start()}`;
   try {
     assert.equal(n2.email, null);
@@ -314,19 +340,20 @@ test('no EMAIL_PROVIDER: the method is hidden and its routes are off; no STRIPE_
     const state = await loginState('members', b2);
     assert.equal((await post('/login/email/begin', { state, email: 'holder@example.org' }, undefined, {}, b2)).status, 404);
     assert.equal((await post('/login/email/finish', { state, email: 'holder@example.org', code: '123456' }, undefined, {}, b2)).status, 404);
-    assert.equal((await webhook(checkout('evt_9', 'x@y.co'), { b: b2 })).status, 404);
+    assert.equal((await addTicket('x@y.co', 'r9', {}, b2)).status, 404);
+    assert.equal((await api('GET', '/tickets/x%40y.co', undefined, { b: b2 })).status, 404);
     assert.equal(n2.tickets.byEmail('x@y.co'), undefined);
   } finally {
     n2.stop();
   }
 });
 
-test('no config/ticket-defaults.json: a Stripe ticket grants nothing (it still signs the holder in, to nothing)', async () => {
+test('no config/ticket-defaults.json: a ticket the site sends without a grant holds nothing (it still signs the holder in, to nothing)', async () => {
   const n2 = makeNode({}, { defaults: null });
   const b2 = `http://127.0.0.1:${await n2.start()}`;
   try {
     assert.equal(n2.ticketDefaults.get().configured, false);
-    assert.deepEqual((await webhook(checkout('evt_10', 'bare@example.org'), { b: b2 })).body, { received: true, ticket: 'added' });
+    assert.equal((await addTicket('bare@example.org', 'r10', {}, b2)).status, 201);
     assert.deepEqual(n2.tickets.byEmail('bare@example.org')!.audiences, []);
     const state = await loginState('members', b2);
     await post('/login/email/begin', { state, email: 'bare@example.org' }, undefined, {}, b2);
