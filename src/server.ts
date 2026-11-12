@@ -39,7 +39,7 @@ import {
   type AudiencesConfig,
   type RolesConfig,
 } from './stores.js';
-import type { JsonStore } from './stores.js';
+import type { Invite, JsonStore } from './stores.js';
 
 export interface ServerConfig {
   iss: string; // e.g. id.animalabs.ai
@@ -174,6 +174,11 @@ export class HomeNode {
       invitePolicy: this.invitePolicy,
       allow: (ip) => this.limiter.allow(ip),
       fetchImpl: opts.fetchImpl,
+      ticketInvites: {
+        mint: (t, agentName) => this.mintTicketInvite(t, agentName, 'account'),
+        list: (t) => this.ticketInviteList(t),
+        revoke: (t, code) => this.revokeTicketInvite(t, code),
+      },
     });
   }
 
@@ -414,6 +419,57 @@ export class HomeNode {
     return { disabled: false, sponsor: { sub: ticketPlaceholderSub(t), name: t.name || TICKET_HOLDER_NAME, scopes: [...t.scopes] } };
   }
 
+  /** An invite for an agent coming with this ticket's holder: the ticket's own reach and budget
+   *  (config/ticket-defaults.json), whether the ticket site asks or the holder does on /account. */
+  private mintTicketInvite(t: Ticket, agentName: string | undefined, by: 'tickets' | 'account'):
+    | { ok: true; invite: Invite }
+    | { ok: false; status: number; body: Record<string, unknown> } {
+    const d = this.ticketDefaults.get();
+    if (!d.configured) return { ok: false, status: 503, body: { error: `no invite can be made: ${noDefaultsMessage(this.cfg.configDir)}` } };
+    const { sponsor, disabled } = this.ticketSponsor(t);
+    if (disabled) return { ok: false, status: 403, body: { error: 'account disabled' } };
+    // ever minted for this ticket — claimed, revoked, expired all count
+    if ((t.invitesMinted ?? 0) >= d.invites.lifetime) return { ok: false, status: 409, body: { error: 'budget', reason: 'lifetime' } };
+    const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), sponsor, agentName || undefined, {
+      gate: false, knownAudiences: Object.keys(this.audiences.get()),
+      // the ticket's own reach, whatever the policy's rules would add
+      restrict: { audiences: t.audiences, scopes: [...new Set([...t.scopes, ...d.allowed.scopes])] },
+      budget: { active: d.invites.active }, sponsorSubs: ticketSponsorSubs(t), ticket: t.id,
+    });
+    if (!r.ok) return { ok: false, status: r.status === 429 ? 409 : r.status, body: r.status === 429 ? { error: 'budget', reason: r.budget } : { error: r.error } };
+    this.tickets.countInvite(t.id);
+    this.mintLog.append({
+      at: new Date().toISOString(), sub: sponsor.sub, aud: 'console',
+      scopes: r.invite.scopes, exp: Math.floor(Date.parse(r.invite.expiresAt!) / 1000), by,
+    });
+    console.error(`[hn] ${by === 'tickets' ? 'tickets api' : 'account'}: ${sponsor.sub} (${sponsor.name}) minted invite ${r.invite.code} for ticket ${t.id} [${r.invite.scopes.join(' ')}] → ${r.invite.audiences!.join(', ')}`);
+    return { ok: true, invite: r.invite };
+  }
+
+  /** The invites made for a ticket (by the ticket site, or by its holder): unclaimed ones show their code. */
+  private ticketInviteList(t: Pick<Ticket, 'id' | 'claimedBy'>): Array<Record<string, unknown>> {
+    const subs = ticketSponsorSubs(t);
+    return this.invites.all().filter((i) => i.ticket === t.id || (i.sponsor && subs.includes(i.sponsor) && !i.ticket)).map((i) => {
+      const claimed = (i.uses ?? 0) >= (i.maxUses ?? 1);
+      const enrolled = claimed ? this.principals.all().find((p) => p.notes?.includes(`invite ${i.code}`)) : undefined;
+      return {
+        ...(claimed ? {} : { code: i.code }),
+        createdAt: i.createdAt ?? null, expiresAt: i.expiresAt ?? null,
+        ...(enrolled ? { claimedBy: enrolled.sub } : {}),
+        ...(i.label ? { agentName: i.label } : {}),
+      };
+    });
+  }
+
+  /** Withdraws an unclaimed invite made for this ticket. */
+  private revokeTicketInvite(t: Pick<Ticket, 'id'>, code: string): boolean {
+    const inv = this.invites.all().find((i) => i.code === code && i.ticket === t.id);
+    if (!inv || (inv.uses ?? 0) >= (inv.maxUses ?? 1)) return false;
+    this.invites.revoke(inv.code);
+    console.error(`[hn] invite ${inv.code} of ticket ${t.id} withdrawn`);
+    return true;
+  }
+
   /** The ticket `email` and/or `ref` name — both, when both are given, must
    *  name the same one. Also a refunded ticket, for the listing. */
   private ticketFor(email: string, ref: string): { live?: Ticket; gone?: RemovedTicket } | null {
@@ -451,25 +507,8 @@ export class HomeNode {
       const found = this.ticketFor(email, ref);
       const t = found?.live;
       if (!t) return json(res, 404, { error: 'no_ticket' });
-      const d = this.ticketDefaults.get();
-      if (!d.configured) return json(res, 503, { error: `no invite can be made: ${noDefaultsMessage(this.cfg.configDir)}` });
-      const { sponsor, disabled } = this.ticketSponsor(t);
-      if (disabled) return json(res, 403, { error: 'account disabled' });
-      // ever minted for this ticket — claimed, revoked, expired all count
-      if ((t.invitesMinted ?? 0) >= d.invites.lifetime) return json(res, 409, { error: 'budget', reason: 'lifetime' });
-      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), sponsor, agentName || undefined, {
-        gate: false, knownAudiences: Object.keys(this.audiences.get()),
-        // the ticket's own reach, whatever the policy's rules would add
-        restrict: { audiences: t.audiences, scopes: [...new Set([...t.scopes, ...d.allowed.scopes])] },
-        budget: { active: d.invites.active }, sponsorSubs: ticketSponsorSubs(t), ticket: t.id,
-      });
-      if (!r.ok) return json(res, r.status === 429 ? 409 : r.status, r.status === 429 ? { error: 'budget', reason: r.budget } : { error: r.error });
-      this.tickets.countInvite(t.id);
-      this.mintLog.append({
-        at: new Date().toISOString(), sub: sponsor.sub, aud: 'console',
-        scopes: r.invite.scopes, exp: Math.floor(Date.parse(r.invite.expiresAt!) / 1000), by: 'tickets',
-      });
-      console.error(`[hn] tickets api: ${sponsor.sub} (${sponsor.name}) minted invite ${r.invite.code} for ticket ${t.id} [${r.invite.scopes.join(' ')}] → ${r.invite.audiences!.join(', ')}`);
+      const r = this.mintTicketInvite(t, agentName, 'tickets');
+      if (!r.ok) return json(res, r.status, r.body);
       return json(res, 201, {
         code: r.invite.code, enrolUrl: `${this.cfg.publicUrl}/enroll`, expiresAt: r.invite.expiresAt, agentsMd: `${this.cfg.publicUrl}/agents.md`,
       });
@@ -478,18 +517,7 @@ export class HomeNode {
       const found = this.ticketFor(clean(url.searchParams.get('email'), 254), clean(url.searchParams.get('ref'), 200));
       const t = found?.live ?? found?.gone;
       if (!t) return json(res, 404, { error: 'no_ticket' });
-      const subs = ticketSponsorSubs(t);
-      const invites = this.invites.all().filter((i) => i.ticket === t.id || (i.sponsor && subs.includes(i.sponsor) && !i.ticket)).map((i) => {
-        const claimed = (i.uses ?? 0) >= (i.maxUses ?? 1);
-        const enrolled = claimed ? this.principals.all().find((p) => p.notes?.includes(`invite ${i.code}`)) : undefined;
-        return {
-          ...(claimed ? {} : { code: i.code }),
-          createdAt: i.createdAt ?? null, expiresAt: i.expiresAt ?? null,
-          ...(enrolled ? { claimedBy: enrolled.sub } : {}),
-          ...(i.label ? { agentName: i.label } : {}),
-        };
-      });
-      return json(res, 200, { invites, ...(found?.gone ? { refunded: true, removedAt: found.gone.removedAt } : {}) });
+      return json(res, 200, { invites: this.ticketInviteList(t), ...(found?.gone ? { refunded: true, removedAt: found.gone.removedAt } : {}) });
     }
     json(res, 404, { error: 'not found' });
   }

@@ -198,6 +198,13 @@ ticket's name. `GET /tickets/invites?email=…` (or `?ref=…`) lists them (`cod
 `claimedBy` once an agent enrolled; a refunded ticket still lists, with `refunded: true`);
 `DELETE /tickets/invites/<code>` revokes an unclaimed one. A refund revokes the ticket's unclaimed invites
 and strips every scope and audience from the agents enrolled through them (they keep their identity).
+
+**Holders make them on `/account` too.** An account that took up a ticket gets an **Agents** card on its
+sign-in settings page: make an invite (optional agent name), see each one's state, withdraw an unused one.
+Same reach and budget as the ticket site's call above (one implementation, `mintTicketInvite` in
+`server.ts`), and the ticket site's `GET /tickets/invites` lists them too. Routes (account token):
+`POST /account/agents {agentName?}`, `POST /account/agents/list`, `POST /account/agents/withdraw {code}`;
+404 for an account without a ticket.
 `GET /enroll` is a short page pointing at `/agents.md`, so `enrolUrl` is usable in a browser.
 
 Sending mail: `EMAIL_PROVIDER=resend` with `RESEND_API_KEY` and `EMAIL_FROM` (e.g.
