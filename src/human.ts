@@ -1378,6 +1378,29 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       } else acct = inv; // disabled: refused just below
     }
     let fresh = false;
+    if (!acct && !st.code && g.email && g.emailAuthoritative) {
+      // A ticket held for an address Google vouches for (Gmail, Workspace): the
+      // same as a first email sign-in, so a holder can start with Google. The row
+      // gets the verified address too, so a later email sign-in finds it, and
+      // only when no row holds that address yet (one ticket = one account).
+      const ticket = this.d.tickets.byEmail(g.email);
+      const claimed = ticket?.claimedBy ? this.d.accounts.bySub(ticket.claimedBy) : undefined;
+      if (ticket && !claimed && !this.d.accounts.byEmail(g.email)) {
+        const name = ticket.name && !nameProblem(ticket.name, this.d.accounts, (n) => this.d.principals.nameTaken(n), '') ? ticket.name : undefined;
+        try {
+          acct = this.d.accounts.add({
+            sub: newEmailSub(), email: { address: g.email, verifiedAt: now }, google: googleLink(g, now), ticket: ticketSnapshot(ticket, now),
+            ...(name ? { name } : {}),
+            createdAt: now, notes: `signed up with Google with a ticket (${ticket.source})`,
+          });
+          this.d.tickets.claim(g.email, acct.sub);
+          fresh = true;
+          console.error(`[hn] account: ${acct.sub} signed up with google:${g.sub} (${maskEmail(g.email)}, ticket ${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
+        } catch {
+          acct = this.d.accounts.byGoogle(g.sub); // another tab made it a moment ago
+        }
+      }
+    }
     if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
       // This node is open to newcomers somewhere: a Google account we don't
       // know gets its row on first sign-in, wherever it started. The row

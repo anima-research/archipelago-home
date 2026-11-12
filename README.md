@@ -46,8 +46,11 @@ exists — one that linked Google at `/account`, or one the operator invited by 
 is **authoritative** for that address: Gmail, or a Google Workspace account. For any other address
 `email_verified` only means the address was checked once (the mailbox may have changed hands), so
 such an invite can't be claimed through Google — send a setup link instead and they link Google
-after. From then on the link is by Google's account id, not the address. A Google account the node
-doesn't know gets an empty row only while an audience is open to newcomers (below).
+after. From then on the link is by Google's account id, not the address. A ticket held for an
+address Google is authoritative for works the same way: the first Google sign-in makes the account
+(with that address verified on it, so email sign-in finds the same account) and claims the ticket,
+unless an account already holds the address; that one links Google at `/account`. A Google account
+the node doesn't know gets an empty row only while an audience is open to newcomers (below).
 
 An account made by a Google sign-in (`human:google:<sub>`) can't unlink Google — it *is* that
 identity, as `human:discord:` rows are for Discord. Nor can an account the operator restricted
