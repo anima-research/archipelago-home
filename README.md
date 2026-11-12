@@ -216,13 +216,14 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 
 | file | says |
 |---|---|
-| `audiences.json` | the services: login redirect, scopes a login must hold, API and MCPL endpoints (`/services`) |
+| `audiences.json` | the services: login redirect, scopes a login must hold, API and MCPL endpoints (`/services`); optional `name`, `description` and `url` list a service on the home page. Admins edit it from `/account` |
+| `site.json` | optional: what the node is called for people — `{"name": "…", "description": "…"}` — on the home page and every page's header (default: the issuer domain) |
 | `roles.json` | Discord guild roles → scopes (only with Discord on) |
 | `invite-policy.json` | the sponsor console: who may open it, which scopes a sponsor may pass to their agent, what every invite and every anchored invite carries, which audiences follow from which scopes |
 | `ticket-defaults.json` | what a ticket grants by default (audiences + scopes) and the most one may carry (`allowed`), for the ticket site's `POST /tickets` and `hn ticket add` |
 | `agents.md` | optional: this deployment's own `/agents.md` in place of the repo's `docs/AGENTS.md` |
 
-`invite-policy.json` is optional — without it the console is off and says so. Anima's is
+`invite-policy.json` is optional — without it agent invites are off and the account page says nothing of them. The console's gate (`console.requiredScopes`) decides who sees **Invites for your agents** on `/account` (the console's page is part of the account page now; `/console` points there, and its JSON API stays for scripts). Anima's is
 `config/invite-policy.example.json`; the format, in full, is at the top of `src/policy.ts`. In short:
 
 ```jsonc
@@ -246,6 +247,22 @@ A sponsor passes on (their scopes ∩ `delegable`) — never more than they hold
 every invite; an `id:anchor` holder also grants `anchorGrantable` outright, and an anchored invite
 carries every `resident` scope. A scope the file doesn't mention is never granted through the
 console.
+
+## Pages for people, and the node's admins
+
+- `/` says what Archipelago is, links to signing in and to `/agents.md`, lists the services that have a
+  `name` in `audiences.json`, and keeps the issuer key under *Technical details*.
+- `/enroll` in a browser explains that agents enroll themselves, and what to do with an invite code.
+- `/account` is the one page for a signed-in person: how they sign in; **Invites for your agents** when the
+  console's gate admits them; and, for admins, **Admin**.
+- **Admins** are people holding the operator scope `hn:admin` (`hn user set <who> --scopes hn:admin,…`;
+  `--scopes` replaces the list). On `/account` they edit audiences (name, description, link, sign-in return
+  address, API and MCPL addresses, required scopes; add or remove; each save keeps
+  `audiences.json.bak-<time>` and leaves fields it doesn't show as they were), see people (how they sign in,
+  ticket, operator scopes) and grant or withdraw scopes or disable and enable them, see agents, and make
+  agent invites when the console's gate lists `hn:admin`. An admin can't disable themselves or drop their own
+  `hn:admin` from the page. Routes: `POST /account/admin/{audiences, audiences/save, audiences/remove,
+  people, people/set, agents}` and `POST /account/invites{,/list,/withdraw}`, account token, JSON.
 
 ## Operator CLI
 

@@ -408,6 +408,11 @@ export function rolesStore(path: string): JsonStore<RolesConfig> {
 export interface AudienceConfig {
   /** Where the login token is delivered (URL fragment): e.g. https://worlds…/auth */
   redirect: string;
+  /** For people: the service's name, a line about it, and where it lives. An audience with a name is listed
+   *  on the node's home page; without one it isn't (an API-only audience, say). */
+  name?: string;
+  description?: string;
+  url?: string;
   /** Scopes a login must have earned (via roles) to get a token for this
    *  audience at all — refusal happens at the login page, with the friendly
    *  "you need the X role" message, instead of at the service. */
@@ -551,7 +556,7 @@ export interface MintRecord {
   aud: string;
   scopes: string[];
   exp: number;
-  by: 'oauth' | 'google' | 'password' | 'passkey' | 'email' | 'setup' | 'exchange' | 'enroll' | 'cli' | 'tickets';
+  by: 'oauth' | 'google' | 'password' | 'passkey' | 'email' | 'setup' | 'exchange' | 'enroll' | 'cli' | 'tickets' | 'account' | 'admin';
 }
 
 export class MintLog {

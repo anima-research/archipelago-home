@@ -37,6 +37,9 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { copyFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { ANCHOR_SCOPE, mintSponsoredInvite, sponsorInviteView } from './console.js';
 import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
@@ -51,6 +54,7 @@ import {
   signupGrant,
   type AudiencesConfig,
   type JsonStore,
+  type InviteStore,
   type MintLog,
   type MintRecord,
   type PrincipalStore,
@@ -85,7 +89,8 @@ import { qrSvg } from './qr.js';
 import { clientDataChallenge, COSE_ALGS, verifyAssertion, verifyRegistration, type RelyingParty } from './webauthn.js';
 import { esc, html, json, page, readJson, redirect, securePage } from './http.js';
 import { consoleRequiredScopes, type InvitePolicy } from './policy.js';
-import { accountPage, loginPage, setupPage } from './pages.js';
+import { accountPage, loginPage, setupPage, type PageSite } from './pages.js';
+import type { SiteInfo } from './site.js';
 
 const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
@@ -108,6 +113,8 @@ const MAX_PENDING = 10_000;
 export interface HumanConfig {
   iss: string;
   publicUrl: string;
+  /** Where the config files live: admins' audience edits are written there (with a backup). */
+  configDir?: string;
   discordClientId?: string;
   discordClientSecret?: string;
   discordBotToken?: string;
@@ -134,6 +141,10 @@ export interface HumanDeps {
   /** Per-IP limiter shared with the other internet-facing routes. */
   allow: (ip: string) => boolean;
   fetchImpl?: FetchLike;
+  /** What the node calls itself for people (config/site.json). */
+  site: JsonStore<SiteInfo>;
+  /** Agent invites: made from the account page by people the console's gate admits. */
+  invites: InviteStore;
 }
 
 /** A link state is bound to the browser that asked for it (`nonce`, also in
@@ -216,6 +227,22 @@ function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<
   };
 }
 
+/** Holding this scope (an operator grant) makes someone one of this node's admins on the account page. */
+export const ADMIN_SCOPE = 'hn:admin';
+/** The node's own audiences: never edited from the admin page. */
+const BUILT_IN_AUDIENCES = new Set(['account', 'console']);
+const AUDIENCE_ID = /^[a-z][a-z0-9-]{0,39}$/;
+const SCOPE = /^[A-Za-z0-9:._-]{1,64}$/;
+/** https anywhere; http only for a local service (development). */
+function webUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === 'https:' || (u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname));
+  } catch {
+    return false;
+  }
+}
+
 export class HumanAuth {
   private states = new Pending<LoginState & { exp: number }>();
   private tickets = new Pending<{ sub: string; state: string; exp: number; tries: number }>();
@@ -257,6 +284,11 @@ export class HumanAuth {
   /** Link codes per account: 3 a day — a signed-in person can't use this node to mail the world. */
   private linkCodes = new Throttle(3, DAY_MS);
   readonly rp: RelyingParty;
+
+  /** The node as people know it, for the pages. */
+  private at(): PageSite {
+    return { site: this.d.site.get(), iss: this.d.cfg.iss };
+  }
 
   constructor(private d: HumanDeps) {
     const u = new URL(d.cfg.publicUrl);
@@ -303,8 +335,8 @@ export class HumanAuth {
       // The static pages and /account/me are cheap and unlimited (people
       // behind one venue NAT share an address); everything that starts or
       // completes a sign-in is limited.
-      if (p === '/account') securePage(res, 200, (n) => accountPage(this.d.cfg.iss, n));
-      else if (p === '/account/setup') securePage(res, 200, (n) => setupPage(this.d.cfg.iss, n));
+      if (p === '/account') securePage(res, 200, (n) => accountPage(this.at(), n));
+      else if (p === '/account/setup') securePage(res, 200, (n) => setupPage(this.at(), n));
       else if (p === '/account/me') this.me(req, res);
       else if (!isLogin) return false;
       else if (!this.d.allow(ip)) json(res, 429, { error: 'too many requests — wait a minute' });
@@ -361,7 +393,179 @@ export class HumanAuth {
     '/account/code': (q, res, b) => this.withAccount(q, res, (t) => this.accountCode(res, t, b)),
     '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(res, t)),
     '/account/google/unlink': (q, res) => this.withAccount(q, res, (t) => this.googleUnlink(res, t)),
+    // agent invites (what the console was), for people its gate admits
+    '/account/invites/list': (q, res) => this.withAccount(q, res, (t) => this.invitesList(res, t)),
+    '/account/invites': (q, res, b) => this.withAccount(q, res, (t) => this.inviteMint(res, t, b)),
+    '/account/invites/withdraw': (q, res, b) => this.withAccount(q, res, (t) => this.inviteWithdraw(res, t, b)),
+    // the node's admins (hn:admin): audiences, people, agents
+    '/account/admin/audiences': (q, res) => this.withAdmin(q, res, () => this.adminAudiences(res)),
+    '/account/admin/audiences/save': (q, res, b) => this.withAdmin(q, res, (a) => this.adminAudienceSave(res, a, b)),
+    '/account/admin/audiences/remove': (q, res, b) => this.withAdmin(q, res, (a) => this.adminAudienceRemove(res, a, b)),
+    '/account/admin/people': (q, res) => this.withAdmin(q, res, () => this.adminPeople(res)),
+    '/account/admin/people/set': (q, res, b) => this.withAdmin(q, res, (a) => this.adminPersonSet(res, a, b)),
+    '/account/admin/agents': (q, res) => this.withAdmin(q, res, () => this.adminAgents(res)),
   };
+
+  // ── agent invites on the account page (the console's rules: its gate, the invite policy) ──
+
+  /** The grant this account would carry on the console, if the console's gate admits it; else null. */
+  private consoleGrant(a: HumanAccount): RoleGrant | null {
+    const gate = consoleRequiredScopes(this.d.invitePolicy.get());
+    if (gate === null || a.disabled) return null;
+    const grant = withheld(mergeGrants(this.storedGrant(a), this.d.codes.grantFor(a.codes, 'console')), a);
+    return grant && gate.every((s) => grant.scopes.includes(s)) ? grant : null;
+  }
+
+  private invitesList(res: ServerResponse, t: Aid1Payload): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a || !this.consoleGrant(a)) return json(res, 403, { error: 'this account can’t make invites for agents here' });
+    json(res, 200, { invites: sponsorInviteView(this.d.invites, this.d.principals, t.sub) });
+  }
+
+  private inviteMint(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const a = this.d.accounts.bySub(t.sub);
+    const grant = a ? this.consoleGrant(a) : null;
+    if (!a || !grant) return json(res, 403, { error: 'this account can’t make invites for agents here' });
+    const label = typeof b.label === 'string' ? b.label.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60) : '';
+    const r = mintSponsoredInvite(this.d.invites, this.d.invitePolicy.get(),
+      { sub: a.sub, name: displayName(a), scopes: grant.scopes, ...(a.withhold ? { withhold: a.withhold } : {}) },
+      label || undefined,
+      { anchorDomain: b.anchor === true && grant.scopes.includes(ANCHOR_SCOPE) ? this.d.cfg.iss : null, knownAudiences: Object.keys(this.d.audiences.get()) });
+    if (!r.ok) return json(res, r.status, { error: r.error });
+    this.d.mintLog.append({ at: new Date().toISOString(), sub: a.sub, aud: 'console', scopes: r.invite.scopes, exp: Math.floor(Date.parse(r.invite.expiresAt!) / 1000), by: 'account' });
+    console.error(`[hn] account: ${a.sub} (${displayName(a)}) minted invite ${r.invite.code} [${r.invite.scopes.join(' ')}]`);
+    json(res, 200, { invite: r.invite, agentsMd: `${this.d.cfg.publicUrl}/agents.md` });
+  }
+
+  private inviteWithdraw(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a || !this.consoleGrant(a)) return json(res, 403, { error: 'this account can’t make invites for agents here' });
+    const inv = this.d.invites.all().find((i) => i.code === String(b.code ?? '') && i.sponsor === t.sub);
+    if (!inv || (inv.uses ?? 0) >= (inv.maxUses ?? 1)) return json(res, 404, { error: 'no such invite waiting' });
+    this.d.invites.revoke(inv.code);
+    console.error(`[hn] account: ${t.sub} withdrew invite ${inv.code}`);
+    json(res, 200, { ok: true });
+  }
+
+  // ── admins: people holding hn:admin (an operator grant: hn user set <who> --scopes hn:admin) ──
+
+  private isAdmin(a: HumanAccount | undefined): boolean {
+    return Boolean(a && !a.disabled && withheld(this.storedGrant(a), a)?.scopes.includes(ADMIN_SCOPE));
+  }
+
+  private withAdmin(req: IncomingMessage, res: ServerResponse, fn: (admin: HumanAccount) => void | Promise<void>): void | Promise<void> {
+    return this.withAccount(req, res, (t) => {
+      const a = this.d.accounts.bySub(t.sub);
+      if (!this.isAdmin(a)) return json(res, 403, { error: 'for this node’s admins only' });
+      return fn(a!);
+    });
+  }
+
+  private adminAudiences(res: ServerResponse): void {
+    json(res, 200, { audiences: this.d.audiences.get(), builtIn: [...BUILT_IN_AUDIENCES] });
+  }
+
+  /** Writes audiences.json under its lock, keeping a dated copy of what was there before. */
+  private writeAudiences(admin: HumanAccount, what: string, fn: (cur: AudiencesConfig) => AudiencesConfig): void {
+    const dir = this.d.cfg.configDir;
+    if (dir) {
+      try {
+        copyFileSync(join(dir, 'audiences.json'), join(dir, `audiences.json.bak-${new Date().toISOString().replace(/[:.]/g, '')}`));
+      } catch {
+        /* no file yet: nothing to keep */
+      }
+    }
+    this.d.audiences.update(fn);
+    console.error(`[hn] admin: ${admin.sub} (${displayName(admin)}) ${what}`);
+  }
+
+  private adminAudienceSave(res: ServerResponse, admin: HumanAccount, b: Record<string, unknown>): void {
+    const id = String(b.id ?? '').trim();
+    if (!AUDIENCE_ID.test(id)) return json(res, 400, { error: 'an audience id is 1–40 lowercase letters, digits or dashes, starting with a letter' });
+    if (BUILT_IN_AUDIENCES.has(id)) return json(res, 400, { error: `“${id}” is this node’s own` });
+    const e = (b.entry ?? {}) as Record<string, unknown>;
+    const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
+    const redirect = str(e.redirect, 500);
+    if (!webUrl(redirect)) return json(res, 400, { error: 'the sign-in return address must be an https:// URL (http:// only on localhost)' });
+    const url = str(e.url, 500), api = str(e.api, 500), mcpl = str(e.mcpl, 500);
+    if (url && !webUrl(url)) return json(res, 400, { error: 'the service link must be an https:// URL' });
+    if (api && !webUrl(api)) return json(res, 400, { error: 'the API address must be an https:// URL' });
+    if (mcpl && !/^wss:\/\/[^\s]+$/.test(mcpl)) return json(res, 400, { error: 'the MCPL address must be a wss:// URL' });
+    const scopes = Array.isArray(e.requiredScopes) ? e.requiredScopes.map((s) => String(s).trim()).filter(Boolean) : [];
+    if (scopes.some((s) => !SCOPE.test(s))) return json(res, 400, { error: 'scopes are letters, digits and : . _ - (up to 64 characters)' });
+    const fields = { name: str(e.name, 60), description: str(e.description, 300), url, api, mcpl };
+    this.writeAudiences(admin, `saved audience ${id}`, (cur) => {
+      // whatever else the entry carries (signup, fields from a newer version) stays as it was
+      const next: Record<string, unknown> = { ...(cur[id] ?? {}), redirect, requiredScopes: scopes };
+      for (const [k, v] of Object.entries(fields)) {
+        if (v) next[k] = v;
+        else delete next[k];
+      }
+      if (!scopes.length) delete next.requiredScopes;
+      return { ...cur, [id]: next as unknown as AudiencesConfig[string] };
+    });
+    json(res, 200, { ok: true, audiences: this.d.audiences.get() });
+  }
+
+  private adminAudienceRemove(res: ServerResponse, admin: HumanAccount, b: Record<string, unknown>): void {
+    const id = String(b.id ?? '');
+    if (!this.d.audiences.get()[id]) return json(res, 404, { error: 'no such audience' });
+    this.writeAudiences(admin, `removed audience ${id}`, (cur) => {
+      const { [id]: _gone, ...rest } = cur;
+      return rest;
+    });
+    json(res, 200, { ok: true, audiences: this.d.audiences.get() });
+  }
+
+  private adminPeople(res: ServerResponse): void {
+    const people = this.d.accounts.all().map((a) => ({
+      sub: a.sub, name: displayName(a), createdAt: a.createdAt, disabled: Boolean(a.disabled),
+      scopes: a.scopes ?? [], withhold: a.withhold ?? [], admin: this.isAdmin(a),
+      signIn: [
+        ...(a.email ? [`email ${maskEmail(a.email.address)}`] : []),
+        ...(a.google?.sub ? [`Google ${maskEmail(a.google.email)}`] : []),
+        ...(a.discord ? [`Discord${a.discord.name ? ` ${a.discord.name}` : ''}`] : []),
+        ...(a.password ? ['password'] : []),
+        ...(a.passkeys?.length ? [`${a.passkeys.length} passkey${a.passkeys.length === 1 ? '' : 's'}`] : []),
+        ...(a.totp ? ['two-factor'] : []),
+      ],
+      ticket: a.ticket?.audiences.length ? a.ticket.audiences : null,
+    }));
+    json(res, 200, { people });
+  }
+
+  private adminPersonSet(res: ServerResponse, admin: HumanAccount, b: Record<string, unknown>): void {
+    const target = this.d.accounts.bySub(String(b.sub ?? ''));
+    if (!target) return json(res, 404, { error: 'no such person' });
+    let scopes: string[] | undefined;
+    if (b.scopes !== undefined) {
+      if (!Array.isArray(b.scopes)) return json(res, 400, { error: 'scopes: a list' });
+      scopes = [...new Set(b.scopes.map((s) => String(s).trim()).filter(Boolean))];
+      if (scopes.some((s) => !SCOPE.test(s))) return json(res, 400, { error: 'scopes are letters, digits and : . _ - (up to 64 characters)' });
+    }
+    const disabled = typeof b.disabled === 'boolean' ? b.disabled : undefined;
+    // no locking yourself out from here: another admin, or the CLI, can do that
+    if (target.sub === admin.sub && (disabled === true || (scopes && !scopes.includes(ADMIN_SCOPE)))) {
+      return json(res, 400, { error: 'you can’t disable yourself or take away your own admin here' });
+    }
+    const next = this.d.accounts.update(target.sub, (x) => {
+      const n: HumanAccount = { ...x, ...(scopes ? { scopes } : {}), ...(disabled !== undefined ? { disabled } : {}) };
+      if (scopes && !scopes.length) delete n.scopes;
+      if (disabled === false) delete n.disabled;
+      return n;
+    });
+    console.error(`[hn] admin: ${admin.sub} (${displayName(admin)}) set ${target.sub}${scopes ? ` scopes [${scopes.join(' ')}]` : ''}${disabled !== undefined ? (disabled ? ' disabled' : ' enabled') : ''}`);
+    json(res, 200, { ok: true, person: { sub: next!.sub, scopes: next!.scopes ?? [], disabled: Boolean(next!.disabled) } });
+  }
+
+  private adminAgents(res: ServerResponse): void {
+    const agents = this.d.principals.all().filter((p) => p.kind === 'agent').map((p) => ({
+      sub: p.sub, name: p.name, scopes: p.scopes, audiences: p.audiences ?? null,
+      sponsor: typeof p.claims?.sponsorName === 'string' ? p.claims.sponsorName : typeof p.claims?.sponsor === 'string' ? p.claims.sponsor : null,
+      tier: typeof p.claims?.tier === 'string' ? p.claims.tier : null, expires: p.expires ?? null,
+    }));
+    json(res, 200, { agents });
+  }
 
   // ── sign-in ──
 
@@ -384,7 +588,8 @@ export class HumanAuth {
     const prefill = (url.searchParams.get('email') ?? '').trim().slice(0, 254);
     securePage(res, 200, (nonce) =>
       loginPage({
-        iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, email: this.emailOn,
+        iss: this.d.cfg.iss, site: this.d.site.get(), audience, ...(this.d.audiences.get()[audience]?.name ? { audienceName: this.d.audiences.get()[audience]!.name } : {}),
+        state, discord: this.discordOn, google: this.googleOn, email: this.emailOn,
         ticketed: this.emailOn && this.d.ticketDefaults.get().allowed.audiences.includes(audience),
         ...(this.emailOn && usableEmail(prefill) ? { prefillEmail: prefill } : {}),
         open: !!signupGrant(this.d.audiences.get()[audience]), nonce,
@@ -818,6 +1023,12 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // an email-made row has no anchor to be named by: its name is its own to set
       nameEditable: t.sub.startsWith('human:email:'),
       ticket: a?.ticket ? { since: a.ticket.claimedAt, audiences: a.ticket.audiences, scopes: a.ticket.scopes } : null,
+      // agent invites, when the console's gate admits this account (the console page is part of this one now)
+      invites: (() => {
+        const g = a ? this.consoleGrant(a) : null;
+        return g ? { canAnchor: g.scopes.includes(ANCHOR_SCOPE), agentsMd: `${this.d.cfg.publicUrl}/agents.md` } : null;
+      })(),
+      admin: this.isAdmin(a),
       codes: (a?.codes ?? []).flatMap((r) => {
         const c = this.d.codes.byId(r.id);
         return c && !c.revoked ? [{ label: c.label, audiences: c.audiences, at: r.at }] : [];

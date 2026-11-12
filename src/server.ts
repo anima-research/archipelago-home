@@ -12,7 +12,7 @@ import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
 import {
-  ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
+  ANCHOR_SCOPE, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
 } from './console.js';
 import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './policy.js';
 import { AccountStore } from './accounts.js';
@@ -27,6 +27,7 @@ import type { SponsorIdentity } from './console.js';
 import { emailKey } from './google.js';
 import { emailSenderFromConfig, type EmailSender } from './email.js';
 import type { FetchLike } from './oauth.js';
+import { consoleMovedPage, enrollPage, homePage, siteStore, type SiteInfo } from './site.js';
 import { esc, html, json, page, readJson } from './http.js';
 import {
   audiencesStore,
@@ -135,6 +136,8 @@ export class HomeNode {
   /** Ticket holders (tickets.ts) and what a ticket grants by default. */
   readonly tickets: TicketStore;
   readonly ticketDefaults: JsonStore<TicketDefaults>;
+  /** What the node calls itself for people (config/site.json). */
+  readonly site: JsonStore<SiteInfo>;
   /** Null = email sign-in off. */
   readonly email: EmailSender | null;
   readonly human: HumanAuth;
@@ -155,6 +158,7 @@ export class HomeNode {
     this.codes = new CodeStore(join(cfg.dataDir, 'codes.json'));
     this.tickets = new TicketStore(join(cfg.dataDir, 'tickets.json'));
     this.ticketDefaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json'));
+    this.site = siteStore(join(cfg.configDir, 'site.json'));
     if (cfg.ticketsToken !== undefined && cfg.ticketsToken.length < 32) {
       throw new Error('HN_TICKETS_TOKEN must be at least 32 characters (e.g. openssl rand -base64 32)');
     }
@@ -174,6 +178,8 @@ export class HomeNode {
       invitePolicy: this.invitePolicy,
       allow: (ip) => this.limiter.allow(ip),
       fetchImpl: opts.fetchImpl,
+      site: this.site,
+      invites: this.invites,
     });
   }
 
@@ -191,7 +197,7 @@ export class HomeNode {
 
   /** Resolves with the bound port (useful with port 0 in tests). */
   start(): Promise<number> {
-    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts, this.codes, this.tickets, this.ticketDefaults]) s.startWatching();
+    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.site, this.invitePolicy, this.accounts, this.codes, this.tickets, this.ticketDefaults]) s.startWatching();
     return new Promise((resolve) =>
       this.server.listen(this.cfg.port, this.cfg.bind, () => {
         const addr = this.server.address();
@@ -263,10 +269,8 @@ export class HomeNode {
         return await this.ticketsApi(req, url, res);
       }
       if (req.method === 'GET' && url.pathname === '/enroll') {
-        // the URL an invite hands an agent is usable in a browser too
-        return html(res, 200, page('enroll', `<p>This is the enrollment endpoint: an agent holding an invite code <b>POSTs</b> its key proof here
-(<code>POST ${esc(this.cfg.publicUrl)}/enroll</code>) and receives its identity and first token.</p>
-<p>The whole procedure, with the exact statement to sign: <a href="/agents.md">/agents.md</a>.</p>`));
+        // the URL an invite hands an agent is opened in a browser too: say what it's for
+        return html(res, 200, enrollPage({ site: this.site.get(), iss: this.cfg.iss, publicUrl: this.cfg.publicUrl }));
       }
       if (url.pathname.startsWith('/console')) {
         if (!this.limiter.allow(ip)) return json(res, 429, { error: 'rate limited' });
@@ -282,11 +286,7 @@ export class HomeNode {
         return json(res, result.status, result.body);
       }
       if (req.method === 'GET' && url.pathname === '/') {
-        return html(res, 200, page('archipelago home', `<p>Identity home node for <b>${esc(this.cfg.iss)}</b>.</p>
-<p>Issuer key: <code>${esc(this.issuer.id)}</code></p>
-<p>Services log you in via <code>/login?audience=…</code>; agents exchange key proofs at <code>/token</code>.</p>
-<p>People: manage your username, password, two-factor code and passkeys at <a href="/account">/account</a>.</p>
-<p>An agent arriving from outside? Start with <a href="/agents.md">/agents.md</a>.</p>`));
+        return html(res, 200, homePage({ site: this.site.get(), iss: this.cfg.iss, issuerId: this.issuer.id, audiences: this.audiences.get() }));
       }
       json(res, 404, { error: 'not found' });
     } catch (err) {
@@ -517,7 +517,8 @@ export class HomeNode {
 
   private async consoleRoute(req: IncomingMessage, url: URL, res: ServerResponse): Promise<boolean> {
     if (url.pathname === '/console' && req.method === 'GET') {
-      html(res, 200, consolePage(this.cfg.iss));
+      // the console's page is part of /account now; its API below stays for scripts
+      html(res, 200, consoleMovedPage({ site: this.site.get(), iss: this.cfg.iss }));
       return true;
     }
     if (url.pathname === '/console/me' && req.method === 'GET') {

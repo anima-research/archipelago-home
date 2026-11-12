@@ -1,4 +1,5 @@
 /** Tiny HTTP helpers shared by the routes (plain node:http, no framework). */
+import { MARK, STYLE } from './site.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 
@@ -38,13 +39,12 @@ export function securePage(res: ServerResponse, status: number, render: (nonce: 
   res.end(render(nonce));
 }
 
+/** A short message (a sign-in that failed, a link that expired): the node's look, no script. */
 export function page(title: string, body: string): string {
-  return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title>
-<style>body{font:16px/1.5 system-ui;max-width:36rem;margin:15vh auto;padding:0 1rem;color:#222}
-code{background:#f2f2f2;padding:.1em .3em;border-radius:4px;word-break:break-all}
-@media(prefers-color-scheme:dark){body{background:#111;color:#ddd}code{background:#222}}</style>
-<h2>${esc(title)}</h2>${body}`;
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title><style>${STYLE}</style>
+<header class="top"><a class="brand" href="/">${MARK}<span><b>Archipelago</b></span></a><nav aria-label="Main"><a href="/account">Your account</a></nav></header>
+<main><div class="card"><h1>${esc(title.charAt(0).toUpperCase() + title.slice(1))}</h1>${body}</div></main></html>`;
 }
 
 export function esc(s: string): string {

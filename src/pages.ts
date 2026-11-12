@@ -4,46 +4,8 @@
  * page memory only, never storage.
  */
 import { esc } from './http.js';
+import { siteName, STYLE, topBar, type SiteInfo } from './site.js';
 
-const CSS = `
-:root{color-scheme:light dark;--bg:#fafafa;--fg:#1c1c1e;--dim:#66666b;--line:#d6d6db;--field:#fff;--card:#fff;
---accent:#2f5bd3;--on-accent:#fff;--err:#b3261e;--ok:#1e7a34;--discord:#5865f2}
-@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#e4e4e4;--dim:#909096;--line:#2f2f33;--field:#18181a;--card:#161618;
---accent:#5b84f0;--on-accent:#fff;--err:#ff8a80;--ok:#7fd88f}}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:30rem;margin:8vh auto 4rem;padding:0 16px}
-h1{font-size:1.5rem;line-height:1.25;margin:0 0 .25rem}
-h2{font-size:1.05rem;margin:0 0 .35rem}
-p{margin:.5rem 0}
-a{color:var(--accent)}
-.dim{color:var(--dim)}.small{font-size:.875rem}.err{color:var(--err)}.ok{color:var(--ok)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:16px 0}
-label{display:block;font-size:.875rem;color:var(--dim);margin:.75rem 0 .25rem}
-input{display:block;width:100%;font:inherit;font-size:16px;color:var(--fg);background:var(--field);border:1px solid var(--line);
-border-radius:8px;padding:.55rem .7rem}
-input:focus-visible,.btn:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.btn{display:inline-flex;align-items:center;justify-content:center;font:inherit;font-weight:500;text-decoration:none;color:var(--fg);
-background:transparent;border:1px solid var(--line);border-radius:8px;padding:.5rem 1rem;min-height:44px;cursor:pointer}
-.btn.block{display:flex;width:100%;margin-top:.75rem}
-.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
-.btn.discord{background:var(--discord);border-color:var(--discord);color:#fff}
-.btn.danger{color:var(--err)}
-.btn.sm{min-height:36px;padding:.3rem .75rem;font-size:.875rem}
-.btn:disabled{opacity:.55;cursor:default}
-.row{display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap}.row>input{flex:1;min-width:10rem}
-.or{display:flex;align-items:center;gap:.75rem;color:var(--dim);font-size:.875rem;margin:1rem 0}
-.or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
-code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;word-break:break-all}
-code.key{word-break:normal;font-size:1rem;letter-spacing:.02em}
-ul.list{list-style:none;padding:0;margin:.5rem 0}
-ul.list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.5rem 0;border-top:1px solid var(--line)}
-ul.list li:first-child{border-top:0}
-.codes{display:grid;grid-template-columns:repeat(2,1fr);gap:.25rem 1rem;padding:.75rem;border:1px dashed var(--line);border-radius:8px;margin:.5rem 0}
-.qr{display:flex;justify-content:center;margin:.75rem 0}.qr svg{max-width:100%;height:auto;border-radius:6px}
-#msg:empty,#err:empty{display:none}
-`;
 
 /** Client helpers every page shares: base64url ⇄ ArrayBuffer, JSON POST, HTML escape. */
 const JS_COMMON = `
@@ -80,24 +42,28 @@ function scriptJson(v: unknown): string {
     .split(String.fromCharCode(0x2029)).join('\\u2029');
 }
 
-function shell(title: string, nonce: string, body: string, script: string): string {
+/** Who's asking for a page: the node, as people know it. */
+export interface PageSite { site: SiteInfo; iss: string }
+
+function shell(title: string, nonce: string, body: string, script: string, at: PageSite, main = ''): string {
   return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(title)}</title><style>${CSS}</style>
-<main>${body}</main>
+<title>${esc(title)} — ${esc(siteName(at.site, at.iss))}</title><style>${STYLE}</style>
+${topBar(at.site, at.iss)}
+<main${main ? ` class="${main}"` : ''}>${body}</main>
 <script nonce="${nonce}">${JS_COMMON}${script}</script></html>`;
 }
 
-const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings', console: 'the agent-invite console' };
+const AUDIENCE_LABEL: Record<string, string> = { account: 'your account', console: 'your account' };
 
 // ── /login ──
 
 export function loginPage(o: {
-  iss: string; audience: string; state: string; discord: boolean; google: boolean; email?: boolean; ticketed?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
+  iss: string; site: SiteInfo; audience: string; audienceName?: string; state: string; discord: boolean; google: boolean; email?: boolean; ticketed?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
 }): string {
-  const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
+  const target = AUDIENCE_LABEL[o.audience] ?? o.audienceName ?? o.audience;
   const body = `
 <h1>Sign in</h1>
-<p class="dim">to continue to <b>${esc(target)}</b> · ${esc(o.iss)}</p>
+<p class="dim">to continue to <b>${esc(target)}</b></p>
 <p id="err" class="err" role="alert"></p>
 <section id="step1">
   ${o.discord ? `<a class="btn discord block" href="/login/discord?state=${encodeURIComponent(o.state)}">Continue with Discord</a>` : ''}
@@ -268,15 +234,14 @@ if ($('em')) {
   if (prefill) { $('e').value = prefill; $('e').focus(); }
 }
 `;
-  return shell(`sign in — ${o.iss}`, o.nonce, body, script);
+  return shell('Sign in', o.nonce, body, script, o);
 }
 
 // ── /account ──
 
-export function accountPage(iss: string, nonce: string): string {
+export function accountPage(at: PageSite, nonce: string): string {
   const body = `
-<h1>Sign-in settings</h1>
-<p class="dim">${esc(iss)}</p>
+<h1>Your account</h1>
 <p id="msg" role="status"></p>
 <div id="app"><p class="dim">Checking sign-in…</p></div>`;
   const script = `
@@ -318,6 +283,24 @@ function render(extra) {
     ((me.open || []).length ? '<p>Open to everyone: ' + me.open.map((o) => '<a href="' + h(o.url) + '">' + h(o.host) + '</a>').join(', ') + '</p>' : '') +
     '</div>';
 
+  // agent invites (what the console was): only for accounts its gate admits
+  if (me.invites) {
+    s += '<div class="card" id="invites"><h2>Invites for your agents</h2>' +
+      '<p class="dim">An AI agent you run gets its own identity here with an invite from you. Make one, give the agent the code, and it enrolls itself (<a href="' + h(me.invites.agentsMd) + '">instructions for agents</a>). Each invite works once and lasts 14 days.</p>' +
+      '<form id="f-inv" class="row"><input id="inv-label" maxlength="60" placeholder="What it’s for (optional)" aria-label="Invite label">' +
+      (me.invites.canAnchor ? '<label class="check small"><input type="checkbox" id="inv-anchor"> resident</label>' : '') +
+      '<button class="btn primary" type="submit">Make an invite</button></form><div id="inv-list" class="small dim">Loading…</div></div>';
+  }
+
+  // the node's admins
+  if (me.admin) {
+    s += '<h2 class="section-title">Admin</h2>' +
+      '<div class="card"><h2>Audiences</h2><p class="dim small">The services that sign in through this node. A service with a name is listed on the home page. Every save keeps a copy of the file as it was.</p><div id="adm-aud" class="small dim">Loading…</div></div>' +
+      '<div class="card"><h2>People</h2><p class="dim small">Scopes here are the operator grant (what the hn CLI sets); hn:admin makes someone an admin. Disabling stops new sign-ins by any method.</p><div id="adm-people" class="small dim">Loading…</div></div>' +
+      '<div class="card"><h2>Agents</h2><div id="adm-agents" class="small dim">Loading…</div></div>';
+  }
+
+  s += '<h2 class="section-title">How you sign in</h2>';
   // username + password
   s += '<div class="card"><h2>Username &amp; password</h2>';
   if (me.hasPassword) {
@@ -425,8 +408,95 @@ function render(extra) {
   wire();
 }
 
+// ── agent invites ──
+async function loadInvites() {
+  const box = $('inv-list'); if (!box) return;
+  let r; try { r = await api('/account/invites/list', {}); } catch { return; }
+  if (r.status !== 200) { box.textContent = r.body.error || 'Couldn’t load the invites.'; return; }
+  const list = r.body.invites || [];
+  box.innerHTML = list.length ? '<ul class="list">' + list.map((i) => '<li><span><b class="mono">' + h(i.code) + '</b>' + (i.label ? ' · ' + h(i.label) : '') +
+    '<br><span class="dim">' + (i.agent ? 'enrolled: ' + h(i.agent.name) + ' <span class="mono">' + h(i.agent.sub) + '</span>' : h(i.status) + (i.expiresAt ? ' · expires ' + fmt(i.expiresAt) : '')) + '</span></span>' +
+    (i.status === 'unclaimed' ? '<button class="btn sm danger" type="button" data-wd="' + h(i.code) + '">Withdraw</button>' : '') + '</li>').join('') + '</ul>' : 'No invites yet.';
+  box.querySelectorAll('[data-wd]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Withdraw this invite? It can no longer be used.')) return;
+    if (await act('/account/invites/withdraw', { code: b.dataset.wd }, 'Invite withdrawn.')) loadInvites();
+  }));
+}
+
+// ── admin ──
+const csv = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean);
+function audForm(id, a, isNew) {
+  const f = (k, label, ph) => '<label>' + label + '<input data-k="' + k + '" value="' + h(a[k] || '') + '" placeholder="' + h(ph || '') + '"></label>';
+  return '<form class="aud" data-id="' + h(id) + '">' +
+    (isNew ? '<label>Id (in tokens, cannot change later)<input data-k="id" placeholder="e.g. tickets" required></label>' : '<h3 class="mono">' + h(id) + '</h3>') +
+    f('name', 'Name (listed on the home page when set)') + f('description', 'Description') + f('url', 'Link for people', 'https://…') +
+    f('redirect', 'Sign-in return address', 'https://…/signin') + f('api', 'API address (optional)', 'https://…') + f('mcpl', 'MCPL address (optional)', 'wss://…') +
+    '<label>Required scopes (comma-separated)<input data-k="requiredScopes" value="' + h((a.requiredScopes || []).join(', ')) + '"></label>' +
+    '<div class="row" style="margin-top:.75rem"><button class="btn sm primary" type="submit">' + (isNew ? 'Add audience' : 'Save') + '</button>' +
+    (isNew ? '' : '<button class="btn sm danger" type="button" data-rm-aud="' + h(id) + '">Remove</button>') + '</div></form>';
+}
+async function loadAudiences() {
+  const box = $('adm-aud'); if (!box) return;
+  let r; try { r = await api('/account/admin/audiences', {}); } catch { return; }
+  if (r.status !== 200) { box.textContent = r.body.error || 'Couldn’t load the audiences.'; return; }
+  const auds = r.body.audiences || {};
+  box.className = '';
+  box.innerHTML = Object.keys(auds).sort().map((id) => '<details><summary><b>' + h(auds[id].name || id) + '</b> <span class="dim mono small">' + h(id) + '</span></summary>' + audForm(id, auds[id], false) + '</details>').join('') +
+    '<details><summary>Add an audience</summary>' + audForm('', {}, true) + '</details>';
+  box.querySelectorAll('form.aud').forEach((form) => (form.onsubmit = async (e) => {
+    e.preventDefault();
+    const v = (k) => { const el = form.querySelector('[data-k="' + k + '"]'); return el ? el.value.trim() : ''; };
+    const id = form.dataset.id || v('id');
+    const entry = { name: v('name'), description: v('description'), url: v('url'), redirect: v('redirect'), api: v('api'), mcpl: v('mcpl'), requiredScopes: csv(v('requiredScopes')) };
+    if (await act('/account/admin/audiences/save', { id, entry }, 'Saved ' + id + '.')) loadAudiences();
+  }));
+  box.querySelectorAll('[data-rm-aud]').forEach((b) => (b.onclick = async () => {
+    if (!confirm('Remove the audience ' + b.dataset.rmAud + '? Nobody can sign in to it until it is added again.')) return;
+    if (await act('/account/admin/audiences/remove', { id: b.dataset.rmAud }, 'Removed ' + b.dataset.rmAud + '.')) loadAudiences();
+  }));
+}
+async function loadPeople() {
+  const box = $('adm-people'); if (!box) return;
+  let r; try { r = await api('/account/admin/people', {}); } catch { return; }
+  if (r.status !== 200) { box.textContent = r.body.error || 'Couldn’t load the people.'; return; }
+  const people = r.body.people || [];
+  box.className = 'tbl';
+  box.innerHTML = '<table class="t"><thead><tr><th>Person</th><th>Signs in with</th><th>Scopes</th><th></th></tr></thead><tbody>' + people.map((p) => '<tr>' +
+    '<td><b>' + h(p.name) + '</b>' + (p.admin ? ' <span class="tag">admin</span>' : '') + (p.disabled ? ' <span class="tag off">disabled</span>' : '') +
+      (p.ticket ? ' <span class="tag">ticket</span>' : '') + '<br><span class="dim mono small">' + h(p.sub) + '</span><br><span class="dim small">since ' + fmt(p.createdAt) + '</span></td>' +
+    '<td class="small">' + (p.signIn.map(h).join('<br>') || '<span class="dim">nothing yet</span>') + '</td>' +
+    '<td><form class="row" data-sub="' + h(p.sub) + '"><input class="small" value="' + h(p.scopes.join(', ')) + '" aria-label="Scopes for ' + h(p.name) + '"><button class="btn sm" type="submit">Save</button></form></td>' +
+    '<td>' + (p.sub === me.sub ? '<span class="dim small">you</span>' : '<button class="btn sm' + (p.disabled ? '' : ' danger') + '" type="button" data-dis="' + h(p.sub) + '" data-to="' + (p.disabled ? '0' : '1') + '">' + (p.disabled ? 'Enable' : 'Disable') + '</button>') + '</td></tr>').join('') + '</tbody></table>';
+  box.querySelectorAll('form[data-sub]').forEach((form) => (form.onsubmit = async (e) => {
+    e.preventDefault();
+    if (await act('/account/admin/people/set', { sub: form.dataset.sub, scopes: csv(form.querySelector('input').value) }, 'Scopes saved.')) loadPeople();
+  }));
+  box.querySelectorAll('[data-dis]').forEach((b) => (b.onclick = async () => {
+    const off = b.dataset.to === '1';
+    if (off && !confirm('Disable this account? It can’t sign in by any method until it is enabled again.')) return;
+    if (await act('/account/admin/people/set', { sub: b.dataset.dis, disabled: off }, off ? 'Disabled.' : 'Enabled.')) loadPeople();
+  }));
+}
+async function loadAgentsAdmin() {
+  const box = $('adm-agents'); if (!box) return;
+  let r; try { r = await api('/account/admin/agents', {}); } catch { return; }
+  if (r.status !== 200) { box.textContent = r.body.error || 'Couldn’t load the agents.'; return; }
+  const agents = r.body.agents || [];
+  box.className = agents.length ? 'tbl' : 'small dim';
+  box.innerHTML = agents.length ? '<table class="t"><thead><tr><th>Agent</th><th>Sponsor</th><th>Scopes</th></tr></thead><tbody>' + agents.map((a) => '<tr>' +
+    '<td><b>' + h(a.name) + '</b>' + (a.tier ? ' <span class="tag">' + h(a.tier) + '</span>' : '') + '<br><span class="dim mono small">' + h(a.sub) + '</span></td>' +
+    '<td class="small">' + h(a.sponsor || '—') + '</td><td class="small mono">' + h((a.scopes || []).join(' ')) + '</td></tr>').join('') + '</tbody></table>' : 'No agents yet.';
+}
+
 function wire() {
   const on = (id, ev, fn) => { const el = $(id); if (el) el['on' + ev] = fn; };
+  on('f-inv', 'submit', async (e) => {
+    e.preventDefault();
+    const r = await act('/account/invites', { label: $('inv-label').value.trim(), anchor: !!($('inv-anchor') && $('inv-anchor').checked) });
+    if (r) { msg('Invite made: ' + r.invite.code + '. Give it to your agent.'); $('inv-label').value = ''; loadInvites(); }
+  });
+  if (me.invites) loadInvites();
+  if (me.admin) { loadAudiences(); loadPeople(); loadAgentsAdmin(); }
   on('f-pw', 'submit', async (e) => {
     e.preventDefault();
     const pw = $('pw-new').value;
@@ -503,19 +573,18 @@ function wire() {
 }
 
 (async () => {
-  if (!token) return signIn('Sign in to manage how you sign in: username & password, a two-factor code, passkeys, email.');
+  if (!token) return signIn('Sign in to see your account: how you sign in (an email code, Google, a passkey, a password), and more.');
   try { const r = await api('/account/me'); me = r.body; render(); } catch {}
 })();
 `;
-  return shell(`sign-in settings — ${iss}`, nonce, body, script);
+  return shell('Your account', nonce, body, script, at, 'wide');
 }
 
 // ── /account/setup ──
 
-export function setupPage(iss: string, nonce: string): string {
+export function setupPage(at: PageSite, nonce: string): string {
   const body = `
 <h1>Set up your sign-in</h1>
-<p class="dim">${esc(iss)}</p>
 <p id="err" class="err" role="alert"></p>
 <div id="app"><p class="dim">Checking your link…</p></div>`;
   const script = `
@@ -547,5 +616,5 @@ const err = (m) => { $('err').textContent = m || ''; };
   ($('u') || $('p')).focus();
 })();
 `;
-  return shell(`set up sign-in — ${iss}`, nonce, body, script);
+  return shell('Set up your sign-in', nonce, body, script, at);
 }
