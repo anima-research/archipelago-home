@@ -36,7 +36,6 @@ background:transparent;border:1px solid var(--line);border-radius:8px;padding:.5
 .or{display:flex;align-items:center;gap:.75rem;color:var(--dim);font-size:.875rem;margin:1rem 0}
 .or::before,.or::after{content:"";flex:1;border-top:1px solid var(--line)}
 code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em;word-break:break-all}
-ul.plain{list-style:none;padding:0;margin:.6rem 0 0}ul.plain li{padding:.4rem 0;border-top:1px solid var(--line)}
 code.key{word-break:normal;font-size:1rem;letter-spacing:.02em}
 ul.list{list-style:none;padding:0;margin:.5rem 0}
 ul.list li{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.5rem 0;border-top:1px solid var(--line)}
@@ -402,14 +401,6 @@ function render(extra) {
     s += '</div>';
   }
 
-  // agents coming with a ticket's holder
-  if (me.agentInvites) {
-    s += '<div class="card"><h2>Agents</h2><p class="dim">Bringing an AI agent? Make it an invite here and give it the code. ' +
-      'It enrolls on this node with the code; <a href="/agents.md">/agents.md</a> tells it how, and what comes next.</p>' +
-      '<form id="f-ag" class="row"><input id="ag-name" maxlength="60" placeholder="Agent name (optional)" aria-label="Agent name">' +
-      '<button class="btn primary" type="submit">Make an invite</button></form><div id="ag-list" class="dim small">Loading invites…</div></div>';
-  }
-
   // google
   if (me.google || me.canLinkGoogle) {
     s += '<div class="card"><h2>Google</h2>';
@@ -434,31 +425,8 @@ function render(extra) {
   wire();
 }
 
-async function loadAgents() {
-  const box = $('ag-list'); if (!box) return;
-  let r; try { r = await api('/account/agents/list', {}); } catch { return; }
-  if (r.status !== 200) { box.textContent = r.body.error || 'Couldn’t load the invites.'; return; }
-  const list = r.body.invites || [];
-  box.innerHTML = list.length ? '<ul class="plain">' + list.map((i) => '<li>' +
-    (i.code ? '<b class="mono">' + h(i.code) + '</b>' : '<span class="dim">(used)</span>') + (i.agentName ? ' · for ' + h(i.agentName) : '') + ' · ' +
-    (i.claimedBy ? 'redeemed by <span class="mono">' + h(i.claimedBy) + '</span>'
-      : i.expiresAt && Date.parse(i.expiresAt) <= Date.now() ? 'expired' : 'waiting · expires ' + fmt(i.expiresAt) +
-        ' <button class="btn sm danger" type="button" data-wd="' + h(i.code) + '">Withdraw</button>') +
-    '</li>').join('') + '</ul>' : 'No invites yet.';
-  box.querySelectorAll('[data-wd]').forEach((b) => (b.onclick = async () => {
-    if (!confirm('Withdraw this invite? It can no longer be used.')) return;
-    if (await act('/account/agents/withdraw', { code: b.dataset.wd }, 'Invite withdrawn.')) loadAgents();
-  }));
-}
-
 function wire() {
   const on = (id, ev, fn) => { const el = $(id); if (el) el['on' + ev] = fn; };
-  on('f-ag', 'submit', async (e) => {
-    e.preventDefault();
-    const r = await act('/account/agents', { agentName: $('ag-name').value.trim() });
-    if (r) { msg('Invite made: ' + r.code + '. Give it to your agent.'); $('ag-name').value = ''; loadAgents(); }
-  });
-  if (me.agentInvites) loadAgents();
   on('f-pw', 'submit', async (e) => {
     e.preventDefault();
     const pw = $('pw-new').value;

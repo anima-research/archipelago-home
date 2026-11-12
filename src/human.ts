@@ -56,7 +56,6 @@ import {
   type PrincipalStore,
   type RoleGrant,
   type RolesConfig,
-  type Invite,
 } from './stores.js';
 import {
   DISCORD_SNAPSHOT_MAX_AGE_MS,
@@ -135,13 +134,6 @@ export interface HumanDeps {
   /** Per-IP limiter shared with the other internet-facing routes. */
   allow: (ip: string) => boolean;
   fetchImpl?: FetchLike;
-  /** Invites for the agents coming with a ticket's holder, within the ticket's reach and budget
-   *  (server.ts, shared with the ticket site's API): what /account offers a ticket holder. */
-  ticketInvites?: {
-    mint(t: Ticket, agentName: string | undefined): { ok: true; invite: Invite } | { ok: false; status: number; body: Record<string, unknown> };
-    list(t: Ticket): Array<Record<string, unknown>>;
-    revoke(t: Ticket, code: string): boolean;
-  };
 }
 
 /** A link state is bound to the browser that asked for it (`nonce`, also in
@@ -369,45 +361,7 @@ export class HumanAuth {
     '/account/code': (q, res, b) => this.withAccount(q, res, (t) => this.accountCode(res, t, b)),
     '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(res, t)),
     '/account/google/unlink': (q, res) => this.withAccount(q, res, (t) => this.googleUnlink(res, t)),
-    '/account/agents': (q, res, b) => this.withAccount(q, res, (t) => this.agentInvite(res, t, b)),
-    '/account/agents/list': (q, res) => this.withAccount(q, res, (t) => this.agentInvites(res, t)),
-    '/account/agents/withdraw': (q, res, b) => this.withAccount(q, res, (t) => this.agentInviteWithdraw(res, t, b)),
   };
-
-  // ── agents coming with a ticket's holder ──
-
-  /** The live ticket this account holds (the one it claimed), if invites can be made for it here. */
-  private heldTicket(sub: string): Ticket | undefined {
-    if (!this.d.ticketInvites) return undefined;
-    return this.d.tickets.all().find((t) => t.claimedBy === sub);
-  }
-
-  private agentInvite(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
-    const ticket = this.heldTicket(t.sub);
-    if (!ticket) return json(res, 404, { error: 'invites for agents come with a ticket, and this account holds none' });
-    const name = typeof b.agentName === 'string' ? b.agentName.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 60) : '';
-    const r = this.d.ticketInvites!.mint(ticket, name || undefined);
-    if (!r.ok) {
-      const reason = r.body.reason;
-      return json(res, r.status, r.body.error === 'budget'
-        ? { error: reason === 'lifetime' ? 'this ticket has made all the invites it can' : 'you already have the most invites waiting at once — once one is used, or expires, you can make another' }
-        : { error: String(r.body.error ?? 'that didn’t go through') });
-    }
-    json(res, 200, { code: r.invite.code, expiresAt: r.invite.expiresAt, enrollUrl: `${this.d.cfg.publicUrl}/enroll`, agentsMd: `${this.d.cfg.publicUrl}/agents.md` });
-  }
-
-  private agentInvites(res: ServerResponse, t: Aid1Payload): void {
-    const ticket = this.heldTicket(t.sub);
-    if (!ticket) return json(res, 404, { error: 'invites for agents come with a ticket, and this account holds none' });
-    json(res, 200, { invites: this.d.ticketInvites!.list(ticket), agentsMd: `${this.d.cfg.publicUrl}/agents.md` });
-  }
-
-  private agentInviteWithdraw(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
-    const ticket = this.heldTicket(t.sub);
-    if (!ticket) return json(res, 404, { error: 'invites for agents come with a ticket, and this account holds none' });
-    if (!this.d.ticketInvites!.revoke(ticket, String(b.code ?? ''))) return json(res, 404, { error: 'no such invite waiting' });
-    json(res, 200, { ok: true });
-  }
 
   // ── sign-in ──
 
@@ -864,8 +818,6 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // an email-made row has no anchor to be named by: its name is its own to set
       nameEditable: t.sub.startsWith('human:email:'),
       ticket: a?.ticket ? { since: a.ticket.claimedAt, audiences: a.ticket.audiences, scopes: a.ticket.scopes } : null,
-      // a ticket holder makes invites for the agents coming with them here
-      agentInvites: Boolean(this.heldTicket(t.sub)),
       codes: (a?.codes ?? []).flatMap((r) => {
         const c = this.d.codes.byId(r.id);
         return c && !c.revoked ? [{ label: c.label, audiences: c.audiences, at: r.at }] : [];
