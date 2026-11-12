@@ -314,6 +314,7 @@ export class HomeNode {
    *                                   its unclaimed invites, its agents' grants); the identities stay
    *   POST   /tickets/invites         {email, ref, agentName?} → 201 {code, enrolUrl, expiresAt, agentsMd}
    *   GET    /tickets/invites?email=…|ref=…
+   *   GET    /tickets/invites/<code>  → {email, refs} — the ticket an invite was made for
    *   DELETE /tickets/invites/<code>  204 — revoke an unclaimed invite of a ticket
    */
   private async ticketsApi(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
@@ -489,6 +490,14 @@ export class HomeNode {
 
   private async ticketInvites(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     const code = /^\/tickets\/invites\/(.+)$/.exec(url.pathname)?.[1];
+    if (code !== undefined && req.method === 'GET') {
+      // Whose ticket an invite was made for (by the ticket site, or by the holder on /account): how the ticket
+      // site finds the holder when an agent registers with the code.
+      const inv = this.invites.all().find((i) => i.code === decodeURIComponent(code) && i.ticket);
+      const t = inv ? this.tickets.byId(inv.ticket!) : undefined;
+      if (!t) return json(res, 404, { error: 'no such invite for a ticket' });
+      return json(res, 200, { email: t.email, refs: [...new Set([...(t.refs ?? []), ...(t.source.startsWith('api:') ? [t.source.slice(4)] : [])])] });
+    }
     if (code !== undefined) {
       if (req.method !== 'DELETE') return json(res, 404, { error: 'not found' });
       const inv = this.invites.all().find((i) => i.code === decodeURIComponent(code) && i.ticket);

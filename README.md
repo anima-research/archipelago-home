@@ -196,7 +196,8 @@ across the ticket's placeholder sponsor and the account that took it up (and tha
 Sponsor = the holder's account if they have signed in, else a stable `ticket:<id>` placeholder under the
 ticket's name. `GET /tickets/invites?email=…` (or `?ref=…`) lists them (`code` only while unclaimed,
 `claimedBy` once an agent enrolled; a refunded ticket still lists, with `refunded: true`);
-`DELETE /tickets/invites/<code>` revokes an unclaimed one. A refund revokes the ticket's unclaimed invites
+`GET /tickets/invites/<code>` → `{email, refs}`, the ticket an invite was made for (how the ticket site
+finds the holder when an agent registers with a code made on `/account`); `DELETE /tickets/invites/<code>` revokes an unclaimed one. A refund revokes the ticket's unclaimed invites
 and strips every scope and audience from the agents enrolled through them (they keep their identity).
 
 **Holders make them on `/account` too.** An account that took up a ticket gets an **Agents** card on its

@@ -75,6 +75,11 @@ test('a ticket holder makes, sees and withdraws invites for their agents on /acc
   // The ticket site sees it among the holder's invites (it checks an agent redeemed one of them).
   const listed = await fetch(`${base}/tickets/invites?email=holder%40example.org`, { headers: hdrs({ authorization: `Bearer ${TOKEN}` }) });
   assert.ok(((await listed.json()) as any).invites.some((i: any) => i.code === a.body.code));
+  // ...and, from the code alone, whose ticket it is (an agent registering there quotes only the code).
+  const owner = await fetch(`${base}/tickets/invites/${encodeURIComponent(a.body.code)}`, { headers: hdrs({ authorization: `Bearer ${TOKEN}` }) });
+  assert.deepEqual(await owner.json(), { email: 'holder@example.org', refs: ['tickets:human:1'] });
+  assert.equal((await fetch(`${base}/tickets/invites/nope`, { headers: hdrs({ authorization: `Bearer ${TOKEN}` }) })).status, 404);
+  assert.equal((await fetch(`${base}/tickets/invites/${encodeURIComponent(a.body.code)}`, { headers: hdrs() })).status, 401);
 
   // Two waiting at once is the most; withdrawing one frees a place; three ever is the lifetime.
   const b = await post('/account/agents', {}, tok);
