@@ -818,6 +818,7 @@ test('open somewhere: a Google newcomer who starts at the wrong door gets an acc
   const closed = await googleLogin('eidoverse');
   assert.equal(closed.status, 403);
   assert.match(closed.text, /signed in, but/);
+  assert.match(closed.text, /open <a href="\/account">your account<\/a>/);
   assert.match(closed.text, /Open to everyone: <a href="https:\/\/notes\.test">notes\.test<\/a>/);
   const row = node.accounts.bySub('human:google:g-open-2');
   assert.ok(row);
@@ -847,6 +848,7 @@ test('open somewhere: a Google newcomer who starts at the wrong door gets an acc
   const d = await discordLogin('eidoverse');
   assert.equal(d.status, 403);
   assert.match(d.text, /Open to everyone: <a href="https:\/\/notes\.test">/);
+  assert.doesNotMatch(d.text, /open <a href="\/account">/); // no account here: nothing to open
   discordRoles = ['r-member'];
 });
 

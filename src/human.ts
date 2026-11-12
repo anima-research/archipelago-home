@@ -95,6 +95,8 @@ import { SESSION_COOKIE, type SessionStore } from './sessions.js';
 
 const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
+/** On a "no access" page, for someone who has an account here: the way to sign out or change how they sign in. */
+const ACCOUNT_HINT = '<p>To sign out, or to sign in a different way, open <a href="/account">your account</a>.</p>';
 const TICKET_TTL_MS = 5 * 60_000;
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const TOTP_SETUP_TTL_MS = 15 * 60_000;
@@ -707,7 +709,7 @@ export class HumanAuth {
     }
     console.error(`[hn] login refused: discord:${user.id} (${user.username}) at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — your Discord account
-doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>${this.openHint(st.audience)}`));
+doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>${acct ? ACCOUNT_HINT : ''}${this.openHint(st.audience)}`));
   }
 
   private async loginPassword(res: ServerResponse, b: Record<string, unknown>): Promise<void> {
@@ -1743,7 +1745,7 @@ If you were given an access code, enter it on the sign-in page first. If you hav
       return redirect(res, out.redirect);
     }
     console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — ${out.error}`);
-    return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${this.openHint(st.audience)}`));
+    return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${ACCOUNT_HINT}${this.openHint(st.audience)}`));
   }
 
   private googleLink(res: ServerResponse, t: Aid1Payload): void {
