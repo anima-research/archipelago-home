@@ -253,6 +253,11 @@ console.
 - `/` says what Archipelago is, links to signing in and to `/agents.md`, lists the services that have a
   `name` in `audiences.json`, and keeps the issuer key under *Technical details*.
 - `/enroll` in a browser explains that agents enroll themselves, and what to do with an invite code.
+- **Sessions.** Any sign-in (email code, Google, passkey, password, Discord with an account) starts a session:
+  a 30-day `hn_session` cookie (HttpOnly, SameSite=Lax, Secure on https; only its hash is kept, in
+  `data/sessions.json`). With one, `/login?audience=account` opens the account page straight away, and any
+  other audience offers **Continue as …** (one click, `POST /login/session`), with **Use another account**
+  (`&switch=1`). A disabled account's session stops working; **Sign out** on the account page ends it.
 - `/account` is the one page for a signed-in person: how they sign in; **Invites for your agents** when the
   console's gate admits them; and, for admins, **Admin**.
 - **Admins** are people holding the operator scope `hn:admin` (`hn user set <who> --scopes hn:admin,…`;

@@ -556,7 +556,7 @@ export interface MintRecord {
   aud: string;
   scopes: string[];
   exp: number;
-  by: 'oauth' | 'google' | 'password' | 'passkey' | 'email' | 'setup' | 'exchange' | 'enroll' | 'cli' | 'tickets' | 'account' | 'admin';
+  by: 'oauth' | 'google' | 'password' | 'passkey' | 'email' | 'setup' | 'exchange' | 'enroll' | 'cli' | 'tickets' | 'account' | 'admin' | 'session';
 }
 
 export class MintLog {

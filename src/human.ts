@@ -91,6 +91,7 @@ import { esc, html, json, page, readJson, redirect, securePage } from './http.js
 import { consoleRequiredScopes, type InvitePolicy } from './policy.js';
 import { accountPage, loginPage, setupPage, type PageSite } from './pages.js';
 import type { SiteInfo } from './site.js';
+import { SESSION_COOKIE, type SessionStore } from './sessions.js';
 
 const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
@@ -145,6 +146,8 @@ export interface HumanDeps {
   site: JsonStore<SiteInfo>;
   /** Agent invites: made from the account page by people the console's gate admits. */
   invites: InviteStore;
+  /** Sign-in sessions: sign in once, continue as that account (sessions.ts). */
+  sessions: SessionStore;
 }
 
 /** A link state is bound to the browser that asked for it (`nonce`, also in
@@ -340,7 +343,7 @@ export class HumanAuth {
       else if (p === '/account/me') this.me(req, res);
       else if (!isLogin) return false;
       else if (!this.d.allow(ip)) json(res, 429, { error: 'too many requests — wait a minute' });
-      else if (p === '/login') this.loginPage(url, res);
+      else if (p === '/login') await this.loginPage(req, url, res);
       else if (p === '/login/discord') this.discordStart(url, res);
       else if (p === '/oauth/callback') await this.callback(req, url, res);
       else if (p === '/login/google') this.googleStart(url, res);
@@ -374,6 +377,8 @@ export class HumanAuth {
     '/login/passkey/finish': (_q, res, b) => this.passkeyLoginFinish(res, b),
     '/login/email/begin': (_q, res, b, ip) => this.emailLoginBegin(res, b, ip),
     '/login/email/finish': (_q, res, b, ip) => this.emailLoginFinish(res, b, ip),
+    '/login/session': (q, res, b) => this.loginSession(q, res, b),
+    '/account/signout': (q, res) => this.signOut(q, res),
     '/account/email/begin': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkBegin(res, t, b, ip)),
     '/account/email/finish': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkFinish(res, t, b, ip)),
     '/account/email/unlink': (q, res) => this.withAccount(q, res, (t) => this.emailUnlink(res, t)),
@@ -575,10 +580,18 @@ export class HumanAuth {
     return state;
   }
 
-  private loginPage(url: URL, res: ServerResponse): void {
+  private async loginPage(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
     const audience = url.searchParams.get('audience') ?? '';
     if (!this.audienceRedirect(audience)) {
       return html(res, 400, page('unknown audience', `<p>Unknown audience <code>${esc(audience)}</code>.</p>`));
+    }
+    // Signed in here already (a session): the node's own account page opens straight away; any other
+    // service gets a one-click "Continue as", so nobody is signed in to a service without asking.
+    // `?switch=1` is "use another account".
+    const sess = url.searchParams.get('switch') ? undefined : this.sessionAccount(req);
+    if (sess && audience === 'account') {
+      const out = this.issue('account', await this.resolve(sess), 'session');
+      if (out.ok) return redirect(res, out.redirect);
     }
     const state = this.newState({ intent: 'login', audience, exp: Date.now() + STATE_TTL_MS });
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
@@ -588,7 +601,8 @@ export class HumanAuth {
     const prefill = (url.searchParams.get('email') ?? '').trim().slice(0, 254);
     securePage(res, 200, (nonce) =>
       loginPage({
-        iss: this.d.cfg.iss, site: this.d.site.get(), audience, ...(this.d.audiences.get()[audience]?.name ? { audienceName: this.d.audiences.get()[audience]!.name } : {}),
+        iss: this.d.cfg.iss, site: this.d.site.get(), audience,
+        ...(sess ? { continueAs: displayName(sess) } : {}), ...(this.d.audiences.get()[audience]?.name ? { audienceName: this.d.audiences.get()[audience]!.name } : {}),
         state, discord: this.discordOn, google: this.googleOn, email: this.emailOn,
         ticketed: this.emailOn && this.d.ticketDefaults.get().allowed.audiences.includes(audience),
         ...(this.emailOn && usableEmail(prefill) ? { prefillEmail: prefill } : {}),
@@ -687,7 +701,10 @@ export class HumanAuth {
       ? { sub: acct.sub, name: displayName(acct), grant, account: acct }
       : { sub: `human:discord:${user.id}`, name: discordName, grant };
     const out = this.issue(st.audience, who, 'oauth');
-    if (out.ok) return redirect(res, out.redirect);
+    if (out.ok) {
+      if (acct) this.startSession(res, acct.sub, 'oauth'); // a row-less Discord sign-in has nothing to continue as
+      return redirect(res, out.redirect);
+    }
     console.error(`[hn] login refused: discord:${user.id} (${user.username}) at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — your Discord account
 doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>${this.openHint(st.audience)}`));
@@ -715,7 +732,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       this.tickets.set(ticket, { sub: acct.sub, state: String(b.state), exp: Date.now() + TICKET_TTL_MS, tries: 0 });
       return json(res, 200, { next: 'totp', ticket });
     }
-    return this.respond(res, await this.finishLogin(String(b.state), acct, 'password'));
+    return this.respondSignedIn(res, await this.finishLogin(String(b.state), acct, 'password'), acct.sub, 'password');
   }
 
   private async loginTotp(res: ServerResponse, b: Record<string, unknown>): Promise<void> {
@@ -742,7 +759,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       return json(res, 401, { error: 'wrong code' });
     }
     this.tickets.take(ticketId);
-    return this.respond(res, await this.finishLogin(t.state, this.d.accounts.bySub(acct.sub)!, 'password'));
+    return this.respondSignedIn(res, await this.finishLogin(t.state, this.d.accounts.bySub(acct.sub)!, 'password'), acct.sub, 'password');
   }
 
   /**
@@ -827,7 +844,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       ...a,
       passkeys: (a.passkeys ?? []).map((p) => (p.id === passkey.id ? { ...p, signCount: v.signCount, lastUsedAt: now } : p)),
     }))!;
-    return this.respond(res, await this.finishLogin(String(b.state), fresh, 'passkey'));
+    return this.respondSignedIn(res, await this.finishLogin(String(b.state), fresh, 'passkey'), fresh.sub, 'passkey');
   }
 
   /** Password/passkey path: resolve the grant (Discord leg included), mint,
@@ -944,6 +961,51 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     console.error(`[hn] login (${by}): ${payload.sub} (${payload.name}) → ${payload.aud} [${payload.scopes.join(' ')}]`);
     // Token rides the fragment — never hits logs or Referer headers (§8).
     return { ok: true, redirect: `${target}#token=${token}` };
+  }
+
+  // ── sign-in sessions (sessions.ts): sign in once here, continue as that account later ──
+
+  private sessionCookie(value: string, maxAgeS: number): string {
+    const secure = this.d.cfg.publicUrl.startsWith('https:') ? '; Secure' : '';
+    return `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAgeS}; HttpOnly; SameSite=Lax${secure}`;
+  }
+
+  /** Adds a cookie to the response, beside any it already sets. */
+  private addCookie(res: ServerResponse, c: string): void {
+    const prev = res.getHeader('set-cookie');
+    res.setHeader('set-cookie', [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), c]);
+  }
+
+  private startSession(res: ServerResponse, sub: string, by: string): void {
+    const s = this.d.sessions.create(sub, by);
+    this.addCookie(res, this.sessionCookie(s.value, s.maxAgeS));
+  }
+
+  /** The account this browser's session is for, if it's live and the account still signs in. */
+  private sessionAccount(req: IncomingMessage): HumanAccount | undefined {
+    const s = this.d.sessions.find(cookie(req, SESSION_COOKIE));
+    const a = s ? this.d.accounts.bySub(s.sub) : undefined;
+    return a && !a.disabled ? a : undefined;
+  }
+
+  /** A sign-in that went through: the token's redirect, and a session for next time. */
+  private respondSignedIn(res: ServerResponse, out: Outcome, sub: string, by: string): void {
+    if (out.ok) this.startSession(res, sub, by);
+    this.respond(res, out);
+  }
+
+  /** "Continue as …" on the sign-in page: the session's account, through the same checks as any sign-in. */
+  private async loginSession(req: IncomingMessage, res: ServerResponse, b: Record<string, unknown>): Promise<void> {
+    const a = this.sessionAccount(req);
+    if (!a) return json(res, 401, { error: 'that sign-in has ended — sign in again' });
+    this.respond(res, await this.finishLogin(String(b.state ?? ''), a, 'session'));
+  }
+
+  /** Signing out here ends this browser's session (tokens already out live out their minutes). */
+  private signOut(req: IncomingMessage, res: ServerResponse): void {
+    this.d.sessions.end(cookie(req, SESSION_COOKIE));
+    this.addCookie(res, this.sessionCookie('', 0));
+    json(res, 200, { ok: true });
   }
 
   private respond(res: ServerResponse, out: Outcome): void {
@@ -1407,7 +1469,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       console.error(`[hn] account: ${acct.sub} took up the ticket for ${maskEmail(email)} (${ticket.source}) → ${ticket.audiences.join(', ') || 'no audiences'}`);
     }
     checked.spend();
-    return this.respond(res, await this.finishLogin(state, acct, 'email'));
+    return this.respondSignedIn(res, await this.finishLogin(state, acct, 'email'), acct.sub, 'email');
   }
 
   private setName(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
@@ -1676,7 +1738,10 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     const who = await this.resolve(acct);
     if (this.d.accounts.bySub(acct.sub)?.disabled) return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     const out = this.issue(st.audience, who, 'google');
-    if (out.ok) return redirect(res, out.redirect);
+    if (out.ok) {
+      this.startSession(res, acct.sub, 'google');
+      return redirect(res, out.redirect);
+    }
     console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${this.openHint(st.audience)}`));
   }

@@ -28,6 +28,7 @@ import { emailKey } from './google.js';
 import { emailSenderFromConfig, type EmailSender } from './email.js';
 import type { FetchLike } from './oauth.js';
 import { consoleMovedPage, enrollPage, homePage, siteStore, type SiteInfo } from './site.js';
+import { SessionStore } from './sessions.js';
 import { esc, html, json, page, readJson } from './http.js';
 import {
   audiencesStore,
@@ -138,6 +139,8 @@ export class HomeNode {
   readonly ticketDefaults: JsonStore<TicketDefaults>;
   /** What the node calls itself for people (config/site.json). */
   readonly site: JsonStore<SiteInfo>;
+  /** Sign-in sessions (sessions.ts). */
+  readonly sessions: SessionStore;
   /** Null = email sign-in off. */
   readonly email: EmailSender | null;
   readonly human: HumanAuth;
@@ -159,6 +162,7 @@ export class HomeNode {
     this.tickets = new TicketStore(join(cfg.dataDir, 'tickets.json'));
     this.ticketDefaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json'));
     this.site = siteStore(join(cfg.configDir, 'site.json'));
+    this.sessions = new SessionStore(join(cfg.dataDir, 'sessions.json'));
     if (cfg.ticketsToken !== undefined && cfg.ticketsToken.length < 32) {
       throw new Error('HN_TICKETS_TOKEN must be at least 32 characters (e.g. openssl rand -base64 32)');
     }
@@ -180,6 +184,7 @@ export class HomeNode {
       fetchImpl: opts.fetchImpl,
       site: this.site,
       invites: this.invites,
+      sessions: this.sessions,
     });
   }
 

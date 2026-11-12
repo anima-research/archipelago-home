@@ -58,14 +58,20 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your account', consol
 // ── /login ──
 
 export function loginPage(o: {
-  iss: string; site: SiteInfo; audience: string; audienceName?: string; state: string; discord: boolean; google: boolean; email?: boolean; ticketed?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
+  iss: string; site: SiteInfo; audience: string; audienceName?: string; continueAs?: string; state: string; discord: boolean; google: boolean; email?: boolean; ticketed?: boolean; prefillEmail?: string; open?: boolean; nonce: string;
 }): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audienceName ?? o.audience;
   const body = `
 <h1>Sign in</h1>
 <p class="dim">to continue to <b>${esc(target)}</b></p>
 <p id="err" class="err" role="alert"></p>
-<section id="step1">
+${o.continueAs ? `<div class="card" id="cont">
+  <p class="dim small">You're signed in here as</p>
+  <p><b>${esc(o.continueAs)}</b></p>
+  <button id="cont-go" class="btn primary block" type="button">Continue as ${esc(o.continueAs)}</button>
+  <p class="small"><a href="/login?audience=${encodeURIComponent(o.audience)}&amp;switch=1">Use another account</a></p>
+</div>` : ''}
+<section id="step1"${o.continueAs ? ' hidden' : ''}>
   ${o.discord ? `<a class="btn discord block" href="/login/discord?state=${encodeURIComponent(o.state)}">Continue with Discord</a>` : ''}
   ${o.google ? `<a class="btn block" href="/login/google?state=${encodeURIComponent(o.state)}">Continue with Google</a>` : ''}
   ${o.discord || o.google ? '<div class="or">or</div>' : ''}
@@ -127,6 +133,14 @@ let ticket = null, conditional = null;
 const err = (m) => { $('err').textContent = m || ''; };
 const busy = (form, on) => form.querySelectorAll('button,input').forEach((e) => (e.disabled = on));
 const go = (r) => { if (r.body && r.body.redirect) { location.assign(r.body.redirect); return true; } return false; };
+if ($('cont-go')) $('cont-go').onclick = async () => {
+  err(''); $('cont-go').disabled = true;
+  const r = await post('/login/session', { state: S.state });
+  if (go(r)) return;
+  $('cont-go').disabled = false;
+  err(r.body.error || 'That didn’t work.');
+  if (r.status === 401) { $('cont').hidden = true; $('step1').hidden = false; }
+};
 
 $('pw').onsubmit = async (e) => {
   e.preventDefault(); err('');
@@ -279,7 +293,7 @@ function render(extra) {
   let s = '<div class="card"><p>Signed in as <b>' + h(me.name) + '</b></p><p class="dim small mono">' + h(me.sub) + '</p>' +
     (me.nameEditable ? '<form id="f-name" class="row"><input id="name-in" maxlength="32" value="' + h(me.name) + '" aria-label="Display name">' +
       '<button class="btn sm" type="submit">Set name</button></form><p class="dim small">What services see you as. 2–32 characters.</p>' : '') +
-    '<p class="dim small">This page stays signed in until ' + until + '.</p>' +
+    '<p class="dim small">This page stays signed in until ' + until + '. <button id="signout" class="btn sm" type="button">Sign out</button></p>' +
     ((me.open || []).length ? '<p>Open to everyone: ' + me.open.map((o) => '<a href="' + h(o.url) + '">' + h(o.host) + '</a>').join(', ') + '</p>' : '') +
     '</div>';
 
@@ -490,6 +504,9 @@ async function loadAgentsAdmin() {
 
 function wire() {
   const on = (id, ev, fn) => { const el = $(id); if (el) el['on' + ev] = fn; };
+  on('signout', 'click', async () => {
+    if (await act('/account/signout', {})) { token = null; location.replace('/'); }
+  });
   on('f-inv', 'submit', async (e) => {
     e.preventDefault();
     const r = await act('/account/invites', { label: $('inv-label').value.trim(), anchor: !!($('inv-anchor') && $('inv-anchor').checked) });
@@ -573,7 +590,7 @@ function wire() {
 }
 
 (async () => {
-  if (!token) return signIn('Sign in to see your account: how you sign in (an email code, Google, a passkey, a password), and more.');
+  if (!token) return location.replace('/login?audience=account');
   try { const r = await api('/account/me'); me = r.body; render(); } catch {}
 })();
 `;
