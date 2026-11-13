@@ -10,11 +10,13 @@
  *   human:discord:<snowflake>   row made from a Discord login — the sub they
  *                               always had, so nothing keyed to it moves
  *   human:local:<username>      row made by the operator (`hn user add`)
+ *   human:google:<google sub>   row made by signing up with Google and an
+ *                               access code (codes.ts)
  *
  * The sub is fixed at creation. Login methods attach to it and come and go;
  * a Discord-anchored row can't drop its Discord link (that link IS its sub).
- * Google is only ever a login method (google.ts): it never makes a row or a
- * sub of its own, and grants nothing by itself.
+ * Google grants nothing by itself (google.ts); a Google login makes a row
+ * only when it comes with an access code.
  *
  * Scopes: the Discord leg still decides what a Discord-linked person holds
  * (roles → scopes, read live at Discord login, or by bot lookup / a recent
@@ -73,6 +75,9 @@ export interface HumanAccount {
   passkeys?: Passkey[];
   /** WebAuthn user handle (random, base64url) — what a passkey stores as `user.id`. */
   webauthnUserId?: string;
+  /** Access codes this person redeemed (codes.ts): what each grants is read
+   *  live from codes.json, and only for that code's own audiences. */
+  codes?: Array<{ id: string; at: string }>;
   /** Operator grant, unioned with whatever Discord grants. */
   scopes?: string[];
   claims?: Record<string, unknown>;
@@ -367,10 +372,15 @@ export function operatorGrant(a: HumanAccount | undefined): RoleGrant | null {
 }
 
 /** Override → the anchor's own name (Discord name for a Discord-anchored
- *  row, username for a local one) → whatever else there is. */
+ *  row, Google name for a Google one, username for a local one) → whatever
+ *  else there is. */
 export function displayName(a: HumanAccount): string {
-  const anchored = a.sub.startsWith('human:discord:') ? a.discord?.name : a.username;
-  return (a.name || anchored || a.username || a.discord?.name || a.sub).slice(0, 32);
+  const anchored = a.sub.startsWith('human:discord:')
+    ? a.discord?.name
+    : a.sub.startsWith('human:google:')
+      ? a.google?.name || a.google?.email?.split('@')[0]
+      : a.username;
+  return (a.name || anchored || a.username || a.discord?.name || a.google?.name || a.sub).slice(0, 32);
 }
 
 /** Login methods still standing — an account must always keep one. (An

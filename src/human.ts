@@ -7,11 +7,15 @@
  *   GET  /oauth/callback          Discord's return leg (also: linking Discord to an account)
  *   GET  /login/google?state=…    → Google OIDC (`?via=google` skips the chooser)
  *   GET  /oauth/google/callback   Google's return leg (also: linking Google; claiming an invite)
+ *   POST /login/code              {state, code} → the code rides this sign-in: redeemed by
+ *                                 whichever method finishes it, and with Google or Discord
+ *                                 it also signs a newcomer up (codes.ts)
  *   POST /login/password          {state, username, password} → redirect | {next:"totp", ticket}
  *   POST /login/totp              {ticket, code}  (6-digit code or a recovery code)
  *   POST /login/passkey/begin     {state} → WebAuthn request options (discoverable, UV required)
  *   POST /login/passkey/finish    {state, credential}
  *   GET  /account (+ /account/…)  self-service, a built-in audience like the console
+ *                                 (POST /account/code redeems an access code there)
  *   GET  /account/setup#code=…    one-time setup link from `hn user add` / `hn user reset`
  *
  * Whatever the method, the result is the same as it always was: a 10-minute,
@@ -29,6 +33,7 @@ import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
 import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
+import { rejectionText, type AccessCode, type CodeRejection, type CodeStore } from './codes.js';
 import {
   grantForRoles,
   type AudiencesConfig,
@@ -85,6 +90,7 @@ export interface HumanDeps {
   cfg: HumanConfig;
   issuer: IssuerKey;
   accounts: AccountStore;
+  codes: CodeStore;
   principals: PrincipalStore;
   roles: JsonStore<RolesConfig>;
   audiences: JsonStore<AudiencesConfig>;
@@ -101,7 +107,8 @@ export interface HumanDeps {
  *  THEIR Discord or Google to the sender's account. `pkce` is the Google
  *  leg's code verifier, set when that leg starts. */
 type LoginState = { audience: string; exp: number; pkce?: string } & (
-  | { intent: 'login' }
+  /** `code`: an access code entered on the sign-in page, redeemed when the sign-in finishes. */
+  | { intent: 'login'; code?: string }
   | { intent: 'link'; provider: 'discord' | 'google'; sub: string; nonce: string }
 );
 type FactorCheck = 'ok' | 'bad' | 'locked';
@@ -231,6 +238,7 @@ export class HumanAuth {
   }
 
   private posts: Record<string, (req: IncomingMessage, res: ServerResponse, b: Record<string, unknown>) => Promise<void> | void> = {
+    '/login/code': (_q, res, b) => this.loginCode(res, b),
     '/login/password': (_q, res, b) => this.loginPassword(res, b),
     '/login/totp': (_q, res, b) => this.loginTotp(res, b),
     '/login/passkey/begin': (_q, res, b) => this.passkeyLoginBegin(res, b),
@@ -247,6 +255,7 @@ export class HumanAuth {
     '/account/passkeys/remove': (q, res, b) => this.withAccount(q, res, (t) => this.passkeyRemove(res, t, b)),
     '/account/discord/link': (q, res) => this.withAccount(q, res, (t) => this.discordLink(res, t)),
     '/account/discord/unlink': (q, res) => this.withAccount(q, res, (t) => this.discordUnlink(res, t)),
+    '/account/code': (q, res, b) => this.withAccount(q, res, (t) => this.accountCode(res, t, b)),
     '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(res, t)),
     '/account/google/unlink': (q, res) => this.withAccount(q, res, (t) => this.googleUnlink(res, t)),
   };
@@ -346,6 +355,15 @@ export class HumanAuth {
       console.error(`[hn] login refused: ${acct.sub} via discord — account disabled`);
       return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     }
+    if (st.code) {
+      // A code rides this sign-in: redeemed into the row, made now if this
+      // Discord person had none.
+      const r = acct
+        ? this.redeemInto(acct.sub, st.code)
+        : this.signUp(`human:discord:${user.id}`, st.code, { discord: snapshot });
+      if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}. Sign in without it, or ask for a new code.</p>`));
+      acct = r.account;
+    }
     const grant = mergeGrants(discordGrant, operatorGrant(acct));
     const who: Who = acct
       ? { sub: acct.sub, name: displayName(acct), grant, account: acct }
@@ -354,7 +372,7 @@ export class HumanAuth {
     if (out.ok) return redirect(res, out.redirect);
     console.error(`[hn] login refused: discord:${user.id} (${user.username}) — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — your Discord account
-doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. Ask an operator for access, then try again.</p>`));
+doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>`));
   }
 
   private async loginPassword(res: ServerResponse, b: Record<string, unknown>): Promise<void> {
@@ -499,8 +517,13 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private async finishLogin(state: string, acct: HumanAccount, by: MintRecord['by']): Promise<Outcome> {
     const st = this.states.get(state);
     if (!st || st.intent !== 'login') return { ok: false, status: 400, error: 'this sign-in page expired — reload it' };
-    const live = this.d.accounts.bySub(acct.sub);
+    let live = this.d.accounts.bySub(acct.sub);
     if (!live || live.disabled) return { ok: false, status: 403, error: 'this account is disabled' };
+    if (st.code) {
+      const r = this.redeemInto(live.sub, st.code);
+      if (typeof r === 'string') return { ok: false, status: 400, error: rejectionText(r) };
+      live = r.account;
+    }
     const who = await this.resolve(live);
     if (this.d.accounts.bySub(acct.sub)?.disabled) return { ok: false, status: 403, error: 'this account is disabled' };
     const out = this.issue(st.audience, who, by);
@@ -554,7 +577,9 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private issue(audience: string, who: Who, by: MintRecord['by']): Outcome {
     const target = this.audienceRedirect(audience);
     if (!target) return { ok: false, status: 400, error: `unknown audience ${audience}` };
-    const grant = who.grant;
+    // Codes count for their own audiences only (codes.ts) — read live, so a
+    // revoked code stops working at the next sign-in.
+    const grant = mergeGrants(who.grant, this.d.codes.grantFor(this.d.accounts.bySub(who.sub)?.codes, audience));
     if (audience === 'account') {
       // Managing your own sign-in needs an account, or a Discord login that
       // would qualify for something (strangers don't get to create rows).
@@ -665,6 +690,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       canLinkDiscord: this.discordOn && !discordAnchored && !a?.discord,
       google: a?.google ? { email: a.google.email, linked: Boolean(a.google.sub) } : null,
       canLinkGoogle: this.googleOn && !a?.google?.sub,
+      codes: (a?.codes ?? []).flatMap((r) => {
+        const c = this.d.codes.byId(r.id);
+        return c && !c.revoked ? [{ label: c.label, audiences: c.audiences, at: r.at }] : [];
+      }),
       scopes: t.scopes,
     };
   }
@@ -851,6 +880,54 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     json(res, 200, this.view(t));
   }
 
+  // ── access codes ──
+
+  private loginCode(res: ServerResponse, b: Record<string, unknown>): void {
+    const st = this.states.get(String(b.state ?? ''));
+    if (!st || st.intent !== 'login') return json(res, 400, { error: 'this sign-in page expired — reload it' });
+    const c = this.d.codes.check(String(b.code ?? ''));
+    if (typeof c === 'string') return json(res, 400, { error: rejectionText(c) });
+    st.code = String(b.code);
+    json(res, 200, { label: c.label, audiences: c.audiences });
+  }
+
+  private accountCode(res: ServerResponse, t: Aid1Payload, b: Record<string, unknown>): void {
+    const a = this.ensureAccount(t);
+    if (!a) return json(res, 404, { error: 'no account' });
+    const r = this.redeemInto(a.sub, String(b.code ?? ''));
+    if (typeof r === 'string') return json(res, 400, { error: rejectionText(r) });
+    json(res, 200, { ...this.view(t), redeemed: { label: r.code.label, audiences: r.code.audiences } });
+  }
+
+  /** Redeem a code into an existing row. */
+  private redeemInto(sub: string, code: string): { code: AccessCode; account: HumanAccount } | CodeRejection {
+    const c = this.d.codes.redeem(code, sub);
+    if (typeof c === 'string') return c;
+    const at = new Date().toISOString();
+    const had = Boolean(this.d.accounts.bySub(sub)?.codes?.some((x) => x.id === c.id));
+    const account = this.d.accounts.update(sub, (a) => (a.codes?.some((x) => x.id === c.id) ? a : { ...a, codes: [...(a.codes ?? []), { id: c.id, at }] }));
+    if (!account) return 'unknown';
+    if (!had) console.error(`[hn] account: ${sub} redeemed ${c.id} (${c.label}) → ${c.audiences.join(', ')}`);
+    return { code: c, account };
+  }
+
+  /** A newcomer with a code: the code is spent first, then their row is made. */
+  private signUp(sub: string, code: string, anchor: Pick<HumanAccount, 'discord' | 'google'>): { code: AccessCode; account: HumanAccount } | CodeRejection {
+    const existing = this.d.accounts.bySub(sub);
+    if (existing) return this.redeemInto(sub, code);
+    const c = this.d.codes.redeem(code, sub);
+    if (typeof c === 'string') return c;
+    const at = new Date().toISOString();
+    let account: HumanAccount;
+    try {
+      account = this.d.accounts.add({ sub, ...anchor, codes: [{ id: c.id, at }], createdAt: at, notes: `signed up with ${c.id}` });
+    } catch {
+      return this.redeemInto(sub, code); // another tab made it a moment ago
+    }
+    console.error(`[hn] account: ${sub} signed up with ${c.id} (${c.label}) → ${c.audiences.join(', ')}`);
+    return { code: c, account };
+  }
+
   // ── Google ──
 
   private googleStart(url: URL, res: ServerResponse): void {
@@ -934,14 +1011,29 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         }
       } else if (inv) acct = inv; // disabled: refused just below
     }
+    let fresh = false;
+    if (!acct && st.code) {
+      // Signing up: a Google account we don't know, with an access code.
+      const r = this.signUp(`human:google:${g.sub}`, st.code, {
+        google: { sub: g.sub, email: g.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now },
+      });
+      if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}.</p>`));
+      acct = r.account;
+      fresh = true;
+    }
     if (!acct) {
       console.error(`[hn] login refused: google:${g.sub} (${label}) — not linked to an account`);
       return html(res, 403, page('no account', `<p>Hi <b>${esc(label)}</b> — this Google account isn’t linked to an account here.
-If you have one, sign in another way and link Google under <a href="/login?audience=account">sign-in settings</a>; otherwise ask an operator.</p>`));
+If you were given an access code, enter it on the sign-in page first. If you have an account, sign in another way and link Google under <a href="/login?audience=account">sign-in settings</a>; otherwise ask an operator.</p>`));
     }
     if (acct.disabled) {
       console.error(`[hn] login refused: ${acct.sub} via google — account disabled`);
       return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
+    }
+    if (st.code && !fresh) {
+      const r = this.redeemInto(acct.sub, st.code);
+      if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}. Sign in without it, or ask for a new code.</p>`));
+      acct = r.account;
     }
     if (acct.google?.sub === g.sub && ((g.email && g.email !== acct.google.email) || (g.name && g.name !== acct.google.name))) {
       try {
@@ -1036,6 +1128,8 @@ If you have one, sign in another way and link Google under <a href="/login?audie
     this.respond(res, this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'setup'));
   }
 }
+
+const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 function cookie(req: IncomingMessage, name: string): string {
   for (const part of (req.headers.cookie ?? '').split(';')) {

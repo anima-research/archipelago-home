@@ -15,13 +15,19 @@
  *   hn user reset <username> [--clear-2fa] [--clear-passkeys]             → new setup link
  *   hn user set <username> [--scopes a,b] [--name "Display"] [--tier x] [--google <email> | --google none]
  *   hn user disable <username>     hn user enable <username>
+ *
+ *   hn code add --aud curation [--scopes x,y] [--label "…"] [--max-uses 50] [--expires 14d]  → the code (shown once)
+ *   hn code ls                      who redeemed what
+ *   hn code close <id>              no new redemptions (what it gave stays)
+ *   hn code revoke <id>             and take back what it gave, from everyone
  */
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { loadOrCreateIssuerKey } from './keys.js';
 import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './token.js';
-import { InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
+import { audiencesStore, InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
+import { CodeStore } from './codes.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
 import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
@@ -71,6 +77,8 @@ function main(): void {
   switch (cmd) {
     case 'user':
       return userCmd(cfg, principals, pos, flag);
+    case 'code':
+      return codeCmd(cfg, pos, flag);
 
     case 'mint': {
       const name = flag.get('name') ?? die('--name required');
@@ -315,6 +323,64 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     }
     default:
       die('usage: hn user add | ls | reset | set | disable | enable');
+  }
+}
+
+/** `hn code …` — access codes that grant audiences to people (codes.ts). */
+function codeCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): void {
+  try {
+    if (process.getuid?.() === 0 && statSync(cfg.dataDir).uid !== 0) {
+      die(`run as the service user, not root (e.g. sudo -u ${userInfoName(statSync(cfg.dataDir).uid)} …) — codes.json is 0600`);
+    }
+  } catch {
+    /* data dir missing: first run */
+  }
+  const codes = new CodeStore(join(cfg.dataDir, 'codes.json'));
+  const [sub, id] = pos;
+  const list = (v?: string) => v?.split(',').map((x) => x.trim()).filter(Boolean) ?? [];
+  switch (sub) {
+    case 'add': {
+      const audiences = list(flag.get('aud'));
+      if (!audiences.length) die('usage: hn code add --aud a[,b] [--scopes x,y] [--label "…"] [--max-uses N] [--expires 14d]');
+      const known = audiencesStore(join(cfg.configDir, 'audiences.json')).get();
+      for (const a of audiences) if (!known[a]) die(`no audience "${a}" in ${join(cfg.configDir, 'audiences.json')}`);
+      // what each audience requires comes along, so the code actually opens it
+      const scopes = [...new Set([...audiences.flatMap((a) => known[a]!.requiredScopes ?? []), ...list(flag.get('scopes'))])];
+      const maxUses = flag.has('max-uses') ? Number(flag.get('max-uses')) : undefined;
+      if (maxUses !== undefined && !(Number.isInteger(maxUses) && maxUses > 0)) die('--max-uses wants a positive whole number');
+      const expires = flag.has('expires') ? new Date(Date.now() + parseTtl(flag.get('expires')!)).toISOString() : undefined;
+      const { code, record } = codes.add({
+        label: (flag.get('label') ?? audiences.join(' + ')).slice(0, 60),
+        audiences,
+        scopes,
+        ...(maxUses ? { maxUses } : {}),
+        ...(expires ? { expires } : {}),
+      });
+      console.error(`[hn] ${record.id} "${record.label}" → ${audiences.join(', ')} [${scopes.join(' ') || 'no scopes'}]` +
+        `${maxUses ? ` · ${maxUses} uses` : ' · unlimited uses'}${expires ? ` · redeem by ${expires.slice(0, 16)}Z` : ''}`);
+      console.error(`[hn] the code (shown once — hand it out; it can also ride a link: ${cfg.publicUrl}/login?audience=${audiences[0]}#code=<code>):`);
+      console.log(code);
+      return;
+    }
+    case 'ls': {
+      const all = codes.all();
+      console.log(`codes (${all.length}):`);
+      for (const c of all) {
+        console.log(`  ${c.id}  "${c.label}"  → ${c.audiences.join(', ')} [${c.scopes.join(' ')}]  uses ${c.uses}${c.maxUses ? `/${c.maxUses}` : ''}` +
+          `${c.expires ? `  until ${c.expires.slice(0, 16)}Z` : ''}${c.revoked ? '  [REVOKED]' : c.closed ? '  [closed]' : ''}`);
+        for (const r of c.redeemed) console.log(`      ${r.at.slice(0, 16)}Z  ${r.sub}`);
+      }
+      return;
+    }
+    case 'close':
+    case 'revoke': {
+      if (!id) die(`usage: hn code ${sub} <id>`);
+      const c = codes.set(id, sub === 'close' ? { closed: true } : { closed: true, revoked: true }) ?? die(`no code ${id}`);
+      console.error(`[hn] ${c.id} ${sub === 'close' ? 'closed — no new redemptions; the ' + c.uses + ' who redeemed it keep access' : 'revoked — closed, and the access it gave is gone at each holder’s next sign-in'}`);
+      return;
+    }
+    default:
+      die('usage: hn code add | ls | close | revoke');
   }
 }
 

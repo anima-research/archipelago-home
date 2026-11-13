@@ -16,6 +16,7 @@ import {
 import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './policy.js';
 import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
+import { CodeStore } from './codes.js';
 import type { FetchLike } from './oauth.js';
 import { esc, html, json, page, readJson } from './http.js';
 import {
@@ -103,6 +104,7 @@ export class HomeNode {
   readonly invitePolicy: JsonStore<InvitePolicy>;
   readonly mintLog: MintLog;
   readonly accounts: AccountStore;
+  readonly codes: CodeStore;
   readonly human: HumanAuth;
   private limiter = new RateLimit();
   private server = createServer((req, res) => void this.route(req, res));
@@ -116,7 +118,9 @@ export class HomeNode {
     this.invitePolicy = invitePolicyStore(join(cfg.configDir, 'invite-policy.json'));
     this.mintLog = new MintLog(join(cfg.dataDir, 'minted.jsonl'));
     this.accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
+    this.codes = new CodeStore(join(cfg.dataDir, 'codes.json'));
     this.human = new HumanAuth({
+      codes: this.codes,
       cfg,
       issuer: this.issuer,
       accounts: this.accounts,
@@ -144,7 +148,7 @@ export class HomeNode {
 
   /** Resolves with the bound port (useful with port 0 in tests). */
   start(): Promise<number> {
-    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts]) s.startWatching();
+    for (const s of [this.principals, this.invites, this.roles, this.audiences, this.invitePolicy, this.accounts, this.codes]) s.startWatching();
     return new Promise((resolve) =>
       this.server.listen(this.cfg.port, this.cfg.bind, () => {
         const addr = this.server.address();
@@ -166,6 +170,7 @@ export class HomeNode {
     this.audiences.stopWatching();
     this.invitePolicy.stopWatching();
     this.accounts.stopWatching();
+    this.codes.stopWatching();
   }
 
   // ── routing ──
