@@ -241,18 +241,21 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       const gmail = /@(gmail|googlemail)\.com$/i.test(v.trim());
       const lines = clashes.map((clash) => {
         const who = clash.username ?? clash.sub;
+        const state =
+          (clash.disabled ? '; DISABLED' : '') +
+          (clash.scopes?.length ? `; holds ${clash.scopes.join(',')}` : '') +
+          (clash.withhold?.length ? `; withheld: ${clash.withhold.join(',')}` : '') +
+          (clash.ignoreRoles?.length ? `; roles set aside: ${clash.ignoreRoles.join(',')}` : '');
         return `  ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
-          (signedUpRow(clash)
-            ? ` — signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'})` +
-              (clash.withhold?.length ? `; withheld: ${clash.withhold.join(',')}` : '') +
-              (clash.ignoreRoles?.length ? `; roles set aside: ${clash.ignoreRoles.join(',')}` : '') +
-              `. To give it access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …` +
-              ` (--scopes replaces the list: include ${clash.scopes?.length ? `its current ${clash.scopes.join(',')}` : 'everything it should hold'})`
-            : '');
+          (signedUpRow(clash) ? ` — signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'})` : '') +
+          state +
+          `. If it's the person: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes … (replaces the list)`;
       });
+      const reported = clashes.some((c) => c.google?.sub);
       die(
         `${v} is already on ${clashes.length === 1 ? 'an account' : `${clashes.length} accounts`}:\n${lines.join('\n')}` +
-          (gmail ? '' : `\n  (an address outside Gmail is only what that Google account reported — Google vouches for it only on a Workspace domain; matching it is not the check)`),
+          (reported && !gmail ? `\n  (an address outside Gmail is only what that Google account reported — Google vouches for it only on a Workspace domain; matching it is not the check)` : '') +
+          `\n  If it isn't them: hn user add ${rawName ?? '<name>'} --scopes … (no --google) and send the setup link — they can link Google after.`,
       );
     }
     return { email: v.trim() };

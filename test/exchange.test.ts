@@ -181,15 +181,19 @@ test('enroll: with no audience to mint for, it refuses before writing anything',
   const guest = generateKey();
   const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_n', 'Nook'), { ...deps, knownAudiences: () => [] });
   assert.equal(res.status, 400);
+  assert.match(String((res.body as { error: string }).error), /no audience configured/);
   assert.equal(principals.byKey(guest.id), undefined);
   assert.equal(typeof invites.check('inv_n', Date.now()), 'object');
 });
 
-test('enroll: an invite with a token lifetime minting can’t parse refuses before writing anything', () => {
-  invites.mint({ code: 'inv_t', scopes: ['worlds:join'], maxUses: 1, tokenTtl: 'forever' });
-  const guest = generateKey();
-  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_t', 'Tern'), deps);
-  assert.equal(res.status, 400);
-  assert.equal(principals.byKey(guest.id), undefined);
-  assert.equal(typeof invites.check('inv_t', Date.now()), 'object');
+test('enroll: an invite whose token lifetime is unusable (unparseable, zero) refuses before writing anything', () => {
+  for (const [code, ttl] of [['inv_t', 'forever'], ['inv_0', '0m']] as const) {
+    invites.mint({ code, scopes: ['worlds:join'], maxUses: 1, tokenTtl: ttl });
+    const guest = generateKey();
+    const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, code, `Tern ${code}`), deps);
+    assert.equal(res.status, 400, ttl);
+    assert.match(String((res.body as { error: string }).error), /bad token lifetime/);
+    assert.equal(principals.byKey(guest.id), undefined);
+    assert.equal(typeof invites.check(code, Date.now()), 'object');
+  }
 });

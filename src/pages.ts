@@ -148,7 +148,7 @@ $('pw').onsubmit = async (e) => {
   const username = $('u').value.trim(), password = $('p').value;
   if (!username || !password) return err('Enter your username and password.');
   busy($('pw'), true);
-  await codePending;
+  if (!(await codeGate())) return busy($('pw'), false);
   const r = await post('/login/password', { state: S.state, username, password }).catch(() => ({ body: { error: 'Network error.' } }));
   busy($('pw'), false);
   if (go(r)) return;
@@ -174,24 +174,31 @@ $('back').onclick = () => { err(''); restart(); };
 
 const SIGNUP = ${scriptJson([o.google && 'Google', o.discord && 'Discord'].filter(Boolean))};
 // Every way to finish signing in waits for a code check still in flight,
-// so the code is on the sign-in before it completes.
-let codePending = Promise.resolve();
+// so the code is on the sign-in before it completes. A refused code stops
+// the first try (its reason stays up); the next one goes on without it.
+let codePending = Promise.resolve(true), codeError = '';
 function useCode(code) {
-  const timeout = new Promise((done) => setTimeout(() => { err('Checking the code is taking too long — sign in without it, or reload and try again.'); done(); }, 10000));
-  codePending = Promise.race([checkCode(code).catch(() => err('That code didn’t work.')), timeout]);
+  codePending = checkCode(code).catch(() => { codeError = 'That code didn’t work.'; err(codeError); return false; });
   return codePending;
 }
+async function codeGate() {
+  if (await codePending) return true;
+  codePending = Promise.resolve(true);
+  err(codeError + ' Sign in again to go on without it.');
+  return false;
+}
 document.querySelectorAll('a[href^="/login/google"],a[href^="/login/discord"]').forEach((a) => {
-  a.addEventListener('click', async (e) => { e.preventDefault(); await codePending; location.assign(a.href); });
+  a.addEventListener('click', async (e) => { e.preventDefault(); if (await codeGate()) location.assign(a.href); });
 });
 async function checkCode(code) {
   err('');
   const r = await post('/login/code', { state: S.state, code }).catch(() => ({ status: 0, body: { error: 'Network error.' } }));
-  if (r.status !== 200) return err(r.body.error || 'That code didn’t work.');
+  if (r.status !== 200) { codeError = r.body.error || 'That code didn’t work.'; err(codeError); return false; }
   $('code-box').hidden = true; $('code-box').open = false;
   const ok = $('code-ok'); ok.hidden = false;
   ok.textContent = 'Code accepted — ' + r.body.label + ' (access to ' + r.body.audiences.join(', ') + '). Now sign in' +
     (SIGNUP.length ? ' — new here? Continue with ' + SIGNUP.join(' or ') + ' to make your account.' : '.');
+  return true;
 }
 $('cf').onsubmit = (e) => { e.preventDefault(); const c = $('code').value.trim(); if (c) useCode(c); else err('Enter the code.'); };
 // A shared link can carry the code in its fragment: /login?audience=…#code=…
@@ -210,7 +217,7 @@ async function passkey(mode) {
   catch (e) { if (mode === 'modal') err(webauthnError(e)); return; }
   if (!cred) return;
   err('');
-  await codePending;
+  if (!(await codeGate())) return;
   const r = await post('/login/passkey/finish', { state: S.state, credential: credJSON(cred) }).catch(() => ({ body: { error: 'Network error.' } }));
   if (!go(r)) err(r.body.error || 'Passkey sign-in failed.');
 }

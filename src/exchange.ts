@@ -37,6 +37,8 @@ export type ExchangeResult =
   | { status: 400 | 403 | 503; body: { error: string } };
 
 const DEFAULT_AGENT_TTL = '7d';
+/** The longest lifetime an invite may set for its agent's tokens. */
+const MAX_TTL_MS = 366 * 86_400_000;
 /** Guests enrolled via invite default to a short leash unless the invite says otherwise. */
 const DEFAULT_ENROLL_TTL = '72h';
 
@@ -176,11 +178,13 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   // principal without its invite spent.)
   const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];
   if (!aud) return fail(400, 'no audience configured');
+  let ttlMs = NaN;
   try {
-    parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse
+    ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse
   } catch {
-    return fail(400, 'this invite has a bad token lifetime — ask for a new one');
+    /* refused just below */
   }
+  if (!(ttlMs > 0 && ttlMs <= MAX_TTL_MS)) return fail(400, 'this invite has a bad token lifetime — ask for a new one');
   deps.principals.add(p);
   deps.invites.consume(inv.code);
   return {

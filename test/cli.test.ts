@@ -36,10 +36,10 @@ const signedUp = (gsub: string, email: string, extra: Partial<HumanAccount> = {}
 
 test('cli: user add --google onto an account a sign-in made is refused — its details and the hn user set to run; nothing written', () => {
   const cases: Array<[HumanAccount, RegExp]> = [
-    [signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] }), /human:google:g1 \(linked\) — signed up by signing in \("Someone", signed up at docs, Google linked 2026-10-30\)\. To give it access, check it's them, then: hn user set human:google:g1 --scopes/],
+    [signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] }), /human:google:g1 \(linked\) — signed up by signing in \("Someone", signed up at docs, Google linked 2026-10-30\)\. If it's the person: hn user set human:google:g1 --scopes[^\n]*\n[^]*If it isn't them: hn user add someone --scopes … \(no --google\)/],
     [signedUp('g2', 'un@gmail.com', { username: 'unny' }), /hn user set unny --scopes/],
-    [signedUp('g3', 'off@gmail.com', { disabled: true }), /hn user enable human:google:g3 && hn user set human:google:g3 --scopes/],
-    [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /human:google:g4 \(linked\) — signed up by signing in .* include its current x:y/],
+    [signedUp('g3', 'off@gmail.com', { disabled: true }), /; DISABLED\. If it's the person: hn user enable human:google:g3 && hn user set human:google:g3 --scopes/],
+    [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /human:google:g4 \(linked\) — signed up by signing in .*; holds x:y\./],
   ];
   for (const [row, msg] of cases) {
     const { hn, rows, raw } = scratch([row]);
@@ -143,4 +143,12 @@ test('cli: the clash names every account on the address, their restrictions, and
   assert.match(r.out, /human:google:g30/);
   assert.match(r.out, /human:google:g31 .*withheld: docs:use/);
   assert.match(r.out, /only what that Google account reported/);
+});
+
+test('cli: the clash shows an invited row’s state too, and no "Google account reported" for an operator’s own invite', () => {
+  const { hn } = scratch([{ sub: 'human:local:cora', username: 'cora', google: { email: 'cora@corp.example' }, disabled: true, withhold: ['x:y'], createdAt: at }]);
+  const r = hn('add', 'cora2', '--google', 'cora@corp.example');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /human:local:cora \(invited\); DISABLED; withheld: x:y\. If it's the person: hn user enable cora && hn user set cora/);
+  assert.doesNotMatch(r.out, /Google account reported/);
 });

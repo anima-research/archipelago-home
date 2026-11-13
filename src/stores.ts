@@ -144,13 +144,13 @@ export class JsonStore<T> {
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
     if (!this.writable()) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
-    this.value = next;
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
     const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', this.mode !== undefined ? { mode: this.mode } : undefined);
     if (this.mode !== undefined) chmodSync(tmp, this.mode); // mode only applies on create
     renameSync(tmp, this.path);
+    this.value = next; // only once it's on disk: a failed write leaves nothing in memory either
     try {
       this.lastMtime = statSync(this.path).mtimeMs; // suppress self-reload
     } catch {

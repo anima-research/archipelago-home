@@ -995,6 +995,7 @@ test('nissa: the console reads the operator’s withhold live — an earlier tok
   assert.ok(!after.delegable.includes('docs:use'));
   const mint = await post('/console/invites', { anchor: true }, tok);
   assert.equal(mint.status, 403);
+  assert.match(String(mint.body.error), /id:anchor/); // refused for the withheld anchor, not for anything else
   const plain = await post('/console/invites', {}, tok);
   assert.equal(plain.status, 200, JSON.stringify(plain.body));
   assert.ok(!plain.body.invite.scopes.includes('docs:use'));
