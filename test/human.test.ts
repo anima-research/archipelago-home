@@ -4,7 +4,7 @@
  */
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HomeNode, type ServerConfig } from '../src/server.js';
@@ -519,20 +519,15 @@ test('Google: chooser offers it; the trip out is OIDC code flow with PKCE and on
   assert.equal(googleTokenBody!.get('client_secret'), 'gsecret');
 });
 
-test('Google: an unknown Google account gets nothing — an unverified one not even a row', async () => {
-  // unverified address: no row, nothing opens (not even sign-in settings)
-  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: false, name: 'Stranger' };
+test('Google: an unknown Google account gets nothing at a closed audience — its row (this node has an open one) holds nothing', async () => {
+  // verified or not: an address is never what grants anything
+  googleUser = { sub: 'g-stranger', email: 'stranger@corp.example', email_verified: false, name: 'Stranger' };
   const r = await googleLogin('eidoverse');
   assert.equal(r.status, 403);
-  assert.match(r.text, /isn’t linked to an account here/);
-  assert.equal(node.accounts.byGoogle('g-stranger'), undefined);
-  assert.equal((await googleLogin('account')).status, 403);
-  // verified (this node has an open audience): a row that holds nothing
-  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: true, name: 'Stranger' };
-  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.match(r.text, /signed in, but/);
   assert.equal(node.accounts.byGoogle('g-stranger')!.scopes, undefined);
+  assert.equal((await googleLogin('notes')).status, 302); // the open one, as the page promises
 });
-
 test('Google: an operator invite by address is claimed by the first VERIFIED sign-in, then follows the Google account', async () => {
   await node.accounts.add({
     sub: 'human:local:grace', username: 'grace', scopes: ['worlds:join'],
@@ -853,22 +848,6 @@ test('open somewhere: a Google newcomer who starts at the wrong door gets an acc
   discordRoles = ['r-member'];
 });
 
-test('google.verified: recorded at sign-up, refreshed at each sign-in (what hn user add trusts)', async () => {
-  googleUser = { sub: 'g-ver-1', email: 'ver@gmail.com', email_verified: true, name: 'Ver' };
-  assert.equal((await googleLogin('notes')).status, 302);
-  assert.equal(node.accounts.bySub('human:google:g-ver-1')!.google!.verified, true);
-  // a row from before the flag existed gets it at its next verified sign-in
-  node.accounts.update('human:google:g-ver-1', (a) => ({ ...a, google: { sub: a.google!.sub, email: a.google!.email, name: a.google!.name } }));
-  assert.equal((await googleLogin('notes')).status, 302);
-  assert.equal(node.accounts.bySub('human:google:g-ver-1')!.google!.verified, true);
-  // Google stops vouching (a new, unverified address): the flag goes
-  googleUser = { sub: 'g-ver-1', email: 'ver@elsewhere.example', email_verified: false, name: 'Ver' };
-  assert.equal((await googleLogin('notes')).status, 302);
-  const g = node.accounts.bySub('human:google:g-ver-1')!.google!;
-  assert.equal(g.email, 'ver@elsewhere.example');
-  assert.equal(g.verified, undefined);
-});
-
 test('open nowhere: a stranger’s Google sign-in still makes no row', async () => {
   const n2 = makeNode({}, { eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
   const b2 = `http://127.0.0.1:${await n2.start()}`;
@@ -916,7 +895,6 @@ test('review: an invitation to an address Google isn’t authoritative for can�
   const ok = await googleLogin('eidoverse');
   assert.equal(ok.status, 302);
   assert.equal(tokenFrom(ok.location!, 'eidoverse').sub, 'human:local:nina');
-  assert.equal(node.accounts.byUsername('nina')!.google!.verified, true);
 });
 
 test('review: a Google-made account can’t unlink Google, and a row whose Google was unlinked never signs in by it', async () => {
@@ -973,29 +951,6 @@ test('review: an account with restrictions can’t unlink Discord or Google (it 
 
 // ── Nissa's review (anima-review on #11) ──
 
-test('nissa: an account adopted by hn user add opens at its own next sign-in Google vouches for — not another account on the address', async () => {
-  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: true, name: 'Adopt' };
-  assert.equal((await googleLogin('notes')).status, 302);
-  // what `hn user add adopt --google adopt@gmail.com --scopes worlds:join` leaves (test/cli.test.ts)
-  node.accounts.update('human:google:g-adopt', (a) => ({ ...a, username: 'adopt', scopes: ['worlds:join'], google: { email: 'adopt@gmail.com' } }));
-  // another Google account now holding the address: not its invitation
-  googleUser = { sub: 'g-adopt-new', email: 'adopt@gmail.com', email_verified: true };
-  assert.equal((await googleLogin('eidoverse')).status, 403);
-  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, undefined);
-  // its own account, Google not vouching now: refused, still waiting
-  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: false };
-  assert.equal((await googleLogin('eidoverse')).status, 403);
-  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, undefined);
-  // its own account, vouched for: claimed, and the access opens
-  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: true, name: 'Adopt' };
-  const ok = await googleLogin('eidoverse');
-  assert.equal(ok.status, 302);
-  const p = tokenFrom(ok.location!, 'eidoverse');
-  assert.equal(p.sub, 'human:google:g-adopt');
-  assert.deepEqual(p.scopes, ['worlds:join']);
-  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, 'g-adopt');
-});
-
 test('nissa: withholding every scope someone holds leaves them nothing — audiences that take any grant refuse too', async () => {
   await node.accounts.add({ sub: 'human:local:wes', username: 'wes', password: await hashPassword('wes password 1'), scopes: ['x:y'], withhold: ['x:y'], createdAt: '' });
   assert.equal((await passwordLogin('wes', 'wes password 1', 'gate')).status, 403);
@@ -1028,6 +983,11 @@ test('nissa: the console reads the operator’s withhold live — an earlier tok
   const before = await me();
   assert.equal(before.canAnchor, true);
   assert.ok(before.residentScopes.includes('docs:use'));
+  node.accounts.update('human:local:sid', (a) => ({ ...a, withhold: ['docs:use'] }));
+  const mid = await me();
+  assert.equal(mid.canAnchor, true);
+  assert.ok(!mid.residentScopes.includes('docs:use')); // the resident list shown drops it too
+  assert.ok(mid.residentScopes.includes('worlds:join'));
   node.accounts.update('human:local:sid', (a) => ({ ...a, withhold: ['id:anchor', 'docs:use'] }));
   const after = await me();
   assert.equal(after.canAnchor, false);
@@ -1038,4 +998,27 @@ test('nissa: the console reads the operator’s withhold live — an earlier tok
   const plain = await post('/console/invites', {}, tok);
   assert.equal(plain.status, 200, JSON.stringify(plain.body));
   assert.ok(!plain.body.invite.scopes.includes('docs:use'));
+});
+
+test('nissa: while accounts.json can’t be read, nobody signs in — not even a Discord login that needs no row', async () => {
+  const n2 = makeNode();
+  const b2 = `http://127.0.0.1:${await n2.start()}`;
+  try {
+    await n2.accounts.add({ sub: 'human:discord:6601', discord: { id: '6601' }, disabled: true, createdAt: '' });
+    const path = join(n2.cfg.dataDir, 'accounts.json');
+    const good = readFileSync(path, 'utf8');
+    writeFileSync(path, JSON.stringify({ accounts: [{ sub: 'human:discord:6601', discord: { id: '6601' }, disabled: true, withhold: 'x', createdAt: '' }] }));
+    utimesSync(path, new Date(), new Date(Date.now() + 5000)); // a new mtime, so the store re-reads it
+    assert.equal((await get('/login?audience=eidoverse', b2)).status, 503);
+    discordUser = { id: '6601', username: 'dis', global_name: 'Dis' };
+    const start = await get('/login/discord?state=x', b2);
+    assert.equal(start.status, 503);
+    assert.match(readFileSync(path, 'utf8'), /"withhold":"x"/); // untouched
+    writeFileSync(path, good);
+    utimesSync(path, new Date(), new Date(Date.now() + 10000));
+    assert.equal((await get('/login?audience=eidoverse', b2)).status, 200);
+  } finally {
+    n2.stop();
+    discordUser = { id: '42', username: 'dee', global_name: 'Dee' };
+  }
 });

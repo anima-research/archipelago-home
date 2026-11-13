@@ -171,17 +171,10 @@ class Throttle {
 const restricted = (a: HumanAccount): boolean => Boolean(a.ignoreRoles?.length || a.withhold?.length);
 const RESTRICTED_UNLINK = 'an operator has set restrictions on this account — ask them to unlink it';
 
-/** The Google link a sign-in writes. `verified` only when Google is
- *  authoritative for the address it sent just now (google.ts) — an address
- *  kept from before (`fallback`) is not re-vouched. */
+/** The Google link a sign-in writes (`fallback`: the address kept when
+ *  Google sent none). */
 function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<HumanAccount['google']> {
-  return {
-    sub: g.sub,
-    email: g.email ?? fallback,
-    ...(g.email && g.emailAuthoritative ? { verified: true } : {}),
-    ...(g.name ? { name: g.name } : {}),
-    linkedAt: now,
-  };
+  return { sub: g.sub, email: g.email ?? fallback, ...(g.name ? { name: g.name } : {}), linkedAt: now };
 }
 
 export class HumanAuth {
@@ -234,6 +227,13 @@ export class HumanAuth {
     const isAccount = p === '/account' || p.startsWith('/account/');
     if (!isLogin && !isAccount) return false;
     res.setHeader('cache-control', 'no-store'); // tokens, tickets, challenges: never cached
+    if (!this.d.accounts.writable()) {
+      // accounts.json is there but unreadable or invalid: an empty store knows
+      // no one's restrictions or disabled accounts, so nobody signs in.
+      console.error(`[hn] sign-in refused (${p}): accounts.json can't be read — fix the file`);
+      if (p.startsWith('/login/') && req.method === 'POST') return json(res, 503, { error: 'sign-in is unavailable right now — try again later' }), true;
+      return html(res, 503, page('unavailable', '<p>Sign-in is unavailable right now. Try again later.</p>')), true;
+    }
     if (req.method === 'GET') {
       // The static pages and /account/me are cheap and unlimited (people
       // behind one venue NAT share an address); everything that starts or
@@ -386,7 +386,7 @@ export class HumanAuth {
     let acct = this.d.accounts.byDiscord(user.id);
     if (acct) acct = this.d.accounts.update(acct.sub, (a) => ({ ...a, discord: snapshot }));
     if (acct?.disabled) {
-      console.error(`[hn] login refused: ${acct.sub} via discord — account disabled`);
+      console.error(`[hn] login refused: ${acct.sub} via discord at ${st.audience} — account disabled`);
       return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     }
     if (st.code) {
@@ -562,7 +562,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (this.d.accounts.bySub(acct.sub)?.disabled) return { ok: false, status: 403, error: 'this account is disabled' };
     const out = this.issue(st.audience, who, by);
     if (out.ok) this.states.take(state);
-    else console.error(`[hn] login refused: ${acct.sub} via ${by} — ${out.error}`);
+    else console.error(`[hn] login refused: ${acct.sub} via ${by} at ${st.audience} — ${out.error}`);
     return out;
   }
 
@@ -600,7 +600,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       if (!live) {
         // The snapshot as the row holds it NOW: a restriction that landed
         // while the bot call was out dropped it, and that must hold.
-        const cur = this.d.accounts.bySub(acct.sub)?.discord;
+        account = this.d.accounts.bySub(acct.sub) ?? account; // operator scopes/tier as they are now, too
+        const cur = account.discord;
         const snap = cur?.id === dc.id ? cur : undefined;
         const age = snap?.checkedAt ? Date.now() - Date.parse(snap.checkedAt) : Infinity;
         if (age <= DISCORD_SNAPSHOT_MAX_AGE_MS) discordGrant = snap!.grant ?? null;
@@ -1055,26 +1056,22 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     let inv: HumanAccount | undefined;
     if (!acct) {
       const keyed = this.d.accounts.bySub(`human:google:${g.sub}`);
-      if (keyed && keyed.google && !keyed.google.sub && g.email && emailKey(keyed.google.email) === emailKey(g.email)) {
-        // Its own row, waiting to be claimed again (`hn user add` gave it
-        // access): the same proof as any invitation, at this sign-in.
-        inv = keyed;
-      } else if (keyed) {
+      if (keyed) {
         // A row keyed on this Google account that no longer links it: Google
         // was unlinked there, which took it away as a way in — codes and open
         // audiences don't bring it back.
-        console.error(`[hn] login refused: google:${g.sub} (${label}) — no longer linked to ${keyed.sub}`);
+        console.error(`[hn] login refused: google:${g.sub} (${label}) at ${st.audience} — no longer linked to ${keyed.sub}`);
         return html(res, 403, page('not linked', `<p>Hi <b>${esc(label)}</b> — this Google account was unlinked from its account here, so it doesn’t sign in any more. Sign in another way, and link it again under <a href="/login?audience=account">sign-in settings</a> if you want it back.</p>`));
       } else if (g.email) {
         const byAddr = this.d.accounts.byGoogleInvite(g.email);
-        // a row keyed on ANOTHER Google account waits for that account only
-        if (byAddr && !(byAddr.sub.startsWith('human:google:') && byAddr.sub !== `human:google:${g.sub}`)) inv = byAddr;
+        // a row keyed on another Google account is that account's alone
+        if (byAddr && !byAddr.sub.startsWith('human:google:')) inv = byAddr;
       }
     }
     if (inv && !inv.disabled && !g.emailAuthoritative) {
       // Google only vouches for Gmail and Workspace addresses (google.ts): an
       // invitation to anything else can't be claimed by a Google sign-in.
-      console.error(`[hn] login refused: google:${g.sub} (${label}) — invite on ${inv.sub} needs an address Google is authoritative for`);
+      console.error(`[hn] login refused: google:${g.sub} (${label}) at ${st.audience} — invite on ${inv.sub} needs an address Google is authoritative for`);
       return html(res, 403, page('invitation', `<p>There’s an invitation here for <b>${esc(g.email!)}</b>, but Google can only vouch that an address is yours for Gmail and Google Workspace accounts. Ask whoever invited you for a setup link instead.</p>`));
     }
     if (inv) {
@@ -1092,13 +1089,14 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       } else acct = inv; // disabled: refused just below
     }
     let fresh = false;
-    if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
+    if (!acct && !inv && !st.code && anyOpen(this.d.audiences.get())) {
       // This node is open to newcomers somewhere: a Google account we don't
       // know gets its row on first sign-in, wherever it started. The row
       // holds nothing — an open audience lets it in, everywhere else it is
       // refused with a pointer to what IS open (issue() decides, as for anyone).
-      // Verified addresses only: a row keyed on this Google account would
-      // shadow an operator invite to that address before it could be claimed.
+      // An invitation to this address was claimed or refused above, and
+      // `hn user add --google` refuses an address already on a row, so the
+      // row can't shadow one.
       try {
         acct = this.d.accounts.add({
           sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${st.audience}`,
@@ -1126,7 +1124,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
 If you were given an access code, enter it on the sign-in page first. If you have an account, sign in another way and link Google under <a href="/login?audience=account">sign-in settings</a>; otherwise ask an operator.</p>`));
     }
     if (acct.disabled) {
-      console.error(`[hn] login refused: ${acct.sub} via google — account disabled`);
+      console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — account disabled`);
       return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     }
     if (st.code && !fresh) {
@@ -1135,20 +1133,11 @@ If you were given an access code, enter it on the sign-in page first. If you hav
       acct = r.account;
     }
     const seen = acct.google;
-    if (
-      seen?.sub === g.sub &&
-      ((g.email && (g.email !== seen.email || g.emailAuthoritative !== Boolean(seen.verified))) || (g.name && g.name !== seen.name))
-    ) {
+    if (seen?.sub === g.sub && ((g.email && g.email !== seen.email) || (g.name && g.name !== seen.name))) {
       try {
         acct = this.d.accounts.update(acct.sub, (a) => {
           if (a.google?.sub !== g.sub) return a;
-          const next = { ...a.google, ...(g.name ? { name: g.name } : {}) };
-          if (g.email) {
-            next.email = g.email;
-            if (g.emailAuthoritative) next.verified = true;
-            else delete next.verified;
-          }
-          return { ...a, google: next };
+          return { ...a, google: { ...a.google, ...(g.email ? { email: g.email } : {}), ...(g.name ? { name: g.name } : {}) } };
         }) ?? acct;
       } catch {
         /* a new address that clashes with someone's invite: keep the old one on file */

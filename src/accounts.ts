@@ -57,16 +57,13 @@ export interface HumanAccount {
   };
   /**
    * Google login. No `sub` yet = an operator invite (`hn user add --google`):
-   * the first Google sign-in with this verified address claims the row and
-   * fills in `sub`. With `sub`, that Google account signs in here, whatever
+   * the first Google sign-in Google is authoritative for this address at
+   * (Gmail or Workspace, google.ts) claims the row and fills in `sub`. With `sub`, that Google account signs in here, whatever
    * its address is now (`email` is just the last one seen).
    */
   google?: {
     sub?: string;
     email: string;
-    /** Google vouched for `email` (email_verified) when it was last seen.
-     *  Absent = not known to be theirs — nothing may be granted by address. */
-    verified?: boolean;
     name?: string;
     linkedAt?: string;
   };
@@ -131,7 +128,6 @@ function accountsProblem(raw: unknown): string | null {
     }
     if (a.google) {
       if (typeof a.google.email !== 'string') return 'bad google email';
-      if (a.google.verified !== undefined && typeof a.google.verified !== 'boolean') return 'bad google verified';
       if (a.google.sub !== undefined) {
         if (typeof a.google.sub !== 'string' || !a.google.sub) return 'bad google sub';
         if (googles.has(a.google.sub)) return 'that Google account is linked elsewhere';
@@ -162,6 +158,13 @@ export class AccountStore {
   constructor(path: string) {
     // 0600: password hashes and TOTP secrets live here.
     this.store = new JsonStore(path, validateAccounts, { accounts: [] }, 'accounts', 0o600);
+  }
+
+  /** False while accounts.json is there but can't be read or fails
+   *  validation: sign-ins then refuse (human.ts), rather than run against
+   *  an empty store that knows no one's restrictions. */
+  writable(): boolean {
+    return this.store.writable();
   }
 
   startWatching(): void {

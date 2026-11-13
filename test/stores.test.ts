@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { audiencesStore, grantForRoles, InviteStore, mcplDirectory, openSites, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
@@ -120,9 +120,23 @@ test('audiences: a malformed signup is refused (the last good file stays); openS
     store.refresh();
     assert.deepEqual(store.get(), good, JSON.stringify(change));
   }
+  // …and does read the next good one (refresh isn't just keeping what it had)
+  const good2 = { notes: { ...good.notes, requiredScopes: null, signup: {} }, other: { redirect: 'https://other.test/auth' } };
+  writeFileSync(path, JSON.stringify(good2));
+  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  store.refresh();
+  assert.deepEqual(store.get(), good2); // requiredScopes: null still reads as none
 });
 
-test('openSites: points newcomers at the service (its redirect origin), not its API host', () => {
-  const all = { app: { redirect: 'https://app.example/auth', api: 'https://api.example/v1', signup: {} }, shut: { redirect: 'https://shut.example/auth' } };
-  assert.deepEqual(openSites(all), [{ audience: 'app', url: 'https://app.example', host: 'app.example' }]);
+test('openSites: points newcomers at the service (its redirect origin), not its API host; skips what isn’t a site', () => {
+  const all = {
+    app: { redirect: 'https://app.example/auth', api: 'https://api.example/v1', signup: {} },
+    shut: { redirect: 'https://shut.example/auth' },
+    badredir: { redirect: 'not a url', api: 'https://api.bad.example', signup: {} },
+    mail: { redirect: 'mailto:someone@example.com', signup: {} },
+  };
+  assert.deepEqual(openSites(all), [
+    { audience: 'app', url: 'https://app.example', host: 'app.example' },
+    { audience: 'badredir', url: 'https://api.bad.example', host: 'api.bad.example' },
+  ]);
 });

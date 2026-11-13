@@ -47,8 +47,11 @@ export class JsonStore<T> {
     let text: string;
     try {
       text = readFileSync(this.path, 'utf8');
-    } catch {
-      this.broken = false; // missing: nothing to protect; the first write makes it
+    } catch (err) {
+      // Missing: nothing to protect, the first write makes it. Any other
+      // read failure (permissions, a directory…) is a file we must not replace.
+      this.broken = (err as NodeJS.ErrnoException).code !== 'ENOENT';
+      if (this.broken) console.error(`[hn] ${this.label}: ${this.path} can't be read (${(err as Error).message}) — writes refused until it's fixed`);
       return null;
     }
     try {
@@ -128,9 +131,16 @@ export class JsonStore<T> {
     });
   }
 
+  /** Can this store write now? (Re-reads the file if it changed, so the
+   *  answer is about the file on disk, not the last poll.) */
+  writable(): boolean {
+    this.refresh();
+    return !this.broken;
+  }
+
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
-    if (this.broken) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
+    if (!this.writable()) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
     this.value = next;
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
@@ -228,6 +238,11 @@ function validatePrincipals(raw: unknown): PrincipalsFile | null {
 
 export class PrincipalStore {
   private store: JsonStore<PrincipalsFile>;
+
+  /** False while its file is there but can't be read: nothing may be written. */
+  writable(): boolean {
+    return this.store.writable();
+  }
 
   constructor(path: string) {
     this.store = new JsonStore(path, validatePrincipals, { principals: [] }, 'principals');
@@ -329,6 +344,11 @@ function validateInvites(raw: unknown): InvitesFile | null {
 
 export class InviteStore {
   private store: JsonStore<InvitesFile>;
+
+  /** False while its file is there but can't be read: nothing may be written. */
+  writable(): boolean {
+    return this.store.writable();
+  }
 
   constructor(path: string) {
     this.store = new JsonStore(path, validateInvites, { invites: [] }, 'invites');
@@ -475,11 +495,16 @@ export function openSites(all: AudiencesConfig): Array<{ audience: string; url: 
   const out: Array<{ audience: string; url: string; host: string }> = [];
   for (const [audience, a] of Object.entries(all)) {
     if (!signupGrant(all, audience)) continue;
-    try {
-      const u = new URL(a.redirect || a.api || '');
+    for (const raw of [a.redirect, a.api]) {
+      let u: URL;
+      try {
+        u = new URL(raw ?? '');
+      } catch {
+        continue; // malformed: try the next
+      }
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') continue; // mailto:, data: … — no site to send anyone to
       out.push({ audience, url: u.origin, host: u.host });
-    } catch {
-      /* a malformed URL: nothing to point at */
+      break;
     }
   }
   return out;
@@ -523,7 +548,7 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
-        if (v.requiredScopes !== undefined && !scopeList(v.requiredScopes)) return null;
+        if (v.requiredScopes != null && !scopeList(v.requiredScopes)) return null; // null = none, as it always read
         if (v.signup !== undefined && !signupOk(v.signup, v.requiredScopes ?? [])) return null;
       }
       return raw as AudiencesConfig;

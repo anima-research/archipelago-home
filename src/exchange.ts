@@ -34,7 +34,7 @@ export interface ExchangeDeps {
 
 export type ExchangeResult =
   | { status: 200; body: Record<string, unknown> }
-  | { status: 400 | 403; body: { error: string } };
+  | { status: 400 | 403 | 503; body: { error: string } };
 
 const DEFAULT_AGENT_TTL = '7d';
 /** Guests enrolled via invite default to a short leash unless the invite says otherwise. */
@@ -132,7 +132,7 @@ export function handleTokenRequest(body: unknown, deps: ExchangeDeps): ExchangeR
 export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult {
   const nowMs = deps.nowMs?.() ?? Date.now();
   const req = body as EnrollRequest;
-  const fail = (status: 400 | 403, error: string): ExchangeResult => {
+  const fail = (status: 400 | 403 | 503, error: string): ExchangeResult => {
     console.error(`[hn] /enroll rejected (${req?.name ?? 'no-name'}): ${error}`);
     return { status, body: { error } };
   };
@@ -168,6 +168,9 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
     notes: `enrolled via invite ${inv.code}${inv.label ? ` (${inv.label})` : ''}`,
   };
   if (deps.principals.bySub(p.sub)) return fail(403, 'name taken'); // slug collision
+  // Both files must take the write, or neither is touched: a principal
+  // written with its invite left unspent would block every retry.
+  if (!deps.invites.writable() || !deps.principals.writable()) return fail(503, 'enrollment is unavailable right now — try again later');
   deps.principals.add(p);
   deps.invites.consume(inv.code);
   const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];

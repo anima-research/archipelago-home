@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountStore, type HumanAccount } from '../src/accounts.js';
@@ -22,7 +22,7 @@ function scratch(rows: HumanAccount[]) {
     });
     return { status: r.status, out: `${r.stdout}${r.stderr}` };
   };
-  return { hn, rows: () => new AccountStore(file).all() };
+  return { hn, file, rows: () => new AccountStore(file).all() };
 }
 
 const at = '2026-10-30T00:00:00Z';
@@ -32,88 +32,60 @@ const signedUp = (gsub: string, email: string, extra: Partial<HumanAccount> = {}
   google: { sub: gsub, email, verified: true, name: 'Someone', linkedAt: at }, ...extra,
 });
 
-test('cli: user add --google adopts a verified sign-up row — same sub, codes kept, access waits for its next vouched sign-in', () => {
-  const { hn, rows } = scratch([signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] })]);
-  const r = hn('add', 'joanne', '--google', 'JoAnne@gmail.com', '--scopes', 'docs:use,worlds:join', '--name', 'Jo Anne', '--tier', 'x');
-  assert.equal(r.status, 0, r.out);
-  assert.match(r.out, /already has an account \(human:google:g1/);
-  const all = rows();
-  assert.equal(all.length, 1); // no second account
-  const a = all[0]!;
-  assert.equal(a.sub, 'human:google:g1');
-  assert.equal(a.username, 'joanne');
-  assert.equal(a.name, 'Jo Anne');
-  assert.deepEqual(a.scopes, ['docs:use', 'worlds:join']);
-  assert.deepEqual(a.claims, { tier: 'x' });
-  // an invitation on its own row: the Google account claims it again at a sign-in Google vouches for
-  assert.deepEqual(a.google, { email: 'jo.anne@gmail.com' });
-  assert.deepEqual(a.codes, [{ id: 'code_1', at }]);
-  assert.match(a.notes!, /^signed up at docs; hn user add /);
-});
-
-test('cli: two accounts on one address — refused, naming both', () => {
-  const { hn, rows } = scratch([signedUp('g9', 'two@gmail.com'), signedUp('g10', 'two@gmail.com', { google: { sub: 'g10', email: 'two@gmail.com', verified: true, linkedAt: at } })]);
-  const before = JSON.stringify(rows());
-  const r = hn('add', 'two', '--google', 'two@gmail.com', '--scopes', 'docs:use');
-  assert.notEqual(r.status, 0);
-  assert.match(r.out, /more than one account \(human:google:g9, human:google:g10\)/);
-  assert.equal(JSON.stringify(rows()), before);
-});
-
-test('cli: not adopted when Google isn’t its only way in, or it chose a username — the hint names hn user set', () => {
-  const pk = { id: 'pk1', publicKey: 'x', counter: 0, name: 'phone', createdAt: at };
+test('cli: user add --google onto an account a sign-in made is refused — its details and the hn user set to run; nothing written', () => {
   const cases: Array<[HumanAccount, RegExp]> = [
-    [signedUp('g11', 'pk@gmail.com', { passkeys: [pk] as unknown as HumanAccount['passkeys'] }), /hn user set human:google:g11 --scopes/],
-    [signedUp('g12', 'un@gmail.com', { username: 'unny' }), /hn user set unny --scopes/],
-    [signedUp('g13', 'off@gmail.com', { disabled: true }), /hn user enable human:google:g13 && hn user set human:google:g13 --scopes/],
+    [signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] }), /signed up by signing in \("Someone", signed up at docs, Google linked 2026-10-30\)\. To give that account access, check it's them, then: hn user set human:google:g1 --scopes/],
+    [signedUp('g2', 'un@gmail.com', { username: 'unny' }), /hn user set unny --scopes/],
+    [signedUp('g3', 'off@gmail.com', { disabled: true }), /hn user enable human:google:g3 && hn user set human:google:g3 --scopes/],
+    [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /already on human:google:g4 \(linked\) — they signed up/],
   ];
   for (const [row, msg] of cases) {
     const { hn, rows } = scratch([row]);
     const before = JSON.stringify(rows());
-    const r = hn('add', 'someone', '--google', row.google!.email, '--scopes', 'docs:use');
+    const r = hn('add', 'someone', '--google', row.google!.email.toUpperCase(), '--scopes', 'docs:use');
     assert.notEqual(r.status, 0, r.out);
     assert.match(r.out, msg);
-    assert.equal(JSON.stringify(rows()), before);
+    assert.equal(JSON.stringify(rows()), before, 'nothing written');
   }
 });
 
-test('cli: its own display name does not block the username', () => {
-  const { hn, rows } = scratch([signedUp('g2', 'al@gmail.com', { name: 'alice' })]);
-  const r = hn('add', 'alice', '--google', 'al@gmail.com');
-  assert.equal(r.status, 0, r.out);
-  assert.equal(rows()[0]!.username, 'alice');
+test('cli: user set --google can’t change a Google-made account’s link', () => {
+  const { hn, rows } = scratch([signedUp('g5', 'mine@gmail.com')]);
+  const before = JSON.stringify(rows());
+  const r = hn('set', 'human:google:g5', '--google', 'other@gmail.com');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /IS a Google identity/);
+  assert.equal(JSON.stringify(rows()), before);
 });
 
-test('cli: never adopted — unverified address, operator grants, a username, disabled', () => {
-  const cases: Array<[string, HumanAccount, RegExp]> = [
-    ['unverified', signedUp('g3', 'u@gmail.com', { google: { sub: 'g3', email: 'u@gmail.com', linkedAt: at } }), /hasn't vouched/],
-    ['granted', signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /already on human:google:g4 \(linked\)$/m],
-    ['named', signedUp('g5', 'w@gmail.com', { username: 'wendy' }), /already on human:google:g5 \(linked\) — they signed up/],
-    ['disabled', signedUp('g6', 'x@gmail.com', { disabled: true }), /already on human:google:g6/],
-  ];
-  for (const [label, row, msg] of cases) {
-    const { hn, rows } = scratch([row]);
-    const before = JSON.stringify(rows());
-    const r = hn('add', `new-${label}`, '--google', row.google!.email, '--scopes', 'docs:use');
-    assert.notEqual(r.status, 0, `${label}: ${r.out}`);
-    assert.match(r.out, msg, label);
-    assert.equal(JSON.stringify(rows()), before, `${label}: nothing written`);
-  }
+test('cli: a store that can’t read its file refuses the write with a one-line error, file untouched', () => {
+  const { hn, file } = scratch([]);
+  const bad = JSON.stringify({ accounts: [{ sub: 'human:local:keep', createdAt: at }, { sub: 'human:local:bad', withhold: 'x', createdAt: at }] });
+  writeFileSync(file, bad);
+  const r = hn('add', 'zed', '--google', 'zed@gmail.com');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /^hn: accounts: .* refusing to overwrite it/m);
+  assert.doesNotMatch(r.out, /\n\s+at /); // no stack trace
+  assert.equal(readFileSync(file, 'utf8'), bad);
 });
 
 test('cli: user set --google onto a sign-up row’s address refuses and names the command to run', () => {
-  const { hn } = scratch([signedUp('g7', 'p@gmail.com'), { sub: 'human:local:pat', username: 'pat', createdAt: at }]);
+  const { hn, rows } = scratch([signedUp('g7', 'p@gmail.com'), { sub: 'human:local:pat', username: 'pat', createdAt: at }]);
+  const before = JSON.stringify(rows());
   const r = hn('set', 'pat', '--google', 'p@gmail.com');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /hn user set human:google:g7 --scopes/);
+  assert.equal(JSON.stringify(rows()), before);
 });
 
-test('cli: restrict --withhold with no value is refused, nothing written', () => {
+test('cli: restrict with no value, or an empty one, is refused, nothing written', () => {
   const { hn, rows } = scratch([]);
-  const r = hn('restrict', '139758639064390000', '--withhold');
-  assert.notEqual(r.status, 0);
-  assert.match(r.out, /wants a value/);
-  assert.deepEqual(rows(), []);
+  for (const args of [['--withhold'], ['--withhold', ''], ['--ignore-roles', ','], ['--withhold', ' , ']]) {
+    const r = hn('restrict', '139758639064390000', ...args);
+    assert.notEqual(r.status, 0, args.join(' '));
+    assert.match(r.out, /wants a value/);
+    assert.deepEqual(rows(), []);
+  }
 });
 
 test('cli: a fresh address is still an invite on a new local account', () => {

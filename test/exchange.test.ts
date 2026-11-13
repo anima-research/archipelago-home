@@ -1,6 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKey } from '../src/keys.js';
@@ -16,6 +16,7 @@ const ISS = 'id.test';
 let deps: ExchangeDeps;
 let principals: PrincipalStore;
 let invites: InviteStore;
+let testDir: string;
 
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), 'hn-test-'));
@@ -36,6 +37,7 @@ beforeEach(() => {
   );
   principals = new PrincipalStore(join(dir, 'principals.json'));
   invites = new InviteStore(join(dir, 'invites.json'));
+  testDir = dir;
   deps = {
     issuer,
     iss: ISS,
@@ -149,4 +151,15 @@ test('a malformed ttl is refused before the proof is checked', () => {
   const req = { ...makeTokenRequest(agentKey.privateKey, agentKey.id, ISS, 'eidoverse'), ttl: 'forever' };
   const res = handleTokenRequest(req, deps);
   assert.equal(res.status, 400);
+});
+
+test('enroll: while invites.json can’t be read, nothing is written — no principal left behind an unspent invite', () => {
+  invites.mint({ code: 'inv_y', scopes: ['worlds:join'], maxUses: 1 });
+  const path = join(testDir, 'invites.json');
+  writeFileSync(path, '{ not json');
+  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  const guest = generateKey();
+  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_y', 'Wren'), deps);
+  assert.equal(res.status, 503);
+  assert.equal(principals.byKey(guest.id), undefined);
 });

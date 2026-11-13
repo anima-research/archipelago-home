@@ -31,7 +31,7 @@ import { mintToken, parseTtl, type Aid1Payload, type PrincipalKind } from './tok
 import { audiencesStore, InviteStore, MintLog, PrincipalStore, type Principal } from './stores.js';
 import { CodeStore } from './codes.js';
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
-import { AccountStore, displayName, loginMethods, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
+import { AccountStore, displayName, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
 
 function flags(args: string[]): { flag: Map<string, string>; pos: string[] } {
@@ -221,15 +221,8 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
 
-  /** A row a Google sign-in made by itself (an open audience, or a code) —
-   *  keyed on that Google account, nothing an operator gave it. */
-  const signedUpRow = (x: HumanAccount): boolean =>
-    Boolean(x.google?.sub) && x.sub === `human:google:${x.google!.sub}` && !x.scopes?.length && !x.claims;
-  /** …that `hn user add` may turn into an invitation on itself: no username
-   *  of its own yet, Google its only way in (so the claim gates the access),
-   *  Google authoritative for the address when last seen, and enabled. */
-  const adoptable = (x: HumanAccount): boolean =>
-    signedUpRow(x) && !x.username && loginMethods(x) === 1 && x.google!.verified === true && !x.disabled;
+  /** A row a Google sign-in made by itself (an open audience, or a code). */
+  const signedUpRow = (x: HumanAccount): boolean => Boolean(x.google?.sub) && x.sub === `human:google:${x.google!.sub}`;
 
   /** --google <email>: an invite by address, checked against everyone else's. */
   const googleFlag = (forSub?: string): { email: string } | null | undefined => {
@@ -240,12 +233,15 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     const k = emailKey(v);
     const clash = accounts.all().find((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
     if (clash) {
+      // Someone who signed up by signing in already has an account: the
+      // operator gives THAT one access, knowingly (an address can change
+      // hands, so nothing is granted to it by address alone).
+      const who = clash.username ?? clash.sub;
       die(
         `${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
           (signedUpRow(clash)
-            ? ` — they signed up by signing in; to give that account access, check it's them, then: ` +
-              `${clash.disabled ? `hn user enable ${clash.username ?? clash.sub} && ` : ''}hn user set ${clash.username ?? clash.sub} --scopes …` +
-              (!clash.google!.verified ? ` (Google hasn't vouched for that address on it)` : '')
+            ? ` — they signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'}).` +
+              ` To give that account access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …`
             : ''),
       );
     }
@@ -256,41 +252,8 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
       const tier = flag.get('tier');
-      // Already signed up with that Google address (an open audience, or a
-      // code), and Google vouched for it? Then THAT row is the person: it
-      // takes the username and the access, and keeps its sub — so whatever a
-      // service already holds under it (docs shares, comments) stays theirs.
-      const gv = flag.get('google');
-      const matches = gv && gv !== 'none' && looksLikeEmail(gv)
-        ? accounts.all().filter((x) => x.google && emailKey(x.google.email) === emailKey(gv))
-        : [];
-      if (matches.length > 1) die(`${gv} is on more than one account (${matches.map((x) => x.sub).join(', ')}) — pick one with hn user set`);
-      const mine = matches[0] && adoptable(matches[0]) ? matches[0] : undefined;
-      // its own display name doesn't count against it
-      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n), mine?.sub);
+      const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
       if (bad) die(bad);
-      if (mine) {
-        const day = new Date().toISOString().slice(0, 10);
-        const next = accounts.update(mine.sub, (x) => {
-          if (!adoptable(x) || emailKey(x.google!.email) !== emailKey(gv!)) throw new Error(`${x.sub} changed under us — run it again`);
-          // An invitation on its own row: the access waits for this Google
-          // account's next sign-in where Google vouches for the address THEN
-          // (an address may have moved on since the row last signed in).
-          return {
-            ...x,
-            username,
-            ...(flag.get('name') ? { name: flag.get('name')!.slice(0, 32) } : {}),
-            ...(scopesFlag ? { scopes: scopesFlag } : {}),
-            ...(tier ? { claims: { tier } } : {}),
-            google: { email: x.google!.email },
-            notes: `${x.notes ? `${x.notes}; ` : ''}hn user add ${day}`,
-          };
-        })!;
-        console.error(`[hn] ${gv} already has an account (${next.sub}, made when they first signed in) — it takes the username ${username} [${(scopesFlag ?? []).join(' ') || 'no scopes yet — hn user set --scopes'}]`);
-        console.error(`[hn] it opens at their next "Continue with Google" as that address (Google vouching then), same as any invite. For a password too: hn user reset ${username}`);
-        console.log(describe(next));
-        return;
-      }
       const google = googleFlag();
       const { code, setup } = newSetupCode();
       accounts.add({
@@ -355,6 +318,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         const clash = accounts.all().some((x) => x.sub !== a.sub && (x.username === n || x.name?.toLowerCase() === n));
         if (clash || principals.nameTaken(n)) die(`the name "${newName}" is already in use here`);
       }
+      if (flag.has('google') && a.google?.sub && a.sub === `human:google:${a.google.sub}`) {
+        die(`${a.sub} IS a Google identity — its Google link can't be changed (make a new account for another address)`);
+      }
       const google = googleFlag(a.sub);
       if (google !== undefined && a.google?.sub) console.error(`[hn] note: replacing the linked Google account (${a.google.email}) on ${a.sub}`);
       const next = accounts.update(a.sub, (x) => {
@@ -377,7 +343,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       // flags first: a bad one must not leave a fresh row behind
       const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
       const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
-      for (const f of ['ignore-roles', 'withhold']) if (flag.get(f) === 'true') die(`--${f} wants a value (comma-separated)`);
+      for (const [f, list] of [['ignore-roles', ign], ['withhold', wh]] as const) {
+        if (flag.has(f) && (flag.get(f) === 'true' || !list?.length)) die(`--${f} wants a value (comma-separated); to lift restrictions use --clear`);
+      }
       if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
       let a = rawName ? (accounts.byUsername(rawName) ?? accounts.bySub(rawName) ?? accounts.byDiscord(rawName.replace(/^human:discord:/, ''))) : undefined;
       if (!a && rawName && /^(human:discord:)?\d{15,22}$/.test(rawName)) {
@@ -470,4 +438,9 @@ function codeCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): v
   }
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  // e.g. a store refusing to overwrite a file it can't read (stores.ts)
+  die((err as Error).message);
+}

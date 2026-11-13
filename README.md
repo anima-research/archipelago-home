@@ -93,13 +93,10 @@ holds no scopes, so a closed audience still refuses them; its refusal page (and 
 lists the sites open to everyone, so someone who came in the wrong door sees where to go.
 
 Inviting someone who already signed up this way (`hn user add <name> --google <their address>`)
-doesn't make a second account: their existing `human:google:<sub>` row takes the username and the
-`--scopes`, and keeps its sub — so what services already hold under it (docs shares, comments) stays
-theirs. It becomes an invitation on that row: the access opens at that Google account's next sign-in
-where Google vouches for the address *then* — the same proof a fresh invite asks of its first sign-in
-(an address may have moved to someone else since the row last signed in). Only a row whose one way
-in is Google, with no username of its own, and an address Google was authoritative for; anything
-else is refused with the `hn user set` to run once you've checked who it is.
+is refused, with that account's details and the `hn user set <it> --scopes …` to run once you've
+checked it's them. Their account keeps its sub, so what services hold under it (docs shares,
+comments) stays theirs. Nothing is granted to an account by its address alone: an address can
+change hands after the account last signed in.
 
 `account` and `console` are this node's own audiences: an `audiences.json` entry by either name
 never opens them to newcomers. The sites listed as open are each audience's redirect origin.
