@@ -998,6 +998,10 @@ test('nissa: the console reads the operator’s withhold live — an earlier tok
   const plain = await post('/console/invites', {}, tok);
   assert.equal(plain.status, 200, JSON.stringify(plain.body));
   assert.ok(!plain.body.invite.scopes.includes('docs:use'));
+  // withhold the console's own gate scope: the same token no longer opens it at all
+  node.accounts.update('human:local:sid', (a) => ({ ...a, withhold: ['worlds:join'] }));
+  assert.equal((await get('/console/me', base, { authorization: `Bearer ${tok}` })).status, 403);
+  assert.equal((await get('/console/invites', base, { authorization: `Bearer ${tok}` })).status, 403);
 });
 
 test('nissa: while accounts.json can’t be read, nobody signs in — not even a Discord login that needs no row', async () => {
@@ -1010,6 +1014,10 @@ test('nissa: while accounts.json can’t be read, nobody signs in — not even a
     writeFileSync(path, JSON.stringify({ accounts: [{ sub: 'human:discord:6601', discord: { id: '6601' }, disabled: true, withhold: 'x', createdAt: '' }] }));
     utimesSync(path, new Date(), new Date(Date.now() + 5000)); // a new mtime, so the store re-reads it
     assert.equal((await get('/login?audience=eidoverse', b2)).status, 503);
+    assert.equal((await get('/console/me', b2, { authorization: 'Bearer x' })).status, 503); // the console too
+    const api = await post('/account/password', {}, 'x', b2);
+    assert.equal(api.status, 503);
+    assert.match(String(api.body.error), /unavailable/); // JSON for the account page's API
     discordUser = { id: '6601', username: 'dis', global_name: 'Dis' };
     const start = await get('/login/discord?state=x', b2);
     assert.equal(start.status, 503);

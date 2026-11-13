@@ -143,6 +143,9 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   const freshErr = checkFreshness(req.timestamp, nowMs);
   if (freshErr) return fail(400, freshErr);
 
+  // Re-read both files first: a revocation by `hn` a moment ago counts, and
+  // neither file may be one we can't read (it would take no write).
+  if (!deps.invites.writable() || !deps.principals.writable()) return fail(503, 'enrollment is unavailable right now — try again later');
   const inv = deps.invites.check(req.invite, nowMs);
   if (typeof inv === 'string') return fail(403, `invite ${inv}`);
 
@@ -168,13 +171,13 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
     notes: `enrolled via invite ${inv.code}${inv.label ? ` (${inv.label})` : ''}`,
   };
   if (deps.principals.bySub(p.sub)) return fail(403, 'name taken'); // slug collision
-  // Both files must take the write, or neither is touched: a principal
-  // written with its invite left unspent would block every retry.
-  if (!deps.invites.writable() || !deps.principals.writable()) return fail(503, 'enrollment is unavailable right now — try again later');
-  deps.principals.add(p);
-  deps.invites.consume(inv.code);
+  // Everything that can refuse, before anything is written. (Two files: a
+  // write that fails after these checks — a full disk — can still leave the
+  // principal without its invite spent.)
   const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];
   if (!aud) return fail(400, 'no audience configured');
+  deps.principals.add(p);
+  deps.invites.consume(inv.code);
   return {
     status: 200,
     body: { sub: p.sub, token: mintFor(deps, p, aud, 'enroll', nowMs).token },

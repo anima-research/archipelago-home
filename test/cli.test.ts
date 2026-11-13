@@ -29,7 +29,7 @@ const at = '2026-10-30T00:00:00Z';
 /** What a Google sign-in at an open audience leaves behind. */
 const signedUp = (gsub: string, email: string, extra: Partial<HumanAccount> = {}): HumanAccount => ({
   sub: `human:google:${gsub}`, createdAt: at, notes: 'signed up at docs',
-  google: { sub: gsub, email, verified: true, name: 'Someone', linkedAt: at }, ...extra,
+  google: { sub: gsub, email, name: 'Someone', linkedAt: at }, ...extra,
 });
 
 test('cli: user add --google onto an account a sign-in made is refused — its details and the hn user set to run; nothing written', () => {
@@ -64,7 +64,8 @@ test('cli: a store that can’t read its file refuses the write with a one-line 
   writeFileSync(file, bad);
   const r = hn('add', 'zed', '--google', 'zed@gmail.com');
   assert.notEqual(r.status, 0);
-  assert.match(r.out, /^hn: accounts: .* refusing to overwrite it/m);
+  assert.match(r.out, /^hn: .*accounts\.json can't be read or fails validation — fix it first/m);
+  assert.match(hn('ls').out, /can't be read/); // not "accounts (0)"
   assert.doesNotMatch(r.out, /\n\s+at /); // no stack trace
   assert.equal(readFileSync(file, 'utf8'), bad);
 });

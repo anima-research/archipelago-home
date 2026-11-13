@@ -44,6 +44,7 @@ export class JsonStore<T> {
   }
 
   private loadOnce(): T | null {
+    const was = this.broken;
     let text: string;
     try {
       text = readFileSync(this.path, 'utf8');
@@ -51,7 +52,7 @@ export class JsonStore<T> {
       // Missing: nothing to protect, the first write makes it. Any other
       // read failure (permissions, a directory…) is a file we must not replace.
       this.broken = (err as NodeJS.ErrnoException).code !== 'ENOENT';
-      if (this.broken) console.error(`[hn] ${this.label}: ${this.path} can't be read (${(err as Error).message}) — writes refused until it's fixed`);
+      if (this.broken && !was) console.error(`[hn] ${this.label}: ${this.path} can't be read (${(err as Error).message}) — writes refused until it's fixed`);
       return null;
     }
     try {
@@ -66,25 +67,30 @@ export class JsonStore<T> {
       v = null;
     }
     this.broken = v === null;
-    if (v === null) console.error(`[hn] ${this.label}: ${this.path} is unreadable or failed validation — writes refused until it's fixed`);
+    if (v === null && !was) console.error(`[hn] ${this.label}: ${this.path} is unreadable or failed validation — writes refused until it's fixed`);
+    if (v !== null && was) console.error(`[hn] ${this.label}: ${this.path} readable again`);
     return v;
+  }
+
+  /** Worth re-reading? A changed mtime — or, while the file is broken, every
+   *  time (a repair can keep the mtime); a broken file that's since gone is
+   *  just missing again. */
+  private changed(): boolean {
+    let m: number;
+    try {
+      m = statSync(this.path).mtimeMs;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.broken = false;
+      return false; // missing or mid-rename
+    }
+    return this.broken || m !== this.lastMtime;
   }
 
   startWatching(intervalMs = 3000): void {
     this.poll = setInterval(() => {
-      let m: number | null = null;
-      try {
-        m = statSync(this.path).mtimeMs;
-      } catch {
-        return; // missing or mid-rename
-      }
-      if (m === this.lastMtime) return;
-      this.lastMtime = m;
-      const next = this.loadOnce();
-      if (next === null) {
-        console.error(`[hn] ${this.label}: ${this.path} unparseable — keeping previous`);
-        return;
-      }
+      if (!this.changed()) return;
+      const next = this.loadOnce(); // logs when it turns unreadable, and when it's readable again
+      if (next === null) return; // keep the previous value
       this.value = next;
       console.error(`[hn] ${this.label}: reloaded`);
     }, intervalMs);
@@ -99,13 +105,7 @@ export class JsonStore<T> {
    *  poll — a stat when nothing changed. Call before a read-modify-write so a
    *  concurrent CLI edit isn't clobbered. */
   refresh(): void {
-    let m: number;
-    try {
-      m = statSync(this.path).mtimeMs;
-    } catch {
-      return;
-    }
-    if (m === this.lastMtime) return;
+    if (!this.changed()) return;
     const next = this.loadOnce();
     if (next !== null) this.value = next;
   }

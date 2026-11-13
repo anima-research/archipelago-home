@@ -231,7 +231,7 @@ export class HumanAuth {
       // accounts.json is there but unreadable or invalid: an empty store knows
       // no one's restrictions or disabled accounts, so nobody signs in.
       console.error(`[hn] sign-in refused (${p}): accounts.json can't be read — fix the file`);
-      if (p.startsWith('/login/') && req.method === 'POST') return json(res, 503, { error: 'sign-in is unavailable right now — try again later' }), true;
+      if (req.method !== 'GET' || p === '/account/me') return json(res, 503, { error: 'sign-in is unavailable right now — try again later' }), true;
       return html(res, 503, page('unavailable', '<p>Sign-in is unavailable right now. Try again later.</p>')), true;
     }
     if (req.method === 'GET') {

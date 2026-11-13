@@ -153,7 +153,8 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 
 A sponsor passes on (their scopes ∩ `delegable`) — never more than they hold — plus `baseline` on
 every invite; an `id:anchor` holder also grants `anchorGrantable` outright, and an anchored invite
-carries every `resident` scope. A scope the file doesn't mention is never granted through the
+carries every `resident` scope — less, in every case, anything the operator withholds from that
+sponsor (`hn user restrict --withhold`, read live). A scope the file doesn't mention is never granted through the
 console.
 
 ## Operator CLI

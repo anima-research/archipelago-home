@@ -252,6 +252,12 @@ export class HomeNode {
       json(res, 401, { error: v.reason });
       return null;
     }
+    // The gate holds live too: a scope the operator now withholds no longer opens the console.
+    const missing = gate.filter((s) => !this.sponsor(v.payload).scopes.includes(s));
+    if (missing.length) {
+      json(res, 403, { error: `missing ${missing.join(', ')}` });
+      return null;
+    }
     return v.payload;
   }
 
@@ -269,6 +275,11 @@ export class HomeNode {
   }
 
   private async consoleRoute(req: IncomingMessage, url: URL, res: ServerResponse): Promise<boolean> {
+    if (url.pathname.startsWith('/console/') && !this.accounts.writable()) {
+      // The console reads each sponsor's restrictions from accounts.json: unreadable, it knows none.
+      json(res, 503, { error: 'the console is unavailable right now — try again later' });
+      return true;
+    }
     if (url.pathname === '/console' && req.method === 'GET') {
       html(res, 200, consolePage(this.cfg.iss));
       return true;

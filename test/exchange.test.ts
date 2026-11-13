@@ -163,3 +163,22 @@ test('enroll: while invites.json can’t be read, nothing is written — no prin
   assert.equal(res.status, 503);
   assert.equal(principals.byKey(guest.id), undefined);
 });
+
+test('enroll: while principals.json can’t be read, a valid invite stays unspent and nothing is written', () => {
+  invites.mint({ code: 'inv_z', scopes: ['worlds:join'], maxUses: 1 });
+  const path = join(testDir, 'principals.json');
+  writeFileSync(path, '{ not json');
+  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  const guest = generateKey();
+  assert.equal(handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_z', 'Moss'), deps).status, 503);
+  assert.equal(typeof invites.check('inv_z', Date.now()), 'object'); // still claimable
+});
+
+test('enroll: with no audience to mint for, it refuses before writing anything', () => {
+  invites.mint({ code: 'inv_n', scopes: ['worlds:join'], maxUses: 1 });
+  const guest = generateKey();
+  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_n', 'Nook'), { ...deps, knownAudiences: () => [] });
+  assert.equal(res.status, 400);
+  assert.equal(principals.byKey(guest.id), undefined);
+  assert.equal(typeof invites.check('inv_n', Date.now()), 'object');
+});

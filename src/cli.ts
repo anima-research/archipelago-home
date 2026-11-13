@@ -206,6 +206,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     /* data dir missing: first run, nothing to protect */
   }
   const accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
+  if (!accounts.writable()) die(`${join(cfg.dataDir, 'accounts.json')} can't be read or fails validation — fix it first (nothing here would be true of it)`);
   const [sub, rawName] = pos;
   const scopesFlag = flag.get('scopes')?.split(',').map((s) => s.trim()).filter(Boolean);
   const setupLink = (code: string) => `${cfg.publicUrl}/account/setup#code=${code}`;
@@ -241,7 +242,8 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         `${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
           (signedUpRow(clash)
             ? ` — they signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'}).` +
-              ` To give that account access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …`
+              ` To give that account access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …` +
+              ` (--scopes replaces the list: include ${clash.scopes?.length ? `its current ${clash.scopes.join(',')}` : 'everything it should hold'})`
             : ''),
       );
     }
@@ -318,7 +320,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         const clash = accounts.all().some((x) => x.sub !== a.sub && (x.username === n || x.name?.toLowerCase() === n));
         if (clash || principals.nameTaken(n)) die(`the name "${newName}" is already in use here`);
       }
-      if (flag.has('google') && a.google?.sub && a.sub === `human:google:${a.google.sub}`) {
+      if (flag.has('google') && a.sub.startsWith('human:google:')) {
         die(`${a.sub} IS a Google identity — its Google link can't be changed (make a new account for another address)`);
       }
       const google = googleFlag(a.sub);

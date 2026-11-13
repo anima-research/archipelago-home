@@ -113,8 +113,10 @@ test('audiences: a malformed signup is refused (the last good file stays); openS
     { signup: { scopes: [] } }, // doesn't cover requiredScopes: every newcomer would be refused
     { requiredScopes: [42] }, { requiredScopes: 'notes:use' },
   ];
+  let tick = 1;
   for (const change of bad) {
     writeFileSync(path, JSON.stringify({ notes: { ...good.notes, ...change } }));
+    utimesSync(path, new Date(), new Date(Date.now() + 1000 * tick++)); // its own mtime, so refresh really reads it
     assert.deepEqual(audiencesStore(path).get(), {}, JSON.stringify(change)); // refused at load: the fallback, not an open audience
     // a running store keeps its last good file through the same bad edit
     store.refresh();
@@ -123,9 +125,22 @@ test('audiences: a malformed signup is refused (the last good file stays); openS
   // …and does read the next good one (refresh isn't just keeping what it had)
   const good2 = { notes: { ...good.notes, requiredScopes: null, signup: {} }, other: { redirect: 'https://other.test/auth' } };
   writeFileSync(path, JSON.stringify(good2));
-  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  utimesSync(path, new Date(), new Date(Date.now() + 1000 * tick++));
   store.refresh();
   assert.deepEqual(store.get(), good2); // requiredScopes: null still reads as none
+});
+
+test('JsonStore: a broken file is retried until it reads — even a repair that keeps the mtime', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aud-'));
+  const path = join(dir, 'audiences.json');
+  writeFileSync(path, '{ broken');
+  const when = new Date(Date.now() - 60_000);
+  utimesSync(path, when, when);
+  const store = audiencesStore(path);
+  writeFileSync(path, JSON.stringify({ a: { redirect: 'https://a.test/auth' } }));
+  utimesSync(path, when, when); // same mtime as the broken file
+  store.refresh();
+  assert.deepEqual(Object.keys(store.get()), ['a']);
 });
 
 test('openSites: points newcomers at the service (its redirect origin), not its API host; skips what isn’t a site', () => {

@@ -10,13 +10,15 @@
  *   human:discord:<snowflake>   row made from a Discord login — the sub they
  *                               always had, so nothing keyed to it moves
  *   human:local:<username>      row made by the operator (`hn user add`)
- *   human:google:<google sub>   row made by signing up with Google and an
- *                               access code (codes.ts)
+ *   human:google:<google sub>   row made by a Google sign-in: with an access
+ *                               code (codes.ts), or as a newcomer while an
+ *                               audience is open to newcomers (stores.ts)
  *
  * The sub is fixed at creation. Login methods attach to it and come and go;
  * a Discord-anchored row can't drop its Discord link (that link IS its sub).
- * Google grants nothing by itself (google.ts); a Google login makes a row
- * only when it comes with an access code.
+ * Google grants nothing by itself (google.ts): the row a newcomer gets holds
+ * no scopes, and neither a Google- nor a Discord-anchored row can drop the
+ * link that IS its sub.
  *
  * Scopes: the Discord leg still decides what a Discord-linked person holds
  * (roles → scopes, read live at Discord login, or by bot lookup / a recent
