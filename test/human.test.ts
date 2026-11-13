@@ -742,3 +742,46 @@ test('codes: redeemed under sign-in settings, or riding a password sign-in', asy
   assert.equal(tokenFrom(viaPw.body.redirect, 'ranker').sub, 'human:local:nia');
   assert.equal(node.accounts.bySub('human:local:nia')!.codes!.length, 1);
 });
+
+// ── per-person restrictions ──
+
+test('restrict: roles set aside for one person don’t count; withheld scopes never come, even from a code', async () => {
+  await node.accounts.add({ sub: 'human:discord:9001', discord: { id: '9001' }, ignoreRoles: ['r-orrery'], createdAt: '' });
+  discordUser = { id: '9001', username: 'ari', global_name: 'Ari' };
+  discordRoles = ['r-member', 'r-orrery'];
+  const e = await discordLogin('eidoverse');
+  assert.equal(e.status, 302);
+  assert.deepEqual(tokenFrom(e.location!, 'eidoverse').scopes.sort(), ['worlds:join', 'worlds:spectate']);
+  assert.equal((await discordLogin('orrery')).status, 403); // r-orrery set aside
+  // someone else with the same roles is unaffected
+  discordUser = { id: '9002', username: 'bex', global_name: 'Bex' };
+  assert.equal((await discordLogin('orrery')).status, 302);
+
+  // withhold: gone whatever the source — roles or a code
+  node.accounts.update('human:discord:9001', (a) => ({ ...a, withhold: ['worlds:join', 'ranker:member'] }));
+  discordUser = { id: '9001', username: 'ari', global_name: 'Ari' };
+  assert.equal((await discordLogin('eidoverse')).status, 403);
+  const { code } = node.codes.add({ label: 'r', audiences: ['ranker'], scopes: ['ranker:member'] });
+  const w = await withCode('ranker', code, 'discord');
+  assert.equal(w.cb!.status, 302);
+  assert.deepEqual(tokenFrom(w.cb!.location!, 'ranker').scopes.includes('ranker:member'), false);
+  discordRoles = ['r-member'];
+});
+
+test('restrict: the live bot re-check on a password sign-in honours set-aside roles too', async () => {
+  const n2 = makeNode({ discordBotToken: 'BOT' });
+  const b2 = `http://127.0.0.1:${await n2.start()}`;
+  try {
+    await n2.accounts.add({
+      sub: 'human:discord:9100', username: 'cass', password: await hashPassword('cass password 1'),
+      discord: { id: '9100', name: 'Cass' }, ignoreRoles: ['r-orrery'], createdAt: '',
+    });
+    discordUser = { id: '9100', username: 'cass', global_name: 'Cass' };
+    discordRoles = ['r-member', 'r-orrery'];
+    assert.equal((await passwordLogin('cass', 'cass password 1', 'orrery', b2)).status, 403);
+    assert.equal((await passwordLogin('cass', 'cass password 1', 'eidoverse', b2)).status, 200);
+  } finally {
+    n2.stop();
+    discordRoles = ['r-member'];
+  }
+});
