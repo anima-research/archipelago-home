@@ -176,7 +176,11 @@ const SIGNUP = ${scriptJson([o.google && 'Google', o.discord && 'Discord'].filte
 // Every way to finish signing in waits for a code check still in flight,
 // so the code is on the sign-in before it completes.
 let codePending = Promise.resolve();
-function useCode(code) { codePending = checkCode(code).catch(() => err('That code didn’t work.')); return codePending; }
+function useCode(code) {
+  const timeout = new Promise((done) => setTimeout(() => { err('Checking the code is taking too long — sign in without it, or reload and try again.'); done(); }, 10000));
+  codePending = Promise.race([checkCode(code).catch(() => err('That code didn’t work.')), timeout]);
+  return codePending;
+}
 document.querySelectorAll('a[href^="/login/google"],a[href^="/login/discord"]').forEach((a) => {
   a.addEventListener('click', async (e) => { e.preventDefault(); await codePending; location.assign(a.href); });
 });

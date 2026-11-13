@@ -176,6 +176,11 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   // principal without its invite spent.)
   const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];
   if (!aud) return fail(400, 'no audience configured');
+  try {
+    parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse
+  } catch {
+    return fail(400, 'this invite has a bad token lifetime — ask for a new one');
+  }
   deps.principals.add(p);
   deps.invites.consume(inv.code);
   return {

@@ -36,10 +36,10 @@ const signedUp = (gsub: string, email: string, extra: Partial<HumanAccount> = {}
 
 test('cli: user add --google onto an account a sign-in made is refused — its details and the hn user set to run; nothing written', () => {
   const cases: Array<[HumanAccount, RegExp]> = [
-    [signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] }), /signed up by signing in \("Someone", signed up at docs, Google linked 2026-10-30\)\. To give that account access, check it's them, then: hn user set human:google:g1 --scopes/],
+    [signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] }), /human:google:g1 \(linked\) — signed up by signing in \("Someone", signed up at docs, Google linked 2026-10-30\)\. To give it access, check it's them, then: hn user set human:google:g1 --scopes/],
     [signedUp('g2', 'un@gmail.com', { username: 'unny' }), /hn user set unny --scopes/],
     [signedUp('g3', 'off@gmail.com', { disabled: true }), /hn user enable human:google:g3 && hn user set human:google:g3 --scopes/],
-    [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /already on human:google:g4 \(linked\) — they signed up/],
+    [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /human:google:g4 \(linked\) — signed up by signing in .* include its current x:y/],
   ];
   for (const [row, msg] of cases) {
     const { hn, rows, raw } = scratch([row]);
@@ -130,4 +130,17 @@ test('cli: the Google clash speaks before "username taken"', () => {
   const r = hn('add', 'alice', '--google', 'alice@gmail.com', '--scopes', 'docs:use');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /signed up by signing in .* hn user set alice --scopes/);
+});
+
+test('cli: the clash names every account on the address, their restrictions, and what a non-Gmail address is worth', () => {
+  const { hn } = scratch([
+    signedUp('g30', 'ceo@company.example'),
+    signedUp('g31', 'ceo@company.example', { withhold: ['docs:use'] }),
+  ]);
+  const r = hn('add', 'ceo', '--google', 'ceo@company.example', '--scopes', 'docs:use');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /already on 2 accounts/);
+  assert.match(r.out, /human:google:g30/);
+  assert.match(r.out, /human:google:g31 .*withheld: docs:use/);
+  assert.match(r.out, /only what that Google account reported/);
 });

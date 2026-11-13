@@ -1,6 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKey } from '../src/keys.js';
@@ -162,6 +162,7 @@ test('enroll: while invites.json can’t be read, nothing is written — no prin
   const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_y', 'Wren'), deps);
   assert.equal(res.status, 503);
   assert.equal(principals.byKey(guest.id), undefined);
+  assert.equal(readFileSync(path, 'utf8'), '{ not json'); // the damaged file, untouched
 });
 
 test('enroll: while principals.json can’t be read, a valid invite stays unspent and nothing is written', () => {
@@ -172,6 +173,7 @@ test('enroll: while principals.json can’t be read, a valid invite stays unspen
   const guest = generateKey();
   assert.equal(handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_z', 'Moss'), deps).status, 503);
   assert.equal(typeof invites.check('inv_z', Date.now()), 'object'); // still claimable
+  assert.equal(readFileSync(path, 'utf8'), '{ not json');
 });
 
 test('enroll: with no audience to mint for, it refuses before writing anything', () => {
@@ -181,4 +183,13 @@ test('enroll: with no audience to mint for, it refuses before writing anything',
   assert.equal(res.status, 400);
   assert.equal(principals.byKey(guest.id), undefined);
   assert.equal(typeof invites.check('inv_n', Date.now()), 'object');
+});
+
+test('enroll: an invite with a token lifetime minting can’t parse refuses before writing anything', () => {
+  invites.mint({ code: 'inv_t', scopes: ['worlds:join'], maxUses: 1, tokenTtl: 'forever' });
+  const guest = generateKey();
+  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_t', 'Tern'), deps);
+  assert.equal(res.status, 400);
+  assert.equal(principals.byKey(guest.id), undefined);
+  assert.equal(typeof invites.check('inv_t', Date.now()), 'object');
 });

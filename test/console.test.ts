@@ -225,3 +225,10 @@ test('mint: what the operator withholds from the sponsor is never passed on — 
   assert.ok(!anchored.invite.scopes.includes('music:upload')); // resident
   assert.ok(!anchored.invite.scopes.includes('docs:use'));
 });
+
+test('mint: a withheld id:anchor is no authority to anchor, even called directly', () => {
+  const r = mintSponsoredInvite(invites, POLICY, { sub: 'human:discord:333', name: 'b', scopes: ['worlds:join', 'id:anchor'], withhold: ['id:anchor'] },
+    'x', { anchorDomain: 'id.test', knownAudiences: KNOWN });
+  assert.equal(r.ok, false);
+  assert.equal(!r.ok && r.status, 403);
+});

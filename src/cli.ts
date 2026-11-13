@@ -232,19 +232,27 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     if (v === 'none') return null;
     if (!looksLikeEmail(v)) die(`--google wants an email address (or "none"), got "${v}"`);
     const k = emailKey(v);
-    const clash = accounts.all().find((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
-    if (clash) {
+    const clashes = accounts.all().filter((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
+    if (clashes.length) {
       // Someone who signed up by signing in already has an account: the
       // operator gives THAT one access, knowingly (an address can change
-      // hands, so nothing is granted to it by address alone).
-      const who = clash.username ?? clash.sub;
-      die(
-        `${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
+      // hands, and outside Gmail it's only what their Google account
+      // reported — so nothing is granted to it by address alone).
+      const gmail = /@(gmail|googlemail)\.com$/i.test(v.trim());
+      const lines = clashes.map((clash) => {
+        const who = clash.username ?? clash.sub;
+        return `  ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
           (signedUpRow(clash)
-            ? ` — they signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'}).` +
-              ` To give that account access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …` +
+            ? ` — signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'})` +
+              (clash.withhold?.length ? `; withheld: ${clash.withhold.join(',')}` : '') +
+              (clash.ignoreRoles?.length ? `; roles set aside: ${clash.ignoreRoles.join(',')}` : '') +
+              `. To give it access, check it's them, then: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes …` +
               ` (--scopes replaces the list: include ${clash.scopes?.length ? `its current ${clash.scopes.join(',')}` : 'everything it should hold'})`
-            : ''),
+            : '');
+      });
+      die(
+        `${v} is already on ${clashes.length === 1 ? 'an account' : `${clashes.length} accounts`}:\n${lines.join('\n')}` +
+          (gmail ? '' : `\n  (an address outside Gmail is only what that Google account reported — Google vouches for it only on a Workspace domain; matching it is not the check)`),
       );
     }
     return { email: v.trim() };

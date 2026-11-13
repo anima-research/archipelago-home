@@ -82,6 +82,9 @@ export function mintSponsoredInvite(
   opts?: { anchorDomain?: string | null; knownAudiences?: string[] },
   nowMs = Date.now(),
 ): ConsoleMintResult {
+  // What the operator withholds is out of the sponsor's authority too (the
+  // gate, delegation, id:anchor), not only out of the invite.
+  if (sponsor.withhold?.length) sponsor = { ...sponsor, scopes: sponsor.scopes.filter((s) => !sponsor.withhold!.includes(s)) };
   const gate = consoleRequiredScopes(policy);
   if (gate === null) {
     return { ok: false, status: 403, error: 'this home has no invite policy (config/invite-policy.json), so the console mints nothing' };
