@@ -32,7 +32,7 @@ const signedUp = (gsub: string, email: string, extra: Partial<HumanAccount> = {}
   google: { sub: gsub, email, verified: true, name: 'Someone', linkedAt: at }, ...extra,
 });
 
-test('cli: user add --google adopts a verified sign-up row — same sub, links and codes kept', () => {
+test('cli: user add --google adopts a verified sign-up row — same sub, codes kept, access waits for its next vouched sign-in', () => {
   const { hn, rows } = scratch([signedUp('g1', 'jo.anne@gmail.com', { codes: [{ id: 'code_1', at }] })]);
   const r = hn('add', 'joanne', '--google', 'JoAnne@gmail.com', '--scopes', 'docs:use,worlds:join', '--name', 'Jo Anne', '--tier', 'x');
   assert.equal(r.status, 0, r.out);
@@ -45,9 +45,36 @@ test('cli: user add --google adopts a verified sign-up row — same sub, links a
   assert.equal(a.name, 'Jo Anne');
   assert.deepEqual(a.scopes, ['docs:use', 'worlds:join']);
   assert.deepEqual(a.claims, { tier: 'x' });
-  assert.equal(a.google?.sub, 'g1');
+  // an invitation on its own row: the Google account claims it again at a sign-in Google vouches for
+  assert.deepEqual(a.google, { email: 'jo.anne@gmail.com' });
   assert.deepEqual(a.codes, [{ id: 'code_1', at }]);
   assert.match(a.notes!, /^signed up at docs; hn user add /);
+});
+
+test('cli: two accounts on one address — refused, naming both', () => {
+  const { hn, rows } = scratch([signedUp('g9', 'two@gmail.com'), signedUp('g10', 'two@gmail.com', { google: { sub: 'g10', email: 'two@gmail.com', verified: true, linkedAt: at } })]);
+  const before = JSON.stringify(rows());
+  const r = hn('add', 'two', '--google', 'two@gmail.com', '--scopes', 'docs:use');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /more than one account \(human:google:g9, human:google:g10\)/);
+  assert.equal(JSON.stringify(rows()), before);
+});
+
+test('cli: not adopted when Google isn’t its only way in, or it chose a username — the hint names hn user set', () => {
+  const pk = { id: 'pk1', publicKey: 'x', counter: 0, name: 'phone', createdAt: at };
+  const cases: Array<[HumanAccount, RegExp]> = [
+    [signedUp('g11', 'pk@gmail.com', { passkeys: [pk] as unknown as HumanAccount['passkeys'] }), /hn user set human:google:g11 --scopes/],
+    [signedUp('g12', 'un@gmail.com', { username: 'unny' }), /hn user set unny --scopes/],
+    [signedUp('g13', 'off@gmail.com', { disabled: true }), /hn user enable human:google:g13 && hn user set human:google:g13 --scopes/],
+  ];
+  for (const [row, msg] of cases) {
+    const { hn, rows } = scratch([row]);
+    const before = JSON.stringify(rows());
+    const r = hn('add', 'someone', '--google', row.google!.email, '--scopes', 'docs:use');
+    assert.notEqual(r.status, 0, r.out);
+    assert.match(r.out, msg);
+    assert.equal(JSON.stringify(rows()), before);
+  }
 });
 
 test('cli: its own display name does not block the username', () => {
@@ -61,7 +88,7 @@ test('cli: never adopted — unverified address, operator grants, a username, di
   const cases: Array<[string, HumanAccount, RegExp]> = [
     ['unverified', signedUp('g3', 'u@gmail.com', { google: { sub: 'g3', email: 'u@gmail.com', linkedAt: at } }), /hasn't vouched/],
     ['granted', signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /already on human:google:g4 \(linked\)$/m],
-    ['named', signedUp('g5', 'w@gmail.com', { username: 'wendy' }), /already on human:google:g5 \(linked\)$/m],
+    ['named', signedUp('g5', 'w@gmail.com', { username: 'wendy' }), /already on human:google:g5 \(linked\) — they signed up/],
     ['disabled', signedUp('g6', 'x@gmail.com', { disabled: true }), /already on human:google:g6/],
   ];
   for (const [label, row, msg] of cases) {
@@ -79,6 +106,14 @@ test('cli: user set --google onto a sign-up row’s address refuses and names th
   const r = hn('set', 'pat', '--google', 'p@gmail.com');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /hn user set human:google:g7 --scopes/);
+});
+
+test('cli: restrict --withhold with no value is refused, nothing written', () => {
+  const { hn, rows } = scratch([]);
+  const r = hn('restrict', '139758639064390000', '--withhold');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /wants a value/);
+  assert.deepEqual(rows(), []);
 });
 
 test('cli: a fresh address is still an invite on a new local account', () => {

@@ -108,9 +108,21 @@ test('audiences: a malformed signup is refused (the last good file stays); openS
   const store = audiencesStore(path);
   assert.deepEqual(store.get(), good);
   assert.deepEqual(openSites(store.get()), [{ audience: 'notes', url: 'https://notes.test', host: 'notes.test' }]);
-  for (const signup of [[], { scopes: ['notes:use', 7] }, { scopes: 'notes:use' }, { scopes: [''] }, null]) {
-    writeFileSync(path, JSON.stringify({ notes: { ...good.notes, signup } }));
-    const s = audiencesStore(path);
-    assert.deepEqual(s.get(), {}, JSON.stringify(signup)); // refused at load: the fallback, not an open audience
+  const bad: Array<Record<string, unknown>> = [
+    { signup: [] }, { signup: { scopes: ['notes:use', 7] } }, { signup: { scopes: 'notes:use' } }, { signup: { scopes: [''] } }, { signup: null },
+    { signup: { scopes: [] } }, // doesn't cover requiredScopes: every newcomer would be refused
+    { requiredScopes: [42] }, { requiredScopes: 'notes:use' },
+  ];
+  for (const change of bad) {
+    writeFileSync(path, JSON.stringify({ notes: { ...good.notes, ...change } }));
+    assert.deepEqual(audiencesStore(path).get(), {}, JSON.stringify(change)); // refused at load: the fallback, not an open audience
+    // a running store keeps its last good file through the same bad edit
+    store.refresh();
+    assert.deepEqual(store.get(), good, JSON.stringify(change));
   }
+});
+
+test('openSites: points newcomers at the service (its redirect origin), not its API host', () => {
+  const all = { app: { redirect: 'https://app.example/auth', api: 'https://api.example/v1', signup: {} }, shut: { redirect: 'https://shut.example/auth' } };
+  assert.deepEqual(openSites(all), [{ audience: 'app', url: 'https://app.example', host: 'app.example' }]);
 });

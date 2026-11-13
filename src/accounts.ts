@@ -368,7 +368,11 @@ export function effectiveRoles(roles: string[], a: HumanAccount | undefined): st
 /** A grant minus what the operator withholds from this person. */
 export function withheld(g: RoleGrant | null, a: HumanAccount | undefined): RoleGrant | null {
   if (!g || !a?.withhold?.length) return g;
-  return { ...g, scopes: g.scopes.filter((s) => !a.withhold!.includes(s)) };
+  const scopes = g.scopes.filter((s) => !a.withhold!.includes(s));
+  // Every scope they held withheld = they hold nothing: no grant at all, or
+  // audiences that take any grant would still let them in.
+  if (!scopes.length && g.scopes.length) return null;
+  return { ...g, scopes };
 }
 
 /** Discord snapshots this old stop counting for non-Discord logins when no

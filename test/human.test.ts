@@ -666,10 +666,13 @@ async function withCode(audience: string, code: string, via: 'google' | 'discord
 
 test('codes: a newcomer signs up with Google + a code; the code opens ONLY its own audiences', async () => {
   const { code, record } = node.codes.add({ label: 'Speaker ranker', audiences: ['ranker'], scopes: ['ranker:member'] });
-  googleUser = { sub: 'g-new', email: 'newcomer@gmail.com', email_verified: true, name: 'New Comer' };
   // without the code: refused (the row this node makes for a verified newcomer holds nothing)
+  googleUser = { sub: 'g-new-0', email: 'newcomer0@gmail.com', email_verified: true };
   assert.equal((await googleLogin('ranker')).status, 403);
-  assert.equal(node.accounts.bySub('human:google:g-new')!.scopes, undefined);
+  assert.equal(node.accounts.bySub('human:google:g-new-0')!.scopes, undefined);
+  // a Google account never seen before, with the code: signUp() makes its row
+  googleUser = { sub: 'g-new', email: 'newcomer@gmail.com', email_verified: true, name: 'New Comer' };
+  assert.equal(node.accounts.bySub('human:google:g-new'), undefined);
   const { code: c, cb } = await withCode('ranker', code.toUpperCase().replace(/-/g, ' '), 'google'); // typed sloppily: still the code
   assert.equal(c.status, 200);
   assert.deepEqual(c.body, { label: 'Speaker ranker', audiences: ['ranker'] });
@@ -966,4 +969,73 @@ test('review: an account with restrictions can’t unlink Discord or Google (it 
   }
   const a = node.accounts.bySub('human:local:rex')!;
   assert.ok(a.discord && a.google?.sub);
+});
+
+// ── Nissa's review (anima-review on #11) ──
+
+test('nissa: an account adopted by hn user add opens at its own next sign-in Google vouches for — not another account on the address', async () => {
+  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: true, name: 'Adopt' };
+  assert.equal((await googleLogin('notes')).status, 302);
+  // what `hn user add adopt --google adopt@gmail.com --scopes worlds:join` leaves (test/cli.test.ts)
+  node.accounts.update('human:google:g-adopt', (a) => ({ ...a, username: 'adopt', scopes: ['worlds:join'], google: { email: 'adopt@gmail.com' } }));
+  // another Google account now holding the address: not its invitation
+  googleUser = { sub: 'g-adopt-new', email: 'adopt@gmail.com', email_verified: true };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, undefined);
+  // its own account, Google not vouching now: refused, still waiting
+  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: false };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, undefined);
+  // its own account, vouched for: claimed, and the access opens
+  googleUser = { sub: 'g-adopt', email: 'adopt@gmail.com', email_verified: true, name: 'Adopt' };
+  const ok = await googleLogin('eidoverse');
+  assert.equal(ok.status, 302);
+  const p = tokenFrom(ok.location!, 'eidoverse');
+  assert.equal(p.sub, 'human:google:g-adopt');
+  assert.deepEqual(p.scopes, ['worlds:join']);
+  assert.equal(node.accounts.bySub('human:google:g-adopt')!.google!.sub, 'g-adopt');
+});
+
+test('nissa: withholding every scope someone holds leaves them nothing — audiences that take any grant refuse too', async () => {
+  await node.accounts.add({ sub: 'human:local:wes', username: 'wes', password: await hashPassword('wes password 1'), scopes: ['x:y'], withhold: ['x:y'], createdAt: '' });
+  assert.equal((await passwordLogin('wes', 'wes password 1', 'gate')).status, 403);
+  node.accounts.update('human:local:wes', (a) => ({ ...a, withhold: ['other'] }));
+  assert.equal((await passwordLogin('wes', 'wes password 1', 'gate')).status, 200);
+});
+
+test('nissa: an audiences.json entry named console or account never opens the node’s own audiences', async () => {
+  const n2 = makeNode({}, {
+    console: { redirect: 'https://evil.test/auth', requiredScopes: ['worlds:join'], signup: { scopes: ['worlds:join'] } },
+    account: { redirect: 'https://evil.test/auth', signup: {} },
+  });
+  const b2 = `http://127.0.0.1:${await n2.start()}`;
+  try {
+    assert.doesNotMatch((await get('/login?audience=console', b2)).text, /open to everyone/);
+    googleUser = { sub: 'g-con', email: 'con@gmail.com', email_verified: true };
+    assert.equal((await googleLogin('console', b2)).status, 403);
+    assert.equal(n2.accounts.bySub('human:google:g-con'), undefined); // nothing is open, so no row either
+  } finally {
+    n2.stop();
+  }
+});
+
+test('nissa: the console reads the operator’s withhold live — an earlier token can’t anchor once id:anchor is withheld', async () => {
+  await node.accounts.add({ sub: 'human:local:sid', username: 'sid', password: await hashPassword('sid password 1'), scopes: ['worlds:join', 'id:anchor', 'docs:use'], createdAt: '' });
+  const r = await passwordLogin('sid', 'sid password 1', 'console');
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  const tok = rawToken(r.body.redirect);
+  const me = async () => JSON.parse((await get('/console/me', base, { authorization: `Bearer ${tok}` })).text);
+  const before = await me();
+  assert.equal(before.canAnchor, true);
+  assert.ok(before.residentScopes.includes('docs:use'));
+  node.accounts.update('human:local:sid', (a) => ({ ...a, withhold: ['id:anchor', 'docs:use'] }));
+  const after = await me();
+  assert.equal(after.canAnchor, false);
+  assert.equal(after.residentScopes, undefined);
+  assert.ok(!after.delegable.includes('docs:use'));
+  const mint = await post('/console/invites', { anchor: true }, tok);
+  assert.equal(mint.status, 403);
+  const plain = await post('/console/invites', {}, tok);
+  assert.equal(plain.status, 200, JSON.stringify(plain.body));
+  assert.ok(!plain.body.invite.scopes.includes('docs:use'));
 });

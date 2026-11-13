@@ -61,7 +61,8 @@ keeps their `human:discord:` sub), turn TOTP on (QR + ten single-use recovery co
 remove passkeys, link Discord to a local account, link or unlink Google. The page's credential is its own login token,
 so it is always a recent sign-in.
 
-Accounts for people without Discord come from the operator — there is no open sign-up. Run
+Accounts for people without Discord come from the operator, from an access code (below), or — while
+an audience is open to newcomers (below) — from a Google newcomer's first sign-in. Run
 `hn user` as the service user (`sudo -u hn …` on the identity box; it refuses to run as root,
 since a root-owned 0600 `accounts.json` would lock the service out):
 
@@ -94,8 +95,14 @@ lists the sites open to everyone, so someone who came in the wrong door sees whe
 Inviting someone who already signed up this way (`hn user add <name> --google <their address>`)
 doesn't make a second account: their existing `human:google:<sub>` row takes the username and the
 `--scopes`, and keeps its sub — so what services already hold under it (docs shares, comments) stays
-theirs. Only when Google is authoritative for that address on the row (`google.verified`, refreshed
-at each sign-in) — the same proof a fresh invite asks of its first sign-in.
+theirs. It becomes an invitation on that row: the access opens at that Google account's next sign-in
+where Google vouches for the address *then* — the same proof a fresh invite asks of its first sign-in
+(an address may have moved to someone else since the row last signed in). Only a row whose one way
+in is Google, with no username of its own, and an address Google was authoritative for; anything
+else is refused with the `hn user set` to run once you've checked who it is.
+
+`account` and `console` are this node's own audiences: an `audiences.json` entry by either name
+never opens them to newcomers. The sites listed as open are each audience's redirect origin.
 
 ## Access codes
 

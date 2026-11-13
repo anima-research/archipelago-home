@@ -309,7 +309,7 @@ export class HumanAuth {
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
     if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
     securePage(res, 200, (nonce) =>
-      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, open: !!signupGrant(this.d.audiences.get()[audience]), nonce }),
+      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, open: !!signupGrant(this.d.audiences.get(), audience), nonce }),
     );
   }
 
@@ -598,8 +598,12 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         }
       }
       if (!live) {
-        const age = dc.checkedAt ? Date.now() - Date.parse(dc.checkedAt) : Infinity;
-        if (age <= DISCORD_SNAPSHOT_MAX_AGE_MS) discordGrant = dc.grant ?? null;
+        // The snapshot as the row holds it NOW: a restriction that landed
+        // while the bot call was out dropped it, and that must hold.
+        const cur = this.d.accounts.bySub(acct.sub)?.discord;
+        const snap = cur?.id === dc.id ? cur : undefined;
+        const age = snap?.checkedAt ? Date.now() - Date.parse(snap.checkedAt) : Infinity;
+        if (age <= DISCORD_SNAPSHOT_MAX_AGE_MS) discordGrant = snap!.grant ?? null;
         else note = 'your Discord roles need re-checking — sign in with Discord once, then this works again';
       }
     }
@@ -619,7 +623,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     // revoked code stops working at the next sign-in.
     const live = this.d.accounts.bySub(who.sub);
     // Codes, and an audience open to newcomers, count for that audience only.
-    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience), signupGrant(this.d.audiences.get()[audience])), live);
+    const grant = withheld(mergeGrants(who.grant, this.d.codes.grantFor(live?.codes, audience), signupGrant(this.d.audiences.get(), audience)), live);
     if (audience === 'account') {
       // Managing your own sign-in needs an account, or a Discord login that
       // would qualify for something (strangers don't get to create rows).
@@ -1027,7 +1031,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       const pending = g.email ? this.d.accounts.byGoogleInvite(g.email) : undefined;
       if (pending && pending.sub !== st.sub) {
         console.error(`[hn] google link refused for ${st.sub}: ${g.email} has an invitation on ${pending.sub}`);
-        return html(res, 409, page('invitation waiting', `<p>There’s an invitation here for <b>${esc(g.email!)}</b> on another account. To take it up, use <b>Continue with Google</b> on the sign-in page instead of linking; to have one account, ask an operator.</p>`));
+        const how = g.emailAuthoritative
+          ? 'To take it up, use <b>Continue with Google</b> on the sign-in page instead of linking; to have one account, ask an operator.'
+          : 'Google can’t vouch for that address (it isn’t Gmail or Google Workspace), so ask whoever invited you for a setup link.';
+        return html(res, 409, page('invitation waiting', `<p>There’s an invitation here for <b>${esc(g.email!)}</b> on another account. ${how}</p>`));
       }
       let acct: HumanAccount | undefined;
       try {
@@ -1045,17 +1052,25 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     }
 
     let acct = this.d.accounts.byGoogle(g.sub);
+    let inv: HumanAccount | undefined;
     if (!acct) {
-      // A row keyed on this Google account that no longer links it: Google
-      // was unlinked there, which took it away as a way in — codes and open
-      // audiences don't bring it back.
       const keyed = this.d.accounts.bySub(`human:google:${g.sub}`);
-      if (keyed) {
+      if (keyed && keyed.google && !keyed.google.sub && g.email && emailKey(keyed.google.email) === emailKey(g.email)) {
+        // Its own row, waiting to be claimed again (`hn user add` gave it
+        // access): the same proof as any invitation, at this sign-in.
+        inv = keyed;
+      } else if (keyed) {
+        // A row keyed on this Google account that no longer links it: Google
+        // was unlinked there, which took it away as a way in — codes and open
+        // audiences don't bring it back.
         console.error(`[hn] login refused: google:${g.sub} (${label}) — no longer linked to ${keyed.sub}`);
         return html(res, 403, page('not linked', `<p>Hi <b>${esc(label)}</b> — this Google account was unlinked from its account here, so it doesn’t sign in any more. Sign in another way, and link it again under <a href="/login?audience=account">sign-in settings</a> if you want it back.</p>`));
+      } else if (g.email) {
+        const byAddr = this.d.accounts.byGoogleInvite(g.email);
+        // a row keyed on ANOTHER Google account waits for that account only
+        if (byAddr && !(byAddr.sub.startsWith('human:google:') && byAddr.sub !== `human:google:${g.sub}`)) inv = byAddr;
       }
     }
-    const inv = !acct && g.email ? this.d.accounts.byGoogleInvite(g.email) : undefined;
     if (inv && !inv.disabled && !g.emailAuthoritative) {
       // Google only vouches for Gmail and Workspace addresses (google.ts): an
       // invitation to anything else can't be claimed by a Google sign-in.
@@ -1090,9 +1105,10 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
           google: googleLink(g, now),
         });
         console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
-      } catch {
+      } catch (err) {
         // another tab made it a moment ago — only if it really is this Google account's
         acct = this.d.accounts.byGoogle(g.sub);
+        if (!acct) console.error(`[hn] account: couldn't make human:google:${g.sub} (${label}): ${(err as Error).message}`);
       }
       fresh = true;
     }

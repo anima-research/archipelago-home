@@ -26,6 +26,10 @@ import type { PrincipalKind } from './token.js';
 export class JsonStore<T> {
   private value: T;
   private lastMtime: number | null = null;
+  /** The file is there but unreadable or invalid: every write is refused
+   *  until it's fixed, so a bad hand edit can't be overwritten by whatever
+   *  this process holds (an empty store, at start). */
+  private broken = false;
   private poll: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -40,15 +44,27 @@ export class JsonStore<T> {
   }
 
   private loadOnce(): T | null {
+    let text: string;
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8')) as unknown;
-      const v = this.validate(raw);
-      if (v === null) console.error(`[hn] ${this.label}: ${this.path} failed validation`);
-      this.lastMtime = statSync(this.path).mtimeMs;
-      return v;
+      text = readFileSync(this.path, 'utf8');
     } catch {
-      return null; // missing/unparseable → caller keeps empty/previous
+      this.broken = false; // missing: nothing to protect; the first write makes it
+      return null;
     }
+    try {
+      this.lastMtime = statSync(this.path).mtimeMs;
+    } catch {
+      /* raced a rename: the next poll catches up */
+    }
+    let v: T | null = null;
+    try {
+      v = this.validate(JSON.parse(text) as unknown);
+    } catch {
+      v = null;
+    }
+    this.broken = v === null;
+    if (v === null) console.error(`[hn] ${this.label}: ${this.path} is unreadable or failed validation — writes refused until it's fixed`);
+    return v;
   }
 
   startWatching(intervalMs = 3000): void {
@@ -114,6 +130,7 @@ export class JsonStore<T> {
 
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
+    if (this.broken) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
     this.value = next;
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
@@ -422,35 +439,44 @@ export interface AudienceConfig {
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
 
+/** This node's own audiences: never opened to newcomers by an audiences.json
+ *  entry of the same name (a `console` entry would hand strangers the
+ *  sponsor console). */
+export const NODE_AUDIENCES: ReadonlySet<string> = new Set(['account', 'console']);
+
 /** What an open audience gives anyone who signs in to it, or null if it isn't open. */
-export function signupGrant(a: AudienceConfig | undefined): RoleGrant | null {
+export function signupGrant(all: AudiencesConfig, name: string): RoleGrant | null {
+  const a = NODE_AUDIENCES.has(name) ? undefined : all[name];
   return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
 }
 
 /** `signup` must be a plain object, its `scopes` (if any) strings — else the
  *  file is refused and the last good one stays (an array would open the
  *  audience; a number in scopes would mint tokens verifiers reject). */
-function signupOk(s: unknown): boolean {
+function signupOk(s: unknown, required: string[]): boolean {
   if (typeof s !== 'object' || s === null || Array.isArray(s)) return false;
   const scopes = (s as { scopes?: unknown }).scopes;
-  return scopes === undefined || (Array.isArray(scopes) && scopes.every((x) => typeof x === 'string' && x.length > 0));
+  if (scopes === undefined) return true; // gets requiredScopes
+  // its own scopes must still let a newcomer in
+  return scopeList(scopes) && required.every((r) => (scopes as string[]).includes(r));
 }
+const scopeList = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.length > 0);
 
 /** Is any audience open to newcomers? (What lets a Google newcomer's first
  *  sign-in make their row — independent of whether a link can be shown.) */
 export function anyOpen(all: AudiencesConfig): boolean {
-  return Object.values(all).some((a) => Boolean(a.signup));
+  return Object.keys(all).some((name) => signupGrant(all, name) !== null);
 }
 
 /** The audiences open to newcomers, each with the site to send a person to
- *  (its `api` origin, else its redirect's) — what a refusal page and the
- *  account page point at. */
+ *  (its redirect's origin — where the service takes people in — else its
+ *  `api`'s) — what a refusal page and the account page point at. */
 export function openSites(all: AudiencesConfig): Array<{ audience: string; url: string; host: string }> {
   const out: Array<{ audience: string; url: string; host: string }> = [];
   for (const [audience, a] of Object.entries(all)) {
-    if (!a.signup) continue;
+    if (!signupGrant(all, audience)) continue;
     try {
-      const u = new URL(a.api || a.redirect);
+      const u = new URL(a.redirect || a.api || '');
       out.push({ audience, url: u.origin, host: u.host });
     } catch {
       /* a malformed URL: nothing to point at */
@@ -497,7 +523,8 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
-        if (v.signup !== undefined && !signupOk(v.signup)) return null;
+        if (v.requiredScopes !== undefined && !scopeList(v.requiredScopes)) return null;
+        if (v.signup !== undefined && !signupOk(v.signup, v.requiredScopes ?? [])) return null;
       }
       return raw as AudiencesConfig;
     },

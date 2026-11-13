@@ -129,7 +129,9 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
 </section>
 <p class="dim small" style="margin-top:2rem">${
     o.open && (o.google || o.discord)
-      ? `New here? ${o.google ? 'Continue with Google' : 'Continue with Discord'} — this one is open to everyone, and your account is made as you sign in.`
+      ? (o.google
+        ? 'New here? Continue with Google — this one is open to everyone, and your account is made as you sign in.'
+        : 'New here? Continue with Discord — this one is open to everyone.')
       : o.discord
       ? 'No username yet? Continue with Discord, then add a password or passkey under <a href="/login?audience=account">sign-in settings</a>.'
       : 'Accounts are created by this home’s operator.'
@@ -336,7 +338,7 @@ function render(extra) {
     s += '<div class="card"><h2>Google</h2>';
     if (me.google && me.google.linked) s += '<p>Linked to <b>' + h(me.google.email) + '</b>. Continue with Google signs in here. (Google adds no access by itself.)</p><button id="g-off" class="btn sm danger" type="button">Unlink</button>';
     else {
-      if (me.google) s += '<p>Invited as <b>' + h(me.google.email) + '</b> — Continue with Google with that address links it on first use. Or link a different Google account:</p>';
+      if (me.google) s += '<p>Invited as <b>' + h(me.google.email) + '</b> — Continue with Google with that address links it on first use, if it’s a Gmail or Google Workspace address. Or link a different Google account:</p>';
       else s += '<p class="dim">Link a Google account so Continue with Google signs in here. Google adds no access by itself.</p>';
       s += '<button id="g-link" class="btn block" type="button">Link Google</button>';
     }
