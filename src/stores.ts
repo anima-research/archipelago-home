@@ -45,6 +45,14 @@ export class JsonStore<T> {
 
   private loadOnce(): T | null {
     const was = this.broken;
+    // The mtime first: a rename between the stat and the read leaves a newer
+    // file under an older mtime, which the next poll re-reads — never the
+    // other way round.
+    try {
+      this.lastMtime = statSync(this.path).mtimeMs;
+    } catch {
+      /* missing, or mid-rename: the read below decides */
+    }
     let text: string;
     try {
       text = readFileSync(this.path, 'utf8');
@@ -54,11 +62,6 @@ export class JsonStore<T> {
       this.broken = (err as NodeJS.ErrnoException).code !== 'ENOENT';
       if (this.broken && !was) console.error(`[hn] ${this.label}: ${this.path} can't be read (${(err as Error).message}) — writes refused until it's fixed`);
       return null;
-    }
-    try {
-      this.lastMtime = statSync(this.path).mtimeMs;
-    } catch {
-      /* raced a rename: the next poll catches up */
     }
     let v: T | null = null;
     try {

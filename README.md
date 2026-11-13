@@ -47,7 +47,8 @@ doesn't know gets an empty row only while an audience is open to newcomers (belo
 
 An account made by a Google sign-in (`human:google:<sub>`) can't unlink Google — it *is* that
 identity, as `human:discord:` rows are for Discord. Nor can an account the operator restricted
-(`hn user restrict`) unlink a sign-in method: it would come back unrestricted on its own.
+(`hn user restrict`) unlink its Discord or Google: that identity would come back unrestricted on
+its own.
 
 ## Human sign-in
 

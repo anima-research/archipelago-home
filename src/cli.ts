@@ -254,9 +254,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
       const tier = flag.get('tier');
+      const google = googleFlag(); // first: an address already on an account says whose, whatever the username
       const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
       if (bad) die(bad);
-      const google = googleFlag();
       const { code, setup } = newSetupCode();
       accounts.add({
         sub: `human:local:${username}`,
@@ -345,6 +345,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       // flags first: a bad one must not leave a fresh row behind
       const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
       const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
+      if (flag.has('clear') && (flag.has('ignore-roles') || flag.has('withhold'))) die('--clear lifts restrictions; it can’t go with --ignore-roles or --withhold');
       for (const [f, list] of [['ignore-roles', ign], ['withhold', wh]] as const) {
         if (flag.has(f) && (flag.get(f) === 'true' || !list?.length)) die(`--${f} wants a value (comma-separated); to lift restrictions use --clear`);
       }

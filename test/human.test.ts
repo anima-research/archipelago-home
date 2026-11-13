@@ -528,7 +528,7 @@ test('Google: an unknown Google account gets nothing at a closed audience — it
   assert.equal(node.accounts.byGoogle('g-stranger')!.scopes, undefined);
   assert.equal((await googleLogin('notes')).status, 302); // the open one, as the page promises
 });
-test('Google: an operator invite by address is claimed by the first VERIFIED sign-in, then follows the Google account', async () => {
+test('Google: an operator invite by address is claimed by the first sign-in Google is authoritative for (Gmail here), then follows the Google account', async () => {
   await node.accounts.add({
     sub: 'human:local:grace', username: 'grace', scopes: ['worlds:join'],
     google: { email: 'Grace.Hopper@gmail.com' }, createdAt: '',

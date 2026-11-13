@@ -169,7 +169,7 @@ class Throttle {
  *  unlinking a sign-in method would let it come back unrestricted as an
  *  identity of its own, so only an operator does that. */
 const restricted = (a: HumanAccount): boolean => Boolean(a.ignoreRoles?.length || a.withhold?.length);
-const RESTRICTED_UNLINK = 'an operator has set restrictions on this account — ask them to unlink it';
+const RESTRICTED_UNLINK = 'an operator has set restrictions on this account, so its sign-in methods can’t be unlinked here — ask an operator';
 
 /** The Google link a sign-in writes (`fallback`: the address kept when
  *  Google sent none). */
@@ -230,7 +230,6 @@ export class HumanAuth {
     if (!this.d.accounts.writable()) {
       // accounts.json is there but unreadable or invalid: an empty store knows
       // no one's restrictions or disabled accounts, so nobody signs in.
-      console.error(`[hn] sign-in refused (${p}): accounts.json can't be read — fix the file`);
       if (req.method !== 'GET' || p === '/account/me') return json(res, 503, { error: 'sign-in is unavailable right now — try again later' }), true;
       return html(res, 503, page('unavailable', '<p>Sign-in is unavailable right now. Try again later.</p>')), true;
     }

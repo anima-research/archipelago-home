@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountStore, type HumanAccount } from '../src/accounts.js';
@@ -22,7 +22,9 @@ function scratch(rows: HumanAccount[]) {
     });
     return { status: r.status, out: `${r.stdout}${r.stderr}` };
   };
-  return { hn, file, rows: () => new AccountStore(file).all() };
+  // raw bytes (or absence): a reopened AccountStore reads a malformed file as empty too
+  const raw = () => (existsSync(file) ? readFileSync(file, 'utf8') : null);
+  return { hn, file, raw, rows: () => new AccountStore(file).all() };
 }
 
 const at = '2026-10-30T00:00:00Z';
@@ -40,22 +42,22 @@ test('cli: user add --google onto an account a sign-in made is refused — its d
     [signedUp('g4', 'v@gmail.com', { scopes: ['x:y'] }), /already on human:google:g4 \(linked\) — they signed up/],
   ];
   for (const [row, msg] of cases) {
-    const { hn, rows } = scratch([row]);
-    const before = JSON.stringify(rows());
+    const { hn, rows, raw } = scratch([row]);
+    const before = raw();
     const r = hn('add', 'someone', '--google', row.google!.email.toUpperCase(), '--scopes', 'docs:use');
     assert.notEqual(r.status, 0, r.out);
     assert.match(r.out, msg);
-    assert.equal(JSON.stringify(rows()), before, 'nothing written');
+    assert.equal(raw(), before, 'nothing written');
   }
 });
 
 test('cli: user set --google can’t change a Google-made account’s link', () => {
-  const { hn, rows } = scratch([signedUp('g5', 'mine@gmail.com')]);
-  const before = JSON.stringify(rows());
+  const { hn, rows, raw } = scratch([signedUp('g5', 'mine@gmail.com')]);
+  const before = raw();
   const r = hn('set', 'human:google:g5', '--google', 'other@gmail.com');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /IS a Google identity/);
-  assert.equal(JSON.stringify(rows()), before);
+  assert.equal(raw(), before);
 });
 
 test('cli: a store that can’t read its file refuses the write with a one-line error, file untouched', () => {
@@ -71,21 +73,21 @@ test('cli: a store that can’t read its file refuses the write with a one-line 
 });
 
 test('cli: user set --google onto a sign-up row’s address refuses and names the command to run', () => {
-  const { hn, rows } = scratch([signedUp('g7', 'p@gmail.com'), { sub: 'human:local:pat', username: 'pat', createdAt: at }]);
-  const before = JSON.stringify(rows());
+  const { hn, rows, raw } = scratch([signedUp('g7', 'p@gmail.com'), { sub: 'human:local:pat', username: 'pat', createdAt: at }]);
+  const before = raw();
   const r = hn('set', 'pat', '--google', 'p@gmail.com');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /hn user set human:google:g7 --scopes/);
-  assert.equal(JSON.stringify(rows()), before);
+  assert.equal(raw(), before);
 });
 
 test('cli: restrict with no value, or an empty one, is refused, nothing written', () => {
-  const { hn, rows } = scratch([]);
+  const { hn, raw } = scratch([]);
   for (const args of [['--withhold'], ['--withhold', ''], ['--ignore-roles', ','], ['--withhold', ' , ']]) {
     const r = hn('restrict', '139758639064390000', ...args);
     assert.notEqual(r.status, 0, args.join(' '));
     assert.match(r.out, /wants a value/);
-    assert.deepEqual(rows(), []);
+    assert.equal(raw(), null);
   }
 });
 
@@ -99,11 +101,11 @@ test('cli: a fresh address is still an invite on a new local account', () => {
 });
 
 test('cli: restrict with a bad flag writes nothing — no stray row for a new Discord id', () => {
-  const { hn, rows } = scratch([]);
+  const { hn, rows, raw } = scratch([]);
   const r = hn('restrict', '139758639064390000', '--ignore-roles', 'team');
   assert.notEqual(r.status, 0);
   assert.match(r.out, /role ids/);
-  assert.deepEqual(rows(), []);
+  assert.equal(raw(), null);
   const ok = hn('restrict', '139758639064390000', '--ignore-roles', '1391615830604779520');
   assert.equal(ok.status, 0, ok.out);
   assert.deepEqual(rows().map((a) => [a.sub, a.ignoreRoles]), [['human:discord:139758639064390000', ['1391615830604779520']]]);
@@ -113,4 +115,19 @@ test('cli: an invite to a non-Gmail address says how to do it when it isn’t Wo
   const { hn } = scratch([]);
   assert.match(hn('add', 'cora', '--google', 'cora@corp.example').out, /only a Gmail or Google Workspace address/);
   assert.doesNotMatch(hn('add', 'gail', '--google', 'gail@gmail.com').out, /only a Gmail/);
+});
+
+test('cli: restrict --clear with a restriction is refused, nothing written', () => {
+  const { hn, raw } = scratch([]);
+  const r = hn('restrict', '139758639064390000', '--withhold', 'id:anchor', '--clear');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /can’t go with/);
+  assert.equal(raw(), null);
+});
+
+test('cli: the Google clash speaks before "username taken"', () => {
+  const { hn } = scratch([signedUp('g20', 'alice@gmail.com', { username: 'alice' })]);
+  const r = hn('add', 'alice', '--google', 'alice@gmail.com', '--scopes', 'docs:use');
+  assert.notEqual(r.status, 0);
+  assert.match(r.out, /signed up by signing in .* hn user set alice --scopes/);
 });

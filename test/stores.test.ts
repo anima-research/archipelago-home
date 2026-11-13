@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { audiencesStore, grantForRoles, InviteStore, mcplDirectory, openSites, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
+import { audiencesStore, anyOpen, grantForRoles, signupGrant, InviteStore, mcplDirectory, openSites, PrincipalStore, serviceDirectory, type RolesConfig } from '../src/stores.js';
 
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'hn-stores-'));
@@ -154,4 +154,16 @@ test('openSites: points newcomers at the service (its redirect origin), not its 
     { audience: 'app', url: 'https://app.example', host: 'app.example' },
     { audience: 'badredir', url: 'https://api.bad.example', host: 'api.bad.example' },
   ]);
+});
+
+test('signupGrant: account and console never take one, whatever audiences.json says', () => {
+  const all = {
+    console: { redirect: 'https://x.test/auth', signup: { scopes: ['worlds:join'] } },
+    account: { redirect: 'https://x.test/auth', signup: {} },
+    docs: { redirect: 'https://docs.test/auth', requiredScopes: ['docs:use'], signup: {} },
+  };
+  assert.equal(signupGrant(all, 'console'), null);
+  assert.equal(signupGrant(all, 'account'), null);
+  assert.deepEqual(signupGrant(all, 'docs'), { scopes: ['docs:use'] });
+  assert.equal(anyOpen({ console: all.console, account: all.account }), false);
 });
