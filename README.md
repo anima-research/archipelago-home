@@ -1,7 +1,7 @@
 # archipelago-home
 
 Connectome home node v0 — identity issuance for humans (Discord OAuth + guild-role→scope, or the
-home's own login: username + password + TOTP, and passkeys) and agents (ed25519 key-proof or
+home's own login: username + password + TOTP, passkeys, and Google) and agents (ed25519 key-proof or
 operator-minted tokens). Design: **connectome `docs/home-node.md`**
 (the authoritative spec); doctrine: connectome `docs/archipelago.md`.
 
@@ -22,7 +22,8 @@ DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… npm start   # binds 127.0.0.1:73
 
 Env: `HN_DOMAIN` (default `id.animalabs.ai`), `HN_PUBLIC_URL`, `HN_BIND`, `HN_PORT`,
 `HN_DATA_DIR`, `HN_CONFIG_DIR`, `HN_BOT_TOKEN` (optional; also re-checks Discord roles live
-when a Discord-linked person signs in another way). First run generates `data/issuer-key.pem`
+when a Discord-linked person signs in another way), `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET`
+(optional; Google login). First run generates `data/issuer-key.pem`
 (0600) — **the** issuer key; guard it, never commit it. `data/accounts.json` (0600) holds
 password hashes, TOTP secrets and passkey keys — back it up with the issuer key, and guard it
 the same way.
@@ -30,16 +31,27 @@ the same way.
 Discord app setup: dev portal → OAuth2 → redirect URI `https://<HN_DOMAIN>/oauth/callback`.
 Scopes requested at login: `identify guilds.members.read` (no bot).
 
+Google setup: Cloud console → Google Auth Platform → Branding (app name, support email), Audience
+External → Publish; Data Access: `openid`, `…/auth/userinfo.email`, `…/auth/userinfo.profile`
+(all non-sensitive, so no verification review); Clients → Web application, redirect URI
+`https://<HN_DOMAIN>/oauth/google/callback`, no JavaScript origins. Code flow with PKCE.
+
+Google carries no roles, so it **grants nothing by itself and creates no one**: it opens an
+account that already exists — one that linked Google at `/account`, or one the operator invited
+by address (`hn user add alice --google alice@gmail.com --scopes …`), which the first sign-in
+with that *verified* address claims. From then on the link is by Google's account id, not the
+address. A Google account the node doesn't know is refused.
+
 ## Human sign-in
 
-`/login?audience=…` is a chooser: **Continue with Discord**, **username + password** (then a
-TOTP code if they turned one on), or **passkey** (also offered as autofill in the username
-field). Every path ends the same way — a 10-minute aid1 token in the audience's URL fragment —
-so audiences change nothing. `?via=discord` skips the chooser.
+`/login?audience=…` is a chooser: **Continue with Discord**, **Continue with Google**,
+**username + password** (then a TOTP code if they turned one on), or **passkey** (also offered
+as autofill in the username field). Every path ends the same way — a 10-minute aid1 token in the audience's URL fragment —
+so audiences change nothing. `?via=discord` / `?via=google` skips the chooser.
 
 People manage their own sign-in at **`/account`**: set a username + password (a Discord person
 keeps their `human:discord:` sub), turn TOTP on (QR + ten single-use recovery codes), add or
-remove passkeys, link Discord to a local account. The page's credential is its own login token,
+remove passkeys, link Discord to a local account, link or unlink Google. The page's credential is its own login token,
 so it is always a recent sign-in.
 
 Accounts for people without Discord come from the operator — there is no open sign-up. Run
@@ -48,9 +60,11 @@ since a root-owned 0600 `accounts.json` would lock the service out):
 
 ```sh
 hn user add alice --scopes worlds:join,worlds:spectate   # → one-time setup link (72h)
+hn user add bea --google bea@gmail.com --scopes …         # → no link: Continue with Google claims it
 hn user ls                                                # who has what (no secrets)
 hn user reset alice [--clear-2fa] [--clear-passkeys]      # → new setup link
 hn user set alice --scopes worlds:join,orrery:use         # operator grant (Discord roles add on top)
+hn user set alice --google alice@work.example             # (re)invite by Google address; --google none drops it
 hn user disable alice    hn user enable alice
 ```
 

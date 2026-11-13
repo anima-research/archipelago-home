@@ -42,6 +42,8 @@ export interface ServerConfig {
   discordClientSecret?: string;
   /** Bot token for server-side role lookup (shrinks OAuth to `identify`). */
   discordBotToken?: string;
+  googleClientId?: string;
+  googleClientSecret?: string;
 }
 
 export function configFromEnv(env = process.env): ServerConfig {
@@ -56,6 +58,8 @@ export function configFromEnv(env = process.env): ServerConfig {
     discordClientId: env.DISCORD_CLIENT_ID,
     discordClientSecret: env.DISCORD_CLIENT_SECRET,
     discordBotToken: env.HN_BOT_TOKEN,
+    googleClientId: env.GOOGLE_CLIENT_ID,
+    googleClientSecret: env.GOOGLE_CLIENT_SECRET,
   };
 }
 
@@ -147,6 +151,7 @@ export class HomeNode {
         const port = typeof addr === 'object' && addr ? addr.port : this.cfg.port;
         console.error(`[hn] home node for ${this.cfg.iss} on ${this.cfg.bind}:${port} — issuer ${this.issuer.id}`);
         if (!this.cfg.discordClientId) console.error('[hn] DISCORD_CLIENT_ID unset — Discord login off (username/passkey login still on)');
+        if (!this.cfg.googleClientId) console.error('[hn] GOOGLE_CLIENT_ID unset — Google login off');
         if (!this.invitePolicy.get().configured) console.error('[hn] no config/invite-policy.json — the sponsor console is off');
         resolve(port);
       }),

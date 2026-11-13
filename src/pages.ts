@@ -91,15 +91,16 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings
 
 // ── /login ──
 
-export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; nonce: string }): string {
+export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; nonce: string }): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
   const body = `
 <h1>Sign in</h1>
 <p class="dim">to continue to <b>${esc(target)}</b> · ${esc(o.iss)}</p>
 <p id="err" class="err" role="alert"></p>
 <section id="step1">
-  ${o.discord ? `<a class="btn discord block" href="/login/discord?state=${encodeURIComponent(o.state)}">Continue with Discord</a>
-  <div class="or">or</div>` : ''}
+  ${o.discord ? `<a class="btn discord block" href="/login/discord?state=${encodeURIComponent(o.state)}">Continue with Discord</a>` : ''}
+  ${o.google ? `<a class="btn block" href="/login/google?state=${encodeURIComponent(o.state)}">Continue with Google</a>` : ''}
+  ${o.discord || o.google ? '<div class="or">or</div>' : ''}
   <form id="pw" novalidate>
     <label for="u">Username</label>
     <input id="u" name="username" autocomplete="username webauthn" autocapitalize="none" autocorrect="off" spellcheck="false" required>
@@ -285,6 +286,18 @@ function render(extra) {
     : '<p class="dim small">This browser can’t create passkeys.</p>';
   s += '</div>';
 
+  // google
+  if (me.google || me.canLinkGoogle) {
+    s += '<div class="card"><h2>Google</h2>';
+    if (me.google && me.google.linked) s += '<p>Linked to <b>' + h(me.google.email) + '</b>. Continue with Google signs in here. (Google adds no access by itself.)</p><button id="g-off" class="btn sm danger" type="button">Unlink</button>';
+    else {
+      if (me.google) s += '<p>Invited as <b>' + h(me.google.email) + '</b> — Continue with Google with that address links it on first use. Or link a different Google account:</p>';
+      else s += '<p class="dim">Link a Google account so Continue with Google signs in here. Google adds no access by itself.</p>';
+      s += '<button id="g-link" class="btn block" type="button">Link Google</button>';
+    }
+    s += '</div>';
+  }
+
   // discord
   if (me.discord || me.canLinkDiscord) {
     s += '<div class="card"><h2>Discord</h2>';
@@ -338,6 +351,11 @@ function wire() {
     if (!confirm('Remove this passkey? (Also delete it from your device or password manager.)')) return;
     if (await act('/account/passkeys/remove', { id: b.dataset.rm }, 'Passkey removed.')) render();
   }));
+  on('g-link', 'click', async () => { const r = await act('/account/google/link', {}); if (r && r.url) location.assign(r.url); });
+  on('g-off', 'click', async () => {
+    if (!confirm('Unlink Google? Continue with Google will stop signing in here.')) return;
+    if (await act('/account/google/unlink', {}, 'Google unlinked.')) render();
+  });
   on('d-link', 'click', async () => { const r = await act('/account/discord/link', {}); if (r && r.url) location.assign(r.url); });
   on('d-off', 'click', async () => {
     if (!confirm('Unlink Discord? Continue with Discord will stop signing in here, and Discord roles stop counting.')) return;

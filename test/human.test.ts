@@ -23,11 +23,20 @@ let recoveryCodes: string[] = [];
 // The Discord user the fake OAuth returns next.
 let discordUser = { id: '42', username: 'dee', global_name: 'Dee' };
 let discordRoles: string[] | null = ['r-member'];
+// The Google account the fake OIDC returns next, and the last token request it saw.
+let googleUser: Record<string, unknown> = { sub: 'g-1', email: 'gail@gmail.com', email_verified: true, name: 'Gail' };
+let googleTokenBody: URLSearchParams | null = null;
+const b64j = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url');
 
 function fakeDiscord(): typeof fetch {
-  return (async (input: string | URL | Request) => {
+  return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+    if (url === 'https://oauth2.googleapis.com/token') {
+      googleTokenBody = new URLSearchParams(String(init?.body ?? ''));
+      const claims = { iss: 'https://accounts.google.com', aud: 'gcid', exp: Math.floor(Date.now() / 1000) + 300, ...googleUser };
+      return ok({ access_token: 'ga', id_token: `${b64j({ alg: 'RS256' })}.${b64j(claims)}.sig` });
+    }
     if (url.endsWith('/oauth2/token')) return ok({ access_token: 't', token_type: 'Bearer' });
     if (url.endsWith('/users/@me')) return ok(discordUser);
     if (url.includes('/member') || url.includes('/members/')) {
@@ -53,7 +62,7 @@ function makeNode(extra: Partial<ServerConfig> = {}): HomeNode {
   }));
   return new HomeNode({
     iss: 'id.test', publicUrl: ORIGIN, bind: '127.0.0.1', port: 0, dataDir: dir, configDir: dir,
-    discordClientId: 'cid', discordClientSecret: 'secret', ...extra,
+    discordClientId: 'cid', discordClientSecret: 'secret', googleClientId: 'gcid', googleClientSecret: 'gsecret', ...extra,
   }, { fetchImpl: fakeDiscord() });
 }
 
@@ -98,6 +107,12 @@ async function accountToken(username: string, password: string): Promise<string>
   const r = await passwordLogin(username, password, 'account');
   assert.equal(r.status, 200, JSON.stringify(r.body));
   return rawToken(r.body.redirect);
+}
+async function googleLogin(audience: string, b = base) {
+  const start = await get(`/login?audience=${audience}&via=google`, b);
+  assert.equal(start.status, 302);
+  const state = new URL(start.location!).searchParams.get('state')!;
+  return get(`/oauth/google/callback?state=${state}&code=x`, b);
 }
 async function discordLogin(audience: string, b = base) {
   const start = await get(`/login?audience=${audience}&via=discord`, b);
@@ -474,6 +489,156 @@ test('with a bot token, password logins re-check Discord roles live', async () =
     assert.equal(p.name, 'Hank Live');
     discordRoles = null; // left the guild
     assert.equal((await passwordLogin('hank', 'hank password 1', 'eidoverse', b2)).status, 403);
+  } finally {
+    n2.stop();
+  }
+});
+
+// ── Google ──
+
+test('Google: chooser offers it; the trip out is OIDC code flow with PKCE and only openid email profile', async () => {
+  const page = await get('/login?audience=eidoverse');
+  assert.match(page.text, /Continue with Google/);
+  const start = await get('/login?audience=eidoverse&via=google');
+  assert.equal(start.status, 302);
+  const u = new URL(start.location!);
+  assert.equal(u.origin + u.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
+  assert.equal(u.searchParams.get('scope'), 'openid email profile');
+  assert.equal(u.searchParams.get('redirect_uri'), 'https://id.test/oauth/google/callback');
+  assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
+  // the verifier sent at the token step is the one the challenge was made from
+  googleUser = { sub: 'g-nobody', email: 'nobody@gmail.com', email_verified: true };
+  await get(`/oauth/google/callback?state=${u.searchParams.get('state')}&code=x`);
+  const { createHash } = await import('node:crypto');
+  assert.equal(createHash('sha256').update(googleTokenBody!.get('code_verifier')!).digest('base64url'), u.searchParams.get('code_challenge'));
+  assert.equal(googleTokenBody!.get('client_secret'), 'gsecret');
+});
+
+test('Google: an unknown Google account gets nothing and makes no row', async () => {
+  googleUser = { sub: 'g-stranger', email: 'stranger@gmail.com', email_verified: true, name: 'Stranger' };
+  const r = await googleLogin('eidoverse');
+  assert.equal(r.status, 403);
+  assert.match(r.text, /isn’t linked to an account here/);
+  assert.equal(node.accounts.byGoogle('g-stranger'), undefined);
+  // the account page doesn't open for them either
+  assert.equal((await googleLogin('account')).status, 403);
+});
+
+test('Google: an operator invite by address is claimed by the first VERIFIED sign-in, then follows the Google account', async () => {
+  await node.accounts.add({
+    sub: 'human:local:grace', username: 'grace', scopes: ['worlds:join'],
+    google: { email: 'Grace.Hopper@gmail.com' }, createdAt: '',
+  });
+  // unverified address: no claim
+  googleUser = { sub: 'g-grace', email: 'gracehopper@gmail.com', email_verified: false, name: 'Grace H' };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  assert.equal(node.accounts.byUsername('grace')!.google!.sub, undefined);
+  // verified, Gmail spelling differs only in dots/case: claimed
+  googleUser = { sub: 'g-grace', email: 'gracehopper@gmail.com', email_verified: true, name: 'Grace H' };
+  const ok = await googleLogin('eidoverse');
+  assert.equal(ok.status, 302);
+  const p = tokenFrom(ok.location!, 'eidoverse');
+  assert.equal(p.sub, 'human:local:grace');
+  assert.deepEqual(p.scopes, ['worlds:join']);
+  assert.equal(node.accounts.byUsername('grace')!.google!.sub, 'g-grace');
+  // later: a new address on the same Google account still signs in
+  googleUser = { sub: 'g-grace', email: 'grace@navy.example', email_verified: true };
+  assert.equal(tokenFrom((await googleLogin('eidoverse')).location!, 'eidoverse').sub, 'human:local:grace');
+  assert.equal(node.accounts.byUsername('grace')!.google!.email, 'grace@navy.example');
+  // a different Google account with the old address can't take it over
+  googleUser = { sub: 'g-impostor', email: 'grace.hopper@gmail.com', email_verified: true };
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+  // no scope for orrery: signed in, but refused there
+  googleUser = { sub: 'g-grace', email: 'grace@navy.example', email_verified: true };
+  assert.equal((await googleLogin('orrery')).status, 403);
+  // disabled: refused
+  node.accounts.update('human:local:grace', (a) => ({ ...a, disabled: true }));
+  assert.equal((await googleLogin('eidoverse')).status, 403);
+});
+
+test('Google: link from sign-in settings (bound to this browser), then Continue with Google opens the account; unlink guarded', async () => {
+  await node.accounts.add({ sub: 'human:local:hal', username: 'hal', password: await hashPassword('hal password 1'), scopes: ['worlds:join'], createdAt: '' });
+  const tok = await accountToken('hal', 'hal password 1');
+  const view0 = JSON.parse((await get('/account/me', base, { authorization: `Bearer ${tok}` })).text);
+  assert.equal(view0.canLinkGoogle, true);
+
+  // someone else completing the link URL in their browser links nothing
+  const stolen = await post('/account/google/link', {}, tok);
+  const stolenStart = await get(new URL(stolen.body.url).pathname + new URL(stolen.body.url).search);
+  const stolenState = new URL(stolenStart.location!).searchParams.get('state')!;
+  googleUser = { sub: 'g-victim', email: 'victim@gmail.com', email_verified: true };
+  assert.equal((await get(`/oauth/google/callback?state=${stolenState}&code=x`)).status, 403);
+  assert.equal(node.accounts.byGoogle('g-victim'), undefined);
+
+  const link = await post('/account/google/link', {}, tok);
+  assert.equal(link.status, 200);
+  assert.match(link.cookie, /^hn_link=/);
+  const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
+  assert.equal(start.status, 302);
+  assert.match(start.location!, /^https:\/\/accounts\.google\.com\//);
+  const state = new URL(start.location!).searchParams.get('state')!;
+  // a Google link state is no good at the Discord callback
+  assert.equal((await get(`/oauth/callback?state=${state}&code=x`, base, { cookie: link.cookie })).status, 403);
+
+  const link2 = await post('/account/google/link', {}, tok);
+  const start2 = await get(new URL(link2.body.url).pathname + new URL(link2.body.url).search);
+  const state2 = new URL(start2.location!).searchParams.get('state')!;
+  googleUser = { sub: 'g-hal', email: 'hal@example.org', email_verified: false, name: 'HAL' };
+  const cb = await get(`/oauth/google/callback?state=${state2}&code=x`, base, { cookie: link2.cookie });
+  assert.equal(cb.status, 302);
+  assert.equal(tokenFrom(cb.location!, 'account').sub, 'human:local:hal');
+  assert.equal(node.accounts.byGoogle('g-hal')!.sub, 'human:local:hal');
+
+  // an explicit link doesn't need a verified address; sign-in is by Google id
+  const viaGoogle = await googleLogin('eidoverse');
+  assert.equal(tokenFrom(viaGoogle.location!, 'eidoverse').sub, 'human:local:hal');
+
+  const tok2 = await accountToken('hal', 'hal password 1');
+  const view = JSON.parse((await get('/account/me', base, { authorization: `Bearer ${tok2}` })).text);
+  assert.deepEqual(view.google, { email: 'hal@example.org', linked: true });
+  assert.equal(view.canLinkGoogle, false);
+  assert.equal((await post('/account/google/link', {}, tok2)).status, 400); // already linked
+  assert.equal((await post('/account/google/unlink', {}, tok2)).status, 200);
+  assert.equal(node.accounts.byGoogle('g-hal'), undefined);
+});
+
+test('Google: a Google-only account can’t unlink its last way in; a Discord person can add Google', async () => {
+  await node.accounts.add({ sub: 'human:local:ida', username: 'ida', scopes: ['worlds:join'], google: { email: 'ida@gmail.com' }, createdAt: '' });
+  googleUser = { sub: 'g-ida', email: 'ida@gmail.com', email_verified: true };
+  const tok = rawToken((await googleLogin('account')).location!);
+  assert.equal((await post('/account/google/unlink', {}, tok)).status, 400);
+
+  discordUser = { id: '4242', username: 'jo', global_name: 'Jo' };
+  discordRoles = ['r-member'];
+  const dtok = rawToken((await discordLogin('account')).location!);
+  const link = await post('/account/google/link', {}, dtok);
+  assert.equal(link.status, 200);
+  const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
+  const state = new URL(start.location!).searchParams.get('state')!;
+  // Google account already linked to ida: refused
+  assert.equal((await get(`/oauth/google/callback?state=${state}&code=x`, base, { cookie: link.cookie })).status, 409);
+  const link2 = await post('/account/google/link', {}, dtok);
+  const start2 = await get(new URL(link2.body.url).pathname + new URL(link2.body.url).search);
+  const state2 = new URL(start2.location!).searchParams.get('state')!;
+  googleUser = { sub: 'g-jo', email: 'jo@gmail.com', email_verified: true };
+  assert.equal((await get(`/oauth/google/callback?state=${state2}&code=x`, base, { cookie: link2.cookie })).status, 302);
+  // Google now opens the Discord-anchored account, with its Discord roles
+  const p = tokenFrom((await googleLogin('eidoverse')).location!, 'eidoverse');
+  assert.equal(p.sub, 'human:discord:4242');
+  assert.ok(p.scopes.includes('worlds:join'));
+});
+
+test('Google: cancelled at Google, or no Google configured', async () => {
+  const start = await get('/login?audience=eidoverse&via=google');
+  const state = new URL(start.location!).searchParams.get('state')!;
+  const r = await get(`/oauth/google/callback?state=${state}&error=access_denied`);
+  assert.equal(r.status, 400);
+  assert.match(r.text, /cancelled/);
+  const n2 = makeNode({ googleClientId: undefined, googleClientSecret: undefined });
+  const b2 = `http://127.0.0.1:${await n2.start()}`;
+  try {
+    assert.doesNotMatch((await get('/login?audience=eidoverse', b2)).text, /Continue with Google/);
+    assert.equal((await get('/login?audience=eidoverse&via=google', b2)).status, 200); // falls back to the chooser
   } finally {
     n2.stop();
   }

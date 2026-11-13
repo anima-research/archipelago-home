@@ -2,9 +2,11 @@
  * The human leg: every way a person gets an aid1 login token, and the page
  * where they manage those ways.
  *
- *   GET  /login?audience=…        chooser: Discord · username+password · passkey
+ *   GET  /login?audience=…        chooser: Discord · Google · username+password · passkey
  *   GET  /login/discord?state=…   → Discord OAuth (`?via=discord` on /login skips the chooser)
  *   GET  /oauth/callback          Discord's return leg (also: linking Discord to an account)
+ *   GET  /login/google?state=…    → Google OIDC (`?via=google` skips the chooser)
+ *   GET  /oauth/google/callback   Google's return leg (also: linking Google; claiming an invite)
  *   POST /login/password          {state, username, password} → redirect | {next:"totp", ticket}
  *   POST /login/totp              {ticket, code}  (6-digit code or a recovery code)
  *   POST /login/passkey/begin     {state} → WebAuthn request options (discoverable, UV required)
@@ -26,6 +28,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { IssuerKey } from './keys.js';
 import { mintToken, newJti, verifyToken, type Aid1Payload } from './token.js';
 import { authorizeUrl, botGuildMember, completeOAuth, displayNameOf, oauthScopes, type FetchLike } from './oauth.js';
+import { completeGoogle, emailKey, googleAuthorizeUrl, newPkceVerifier, type GoogleIdentity } from './google.js';
 import {
   grantForRoles,
   type AudiencesConfig,
@@ -74,6 +77,8 @@ export interface HumanConfig {
   discordClientId?: string;
   discordClientSecret?: string;
   discordBotToken?: string;
+  googleClientId?: string;
+  googleClientSecret?: string;
 }
 
 export interface HumanDeps {
@@ -93,8 +98,12 @@ export interface HumanDeps {
 
 /** A link state is bound to the browser that asked for it (`nonce`, also in
  *  an HttpOnly cookie): a link URL handed to someone else can't attach
- *  THEIR Discord to the sender's account. */
-type LoginState = { audience: string; exp: number } & ({ intent: 'login' } | { intent: 'link'; sub: string; nonce: string });
+ *  THEIR Discord or Google to the sender's account. `pkce` is the Google
+ *  leg's code verifier, set when that leg starts. */
+type LoginState = { audience: string; exp: number; pkce?: string } & (
+  | { intent: 'login' }
+  | { intent: 'link'; provider: 'discord' | 'google'; sub: string; nonce: string }
+);
 type FactorCheck = 'ok' | 'bad' | 'locked';
 const LINK_COOKIE = 'hn_link';
 type Who = { sub: string; name: string; grant: RoleGrant | null; account?: HumanAccount; note?: string };
@@ -164,6 +173,12 @@ export class HumanAuth {
   private get discordOn(): boolean {
     return Boolean(this.d.cfg.discordClientId && this.d.cfg.discordClientSecret);
   }
+  private get googleOn(): boolean {
+    return Boolean(this.d.cfg.googleClientId && this.d.cfg.googleClientSecret);
+  }
+  private get googleCallbackUrl(): string {
+    return `${this.d.cfg.publicUrl}/oauth/google/callback`;
+  }
 
   /** Built-in audiences of this very node — no config entry, no server
    *  session: the login token IS the page's credential. */
@@ -176,7 +191,7 @@ export class HumanAuth {
   /** Handles the route if it's ours; false = not ours. */
   async route(req: IncomingMessage, url: URL, res: ServerResponse, ip: string): Promise<boolean> {
     const p = url.pathname;
-    const isLogin = p === '/login' || p.startsWith('/login/') || p === '/oauth/callback';
+    const isLogin = p === '/login' || p.startsWith('/login/') || p === '/oauth/callback' || p === '/oauth/google/callback';
     const isAccount = p === '/account' || p.startsWith('/account/');
     if (!isLogin && !isAccount) return false;
     res.setHeader('cache-control', 'no-store'); // tokens, tickets, challenges: never cached
@@ -192,6 +207,8 @@ export class HumanAuth {
       else if (p === '/login') this.loginPage(url, res);
       else if (p === '/login/discord') this.discordStart(url, res);
       else if (p === '/oauth/callback') await this.callback(req, url, res);
+      else if (p === '/login/google') this.googleStart(url, res);
+      else if (p === '/oauth/google/callback') await this.googleCallback(req, url, res);
       else return false;
       return true;
     }
@@ -230,6 +247,8 @@ export class HumanAuth {
     '/account/passkeys/remove': (q, res, b) => this.withAccount(q, res, (t) => this.passkeyRemove(res, t, b)),
     '/account/discord/link': (q, res) => this.withAccount(q, res, (t) => this.discordLink(res, t)),
     '/account/discord/unlink': (q, res) => this.withAccount(q, res, (t) => this.discordUnlink(res, t)),
+    '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(res, t)),
+    '/account/google/unlink': (q, res) => this.withAccount(q, res, (t) => this.googleUnlink(res, t)),
   };
 
   // ── sign-in ──
@@ -247,7 +266,10 @@ export class HumanAuth {
     }
     const state = this.newState({ intent: 'login', audience, exp: Date.now() + STATE_TTL_MS });
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
-    securePage(res, 200, (nonce) => loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, nonce }));
+    if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
+    securePage(res, 200, (nonce) =>
+      loginPage({ iss: this.d.cfg.iss, audience, state, discord: this.discordOn, google: this.googleOn, nonce }),
+    );
   }
 
   private discordStart(url: URL, res: ServerResponse): void {
@@ -274,8 +296,8 @@ export class HumanAuth {
       return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
     }
     if (st.intent === 'link') {
-      res.setHeader('set-cookie', this.linkCookie('', 0)); // spent either way
-      if (!safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
+      res.setHeader('set-cookie', this.linkCookie('', 0, '/oauth/callback')); // spent either way
+      if (st.provider !== 'discord' || !safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
         console.error(`[hn] link refused for ${st.sub}: finished in a browser that didn't start it`);
         return html(res, 403, page('link refused', '<p>Linking Discord has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
       }
@@ -641,6 +663,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
           ? { id: t.sub.slice('human:discord:'.length), name: t.name, canUnlink: false }
           : null,
       canLinkDiscord: this.discordOn && !discordAnchored && !a?.discord,
+      google: a?.google ? { email: a.google.email, linked: Boolean(a.google.sub) } : null,
+      canLinkGoogle: this.googleOn && !a?.google?.sub,
       scopes: t.scopes,
     };
   }
@@ -800,16 +824,16 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     if (!this.discordOn) return json(res, 400, { error: 'Discord login is not configured on this node' });
     if (!a || t.sub.startsWith('human:discord:') || a.discord) return json(res, 400, { error: 'nothing to link' });
     const nonce = randomBytes(24).toString('base64url');
-    const state = this.newState({ intent: 'link', sub: t.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
-    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000));
+    const state = this.newState({ intent: 'link', provider: 'discord', sub: t.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
+    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000, '/oauth/callback'));
     json(res, 200, { url: `${this.d.cfg.publicUrl}/login/discord?state=${state}` });
   }
 
-  /** HttpOnly, scoped to the callback; Lax so Discord's redirect back (a
-   *  top-level GET) carries it. */
-  private linkCookie(value: string, maxAgeS: number): string {
+  /** HttpOnly, scoped to that provider's callback; Lax so the provider's
+   *  redirect back (a top-level GET) carries it. */
+  private linkCookie(value: string, maxAgeS: number, path: '/oauth/callback' | '/oauth/google/callback'): string {
     const secure = this.d.cfg.publicUrl.startsWith('https:') ? '; Secure' : '';
-    return `${LINK_COOKIE}=${value}; Path=/oauth/callback; Max-Age=${maxAgeS}; HttpOnly; SameSite=Lax${secure}`;
+    return `${LINK_COOKIE}=${value}; Path=${path}; Max-Age=${maxAgeS}; HttpOnly; SameSite=Lax${secure}`;
   }
 
   private discordUnlink(res: ServerResponse, t: Aid1Payload): void {
@@ -824,6 +848,136 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       return rest;
     });
     console.error(`[hn] account: ${t.sub} unlinked discord:${a.discord.id}`);
+    json(res, 200, this.view(t));
+  }
+
+  // ── Google ──
+
+  private googleStart(url: URL, res: ServerResponse): void {
+    const state = url.searchParams.get('state') ?? '';
+    if (!this.states.get(state)) {
+      return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
+    }
+    if (!this.googleOn) return html(res, 503, page('login unavailable', '<p>Google login is not configured on this node.</p>'));
+    this.toGoogle(res, state);
+  }
+
+  private toGoogle(res: ServerResponse, state: string): void {
+    const st = this.states.get(state)!;
+    st.pkce = newPkceVerifier(); // a fresh one per trip to Google
+    redirect(res, googleAuthorizeUrl(this.d.cfg.googleClientId!, this.googleCallbackUrl, state, st.pkce));
+  }
+
+  private async googleCallback(req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+    const st = this.states.take(url.searchParams.get('state') ?? ''); // single-use, success or not
+    if (!st) {
+      return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
+    }
+    if (st.intent === 'link') {
+      res.setHeader('set-cookie', this.linkCookie('', 0, '/oauth/google/callback')); // spent either way
+      if (st.provider !== 'google' || !safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
+        console.error(`[hn] google link refused for ${st.sub}: wrong provider, or finished in a browser that didn't start it`);
+        return html(res, 403, page('link refused', '<p>Linking Google has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
+      }
+    }
+    const code = url.searchParams.get('code') ?? '';
+    if (!code || !st.pkce || !this.googleOn) {
+      const cancelled = url.searchParams.get('error') === 'access_denied';
+      return html(res, 400, page('login failed', `<p>${cancelled ? 'Google sign-in was cancelled.' : 'Google did not complete the sign-in.'} Start again from the service.</p>`));
+    }
+    let g: GoogleIdentity;
+    try {
+      g = await completeGoogle(
+        { clientId: this.d.cfg.googleClientId!, clientSecret: this.d.cfg.googleClientSecret!, redirectUri: this.googleCallbackUrl, code, verifier: st.pkce },
+        this.d.fetchImpl,
+      );
+    } catch (err) {
+      console.error(`[hn] google sign-in failed: ${(err as Error).message}`);
+      return html(res, 502, page('login failed', '<p>Google sign-in didn’t go through. Start again from the service.</p>'));
+    }
+    const label = g.email ?? g.name ?? `Google account ${g.sub}`;
+    const now = new Date().toISOString();
+
+    if (st.intent === 'link') {
+      const other = this.d.accounts.byGoogle(g.sub);
+      if (other && other.sub !== st.sub) {
+        return html(res, 409, page('already linked', `<p>That Google account (<b>${esc(label)}</b>) is already linked to another account here.</p>`));
+      }
+      let acct: HumanAccount | undefined;
+      try {
+        acct = this.d.accounts.update(st.sub, (a) => {
+          if (a.disabled || (a.google?.sub && a.google.sub !== g.sub)) throw new Error('account changed');
+          return { ...a, google: { sub: g.sub, email: g.email ?? a.google?.email ?? '', ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+        });
+      } catch {
+        acct = undefined;
+      }
+      if (!acct) return html(res, 400, page('link failed', '<p>That account can’t take a Google link right now. Start again from your sign-in settings.</p>'));
+      console.error(`[hn] account: ${acct.sub} linked google:${g.sub} (${label})`);
+      const out = this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'google');
+      return out.ok ? redirect(res, out.redirect) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
+    }
+
+    let acct = this.d.accounts.byGoogle(g.sub);
+    if (!acct && g.email && g.emailVerified) {
+      // An operator invite by address: the first verified sign-in claims it.
+      const inv = this.d.accounts.byGoogleInvite(g.email);
+      if (inv && !inv.disabled) {
+        try {
+          acct = this.d.accounts.update(inv.sub, (a) => {
+            if (a.disabled || !a.google || a.google.sub || emailKey(a.google.email) !== emailKey(g.email!)) throw new Error('changed');
+            return { ...a, google: { sub: g.sub, email: g.email!, ...(g.name ? { name: g.name } : {}), linkedAt: now } };
+          });
+          if (acct) console.error(`[hn] account: ${acct.sub} claimed by google:${g.sub} (${g.email})`);
+        } catch {
+          acct = undefined;
+        }
+      } else if (inv) acct = inv; // disabled: refused just below
+    }
+    if (!acct) {
+      console.error(`[hn] login refused: google:${g.sub} (${label}) — not linked to an account`);
+      return html(res, 403, page('no account', `<p>Hi <b>${esc(label)}</b> — this Google account isn’t linked to an account here.
+If you have one, sign in another way and link Google under <a href="/login?audience=account">sign-in settings</a>; otherwise ask an operator.</p>`));
+    }
+    if (acct.disabled) {
+      console.error(`[hn] login refused: ${acct.sub} via google — account disabled`);
+      return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
+    }
+    if (acct.google?.sub === g.sub && ((g.email && g.email !== acct.google.email) || (g.name && g.name !== acct.google.name))) {
+      try {
+        acct = this.d.accounts.update(acct.sub, (a) => (a.google?.sub === g.sub ? { ...a, google: { ...a.google, ...(g.email ? { email: g.email } : {}), ...(g.name ? { name: g.name } : {}) } } : a)) ?? acct;
+      } catch {
+        /* a new address that clashes with someone's invite: keep the old one on file */
+      }
+    }
+    const who = await this.resolve(acct);
+    if (this.d.accounts.bySub(acct.sub)?.disabled) return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
+    const out = this.issue(st.audience, who, 'google');
+    if (out.ok) return redirect(res, out.redirect);
+    console.error(`[hn] login refused: ${acct.sub} via google — ${out.error}`);
+    return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>`));
+  }
+
+  private googleLink(res: ServerResponse, t: Aid1Payload): void {
+    if (!this.googleOn) return json(res, 400, { error: 'Google login is not configured on this node' });
+    const a = this.ensureAccount(t);
+    if (!a) return json(res, 404, { error: 'no account' });
+    if (a.google?.sub) return json(res, 400, { error: 'a Google account is already linked — unlink it first' });
+    const nonce = randomBytes(24).toString('base64url');
+    const state = this.newState({ intent: 'link', provider: 'google', sub: a.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
+    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000, '/oauth/google/callback'));
+    json(res, 200, { url: `${this.d.cfg.publicUrl}/login/google?state=${state}` });
+  }
+
+  private googleUnlink(res: ServerResponse, t: Aid1Payload): void {
+    const a = this.d.accounts.bySub(t.sub);
+    if (!a?.google) return json(res, 400, { error: 'no Google account linked' });
+    if (loginMethods(a) <= 1) return json(res, 400, { error: 'that’s your only way to sign in — add another first' });
+    this.d.accounts.update(t.sub, (x) => {
+      const { google: _g, ...rest } = x;
+      return rest;
+    });
+    console.error(`[hn] account: ${t.sub} unlinked google${a.google.sub ? `:${a.google.sub}` : ` invite (${a.google.email})`}`);
     json(res, 200, this.view(t));
   }
 
