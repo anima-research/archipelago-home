@@ -11,7 +11,7 @@ import { loadOrCreateIssuerKey, type IssuerKey } from './keys.js';
 import { verifyToken, type Aid1Payload } from './token.js';
 import { handleEnroll, handleTokenRequest, type ExchangeDeps } from './exchange.js';
 import {
-  ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView,
+  ANCHOR_SCOPE, consolePage, delegableScopes, mintSponsoredInvite, residentScopes, sponsorInviteView, type SponsorIdentity,
 } from './console.js';
 import { consoleRequiredScopes, invitePolicyStore, type InvitePolicy } from './policy.js';
 import { AccountStore } from './accounts.js';
@@ -252,10 +252,34 @@ export class HomeNode {
       json(res, 401, { error: v.reason });
       return null;
     }
+    // The gate holds live too: a scope the operator now withholds no longer opens the console.
+    const missing = gate.filter((s) => !this.sponsor(v.payload).scopes.includes(s));
+    if (missing.length) {
+      json(res, 403, { error: `missing ${missing.join(', ')}` });
+      return null;
+    }
     return v.payload;
   }
 
+  /** The sponsor as the console acts for them: what the operator withholds
+   *  now (`hn user restrict --withhold`) is out of their token's scopes, so
+   *  it neither passes on nor counts as authority (id:anchor) — live, not
+   *  from when the console token was issued. */
+  private sponsor(who: { sub: string; name: string; scopes: string[] }): SponsorIdentity {
+    const withhold = this.accounts.bySub(who.sub)?.withhold;
+    return {
+      sub: who.sub, name: who.name,
+      scopes: withhold?.length ? who.scopes.filter((s) => !withhold.includes(s)) : who.scopes,
+      ...(withhold?.length ? { withhold } : {}),
+    };
+  }
+
   private async consoleRoute(req: IncomingMessage, url: URL, res: ServerResponse): Promise<boolean> {
+    if (url.pathname.startsWith('/console/') && !this.accounts.writable()) {
+      // The console reads each sponsor's restrictions from accounts.json: unreadable, it knows none.
+      json(res, 503, { error: 'the console is unavailable right now — try again later' });
+      return true;
+    }
     if (url.pathname === '/console' && req.method === 'GET') {
       html(res, 200, consolePage(this.cfg.iss));
       return true;
@@ -263,10 +287,13 @@ export class HomeNode {
     if (url.pathname === '/console/me' && req.method === 'GET') {
       const who = this.consoleAuth(req, res);
       if (who) {
+        const s = this.sponsor(who);
+        const keep = (list: string[]) => list.filter((x) => !s.withhold?.includes(x));
         json(res, 200, {
-          sub: who.sub, name: who.name, delegable: delegableScopes(this.invitePolicy.get(), who.scopes),
-          canAnchor: who.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
-          ...(who.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: residentScopes(this.invitePolicy.get()) } : {}),
+          sub: who.sub, name: who.name,
+          delegable: keep(delegableScopes(this.invitePolicy.get(), s.scopes)),
+          canAnchor: s.scopes.includes(ANCHOR_SCOPE), home: this.cfg.iss,
+          ...(s.scopes.includes(ANCHOR_SCOPE) ? { residentScopes: keep(residentScopes(this.invitePolicy.get())) } : {}),
         });
       }
       return true;
@@ -280,7 +307,7 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
-      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), { sub: who.sub, name: who.name, scopes: who.scopes },
+      const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), this.sponsor(who),
         typeof body?.label === 'string' ? body.label : undefined,
         { anchorDomain: body?.anchor === true ? this.cfg.iss : null,
           knownAudiences: Object.keys(this.audiences.get()) });

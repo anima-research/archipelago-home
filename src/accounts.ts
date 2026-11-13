@@ -10,13 +10,15 @@
  *   human:discord:<snowflake>   row made from a Discord login — the sub they
  *                               always had, so nothing keyed to it moves
  *   human:local:<username>      row made by the operator (`hn user add`)
- *   human:google:<google sub>   row made by signing up with Google and an
- *                               access code (codes.ts)
+ *   human:google:<google sub>   row made by a Google sign-in: with an access
+ *                               code (codes.ts), or as a newcomer while an
+ *                               audience is open to newcomers (stores.ts)
  *
  * The sub is fixed at creation. Login methods attach to it and come and go;
  * a Discord-anchored row can't drop its Discord link (that link IS its sub).
- * Google grants nothing by itself (google.ts); a Google login makes a row
- * only when it comes with an access code.
+ * Google grants nothing by itself (google.ts): the row a newcomer gets holds
+ * no scopes, and neither a Google- nor a Discord-anchored row can drop the
+ * link that IS its sub.
  *
  * Scopes: the Discord leg still decides what a Discord-linked person holds
  * (roles → scopes, read live at Discord login, or by bot lookup / a recent
@@ -57,8 +59,8 @@ export interface HumanAccount {
   };
   /**
    * Google login. No `sub` yet = an operator invite (`hn user add --google`):
-   * the first Google sign-in with this verified address claims the row and
-   * fills in `sub`. With `sub`, that Google account signs in here, whatever
+   * the first Google sign-in Google is authoritative for this address at
+   * (Gmail or Workspace, google.ts) claims the row and fills in `sub`. With `sub`, that Google account signs in here, whatever
    * its address is now (`email` is just the last one seen).
    */
   google?: {
@@ -142,7 +144,10 @@ function accountsProblem(raw: unknown): string | null {
       if (passkeys.has(p.id)) return 'that passkey is already registered';
       passkeys.add(p.id);
     }
-    if (a.scopes !== undefined && (!Array.isArray(a.scopes) || !a.scopes.every((s) => typeof s === 'string'))) return 'bad scopes';
+    const strings = (v: unknown) => Array.isArray(v) && v.every((s) => typeof s === 'string');
+    if (a.scopes !== undefined && !strings(a.scopes)) return 'bad scopes';
+    if (a.ignoreRoles !== undefined && !strings(a.ignoreRoles)) return 'bad ignoreRoles';
+    if (a.withhold !== undefined && !strings(a.withhold)) return 'bad withhold';
   }
   return null;
 }
@@ -155,6 +160,13 @@ export class AccountStore {
   constructor(path: string) {
     // 0600: password hashes and TOTP secrets live here.
     this.store = new JsonStore(path, validateAccounts, { accounts: [] }, 'accounts', 0o600);
+  }
+
+  /** False while accounts.json is there but can't be read or fails
+   *  validation: sign-ins then refuse (human.ts), rather than run against
+   *  an empty store that knows no one's restrictions. */
+  writable(): boolean {
+    return this.store.writable();
   }
 
   startWatching(): void {
@@ -361,7 +373,11 @@ export function effectiveRoles(roles: string[], a: HumanAccount | undefined): st
 /** A grant minus what the operator withholds from this person. */
 export function withheld(g: RoleGrant | null, a: HumanAccount | undefined): RoleGrant | null {
   if (!g || !a?.withhold?.length) return g;
-  return { ...g, scopes: g.scopes.filter((s) => !a.withhold!.includes(s)) };
+  const scopes = g.scopes.filter((s) => !a.withhold!.includes(s));
+  // Every scope they held withheld = they hold nothing: no grant at all, or
+  // audiences that take any grant would still let them in.
+  if (!scopes.length && g.scopes.length) return null;
+  return { ...g, scopes };
 }
 
 /** Discord snapshots this old stop counting for non-Discord logins when no

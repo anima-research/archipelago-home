@@ -26,6 +26,10 @@ import type { PrincipalKind } from './token.js';
 export class JsonStore<T> {
   private value: T;
   private lastMtime: number | null = null;
+  /** The file is there but unreadable or invalid: every write is refused
+   *  until it's fixed, so a bad hand edit can't be overwritten by whatever
+   *  this process holds (an empty store, at start). */
+  private broken = false;
   private poll: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -40,32 +44,56 @@ export class JsonStore<T> {
   }
 
   private loadOnce(): T | null {
+    const was = this.broken;
+    // The mtime first: a rename between the stat and the read leaves a newer
+    // file under an older mtime, which the next poll re-reads — never the
+    // other way round.
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8')) as unknown;
-      const v = this.validate(raw);
-      if (v === null) console.error(`[hn] ${this.label}: ${this.path} failed validation`);
       this.lastMtime = statSync(this.path).mtimeMs;
-      return v;
     } catch {
-      return null; // missing/unparseable → caller keeps empty/previous
+      /* missing, or mid-rename: the read below decides */
     }
+    let text: string;
+    try {
+      text = readFileSync(this.path, 'utf8');
+    } catch (err) {
+      // Missing: nothing to protect, the first write makes it. Any other
+      // read failure (permissions, a directory…) is a file we must not replace.
+      this.broken = (err as NodeJS.ErrnoException).code !== 'ENOENT';
+      if (this.broken && !was) console.error(`[hn] ${this.label}: ${this.path} can't be read (${(err as Error).message}) — writes refused until it's fixed`);
+      return null;
+    }
+    let v: T | null = null;
+    try {
+      v = this.validate(JSON.parse(text) as unknown);
+    } catch {
+      v = null;
+    }
+    this.broken = v === null;
+    if (v === null && !was) console.error(`[hn] ${this.label}: ${this.path} is unreadable or failed validation — writes refused until it's fixed`);
+    if (v !== null && was) console.error(`[hn] ${this.label}: ${this.path} readable again`);
+    return v;
+  }
+
+  /** Worth re-reading? A changed mtime — or, while the file is broken, every
+   *  time (a repair can keep the mtime); a broken file that's since gone is
+   *  just missing again. */
+  private changed(): boolean {
+    let m: number;
+    try {
+      m = statSync(this.path).mtimeMs;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.broken = false;
+      return false; // missing or mid-rename
+    }
+    return this.broken || m !== this.lastMtime;
   }
 
   startWatching(intervalMs = 3000): void {
     this.poll = setInterval(() => {
-      let m: number | null = null;
-      try {
-        m = statSync(this.path).mtimeMs;
-      } catch {
-        return; // missing or mid-rename
-      }
-      if (m === this.lastMtime) return;
-      this.lastMtime = m;
-      const next = this.loadOnce();
-      if (next === null) {
-        console.error(`[hn] ${this.label}: ${this.path} unparseable — keeping previous`);
-        return;
-      }
+      if (!this.changed()) return;
+      const next = this.loadOnce(); // logs when it turns unreadable, and when it's readable again
+      if (next === null) return; // keep the previous value
       this.value = next;
       console.error(`[hn] ${this.label}: reloaded`);
     }, intervalMs);
@@ -80,13 +108,7 @@ export class JsonStore<T> {
    *  poll — a stat when nothing changed. Call before a read-modify-write so a
    *  concurrent CLI edit isn't clobbered. */
   refresh(): void {
-    let m: number;
-    try {
-      m = statSync(this.path).mtimeMs;
-    } catch {
-      return;
-    }
-    if (m === this.lastMtime) return;
+    if (!this.changed()) return;
     const next = this.loadOnce();
     if (next !== null) this.value = next;
   }
@@ -112,15 +134,23 @@ export class JsonStore<T> {
     });
   }
 
+  /** Can this store write now? (Re-reads the file if it changed, so the
+   *  answer is about the file on disk, not the last poll.) */
+  writable(): boolean {
+    this.refresh();
+    return !this.broken;
+  }
+
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
-    this.value = next;
+    if (!this.writable()) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
     const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
     writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', this.mode !== undefined ? { mode: this.mode } : undefined);
     if (this.mode !== undefined) chmodSync(tmp, this.mode); // mode only applies on create
     renameSync(tmp, this.path);
+    this.value = next; // only once it's on disk: a failed write leaves nothing in memory either
     try {
       this.lastMtime = statSync(this.path).mtimeMs; // suppress self-reload
     } catch {
@@ -211,6 +241,11 @@ function validatePrincipals(raw: unknown): PrincipalsFile | null {
 
 export class PrincipalStore {
   private store: JsonStore<PrincipalsFile>;
+
+  /** False while its file is there but can't be read: nothing may be written. */
+  writable(): boolean {
+    return this.store.writable();
+  }
 
   constructor(path: string) {
     this.store = new JsonStore(path, validatePrincipals, { principals: [] }, 'principals');
@@ -313,6 +348,11 @@ function validateInvites(raw: unknown): InvitesFile | null {
 export class InviteStore {
   private store: JsonStore<InvitesFile>;
 
+  /** False while its file is there but can't be read: nothing may be written. */
+  writable(): boolean {
+    return this.store.writable();
+  }
+
   constructor(path: string) {
     this.store = new JsonStore(path, validateInvites, { invites: [] }, 'invites');
   }
@@ -408,9 +448,70 @@ export interface AudienceConfig {
    *  hasn't published one. wss only, for the same reason as `api`: the host
    *  puts the resident's credential on this dial. */
   mcpl?: string;
+  /**
+   * Open to newcomers: anyone who signs in (a Google account the node has
+   * never seen, a Discord account with no role) gets a token for THIS
+   * audience, holding `scopes` (default: its requiredScopes) — and nothing
+   * anywhere else. While any audience is open, a Google newcomer gets an
+   * account row (human:google:<sub>) on first sign-in WHEREVER it started —
+   * the row holds nothing, so closed audiences still refuse it (pointing at
+   * the open ones). Absent = only people with a grant get in.
+   */
+  signup?: { scopes?: string[] };
 }
 
 export type AudiencesConfig = Record<string, AudienceConfig>;
+
+/** This node's own audiences: never opened to newcomers by an audiences.json
+ *  entry of the same name (a `console` entry would hand strangers the
+ *  sponsor console). */
+export const NODE_AUDIENCES: ReadonlySet<string> = new Set(['account', 'console']);
+
+/** What an open audience gives anyone who signs in to it, or null if it isn't open. */
+export function signupGrant(all: AudiencesConfig, name: string): RoleGrant | null {
+  const a = NODE_AUDIENCES.has(name) ? undefined : all[name];
+  return a?.signup ? { scopes: [...(a.signup.scopes ?? a.requiredScopes ?? [])] } : null;
+}
+
+/** `signup` must be a plain object, its `scopes` (if any) strings — else the
+ *  file is refused and the last good one stays (an array would open the
+ *  audience; a number in scopes would mint tokens verifiers reject). */
+function signupOk(s: unknown, required: string[]): boolean {
+  if (typeof s !== 'object' || s === null || Array.isArray(s)) return false;
+  const scopes = (s as { scopes?: unknown }).scopes;
+  if (scopes === undefined) return true; // gets requiredScopes
+  // its own scopes must still let a newcomer in
+  return scopeList(scopes) && required.every((r) => (scopes as string[]).includes(r));
+}
+const scopeList = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string' && x.length > 0);
+
+/** Is any audience open to newcomers? (What lets a Google newcomer's first
+ *  sign-in make their row — independent of whether a link can be shown.) */
+export function anyOpen(all: AudiencesConfig): boolean {
+  return Object.keys(all).some((name) => signupGrant(all, name) !== null);
+}
+
+/** The audiences open to newcomers, each with the site to send a person to
+ *  (its redirect's origin — where the service takes people in — else its
+ *  `api`'s) — what a refusal page and the account page point at. */
+export function openSites(all: AudiencesConfig): Array<{ audience: string; url: string; host: string }> {
+  const out: Array<{ audience: string; url: string; host: string }> = [];
+  for (const [audience, a] of Object.entries(all)) {
+    if (!signupGrant(all, audience)) continue;
+    for (const raw of [a.redirect, a.api]) {
+      let u: URL;
+      try {
+        u = new URL(raw ?? '');
+      } catch {
+        continue; // malformed: try the next
+      }
+      if (u.protocol !== 'https:' && u.protocol !== 'http:') continue; // mailto:, data: … — no site to send anyone to
+      out.push({ audience, url: u.origin, host: u.host });
+      break;
+    }
+  }
+  return out;
+}
 
 /** The published service directory: audience → API base, for audiences that
  *  declare one. Audiences without an `api` (MCPL-only, or human-login-only)
@@ -450,6 +551,8 @@ export function audiencesStore(path: string): JsonStore<AudiencesConfig> {
       if (!raw || typeof raw !== 'object') return null;
       for (const v of Object.values(raw as AudiencesConfig)) {
         if (!v || typeof v.redirect !== 'string') return null;
+        if (v.requiredScopes != null && !scopeList(v.requiredScopes)) return null; // null = none, as it always read
+        if (v.signup !== undefined && !signupOk(v.signup, v.requiredScopes ?? [])) return null;
       }
       return raw as AudiencesConfig;
     },

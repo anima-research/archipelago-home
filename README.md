@@ -36,11 +36,19 @@ External → Publish; Data Access: `openid`, `…/auth/userinfo.email`, `…/aut
 (all non-sensitive, so no verification review); Clients → Web application, redirect URI
 `https://<HN_DOMAIN>/oauth/google/callback`, no JavaScript origins. Code flow with PKCE.
 
-Google carries no roles, so it **grants nothing by itself and creates no one**: it opens an
-account that already exists — one that linked Google at `/account`, or one the operator invited
-by address (`hn user add alice --google alice@gmail.com --scopes …`), which the first sign-in
-with that *verified* address claims. From then on the link is by Google's account id, not the
-address. A Google account the node doesn't know is refused.
+Google carries no roles, so it **grants nothing by itself**: it opens an account that already
+exists — one that linked Google at `/account`, or one the operator invited by address
+(`hn user add alice --google alice@gmail.com --scopes …`), which the first sign-in claims if Google
+is **authoritative** for that address: Gmail, or a Google Workspace account. For any other address
+`email_verified` only means the address was checked once (the mailbox may have changed hands), so
+such an invite can't be claimed through Google — send a setup link instead and they link Google
+after. From then on the link is by Google's account id, not the address. A Google account the node
+doesn't know gets an empty row only while an audience is open to newcomers (below).
+
+An account made by a Google sign-in (`human:google:<sub>`) can't unlink Google — it *is* that
+identity, as `human:discord:` rows are for Discord. Nor can an account the operator restricted
+(`hn user restrict`) unlink its Discord or Google: that identity would come back unrestricted on
+its own.
 
 ## Human sign-in
 
@@ -54,7 +62,8 @@ keeps their `human:discord:` sub), turn TOTP on (QR + ten single-use recovery co
 remove passkeys, link Discord to a local account, link or unlink Google. The page's credential is its own login token,
 so it is always a recent sign-in.
 
-Accounts for people without Discord come from the operator — there is no open sign-up. Run
+Accounts for people without Discord come from the operator, from an access code (below), or — while
+an audience is open to newcomers (below) — from a Google newcomer's first sign-in. Run
 `hn user` as the service user (`sudo -u hn …` on the identity box; it refuses to run as root,
 since a root-owned 0600 `accounts.json` would lock the service out):
 
@@ -71,6 +80,27 @@ hn user disable alice    hn user enable alice
 Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes lock its second
 factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
 these, so they remain a way in during a lockout.
+
+## Audiences open to newcomers
+
+An audience with `"signup": {}` in `audiences.json` (optionally `{"scopes": [...]}`, default its
+`requiredScopes`) admits anyone who signs in — a Google account the node has never seen, or a
+Discord account with no role — holding those scopes **for that audience only**. Everywhere else
+they hold nothing. Per-person `withhold` still applies.
+
+While any audience is open, a Google newcomer gets an account row (`human:google:<sub>`) on first
+sign-in **wherever they started** — sign-in settings, or a service they can't use yet. The row
+holds no scopes, so a closed audience still refuses them; its refusal page (and the account page)
+lists the sites open to everyone, so someone who came in the wrong door sees where to go.
+
+Inviting someone who already signed up this way (`hn user add <name> --google <their address>`)
+is refused, with that account's details and the `hn user set <it> --scopes …` to run once you've
+checked it's them. Their account keeps its sub, so what services hold under it (docs shares,
+comments) stays theirs. Nothing is granted to an account by its address alone: an address can
+change hands after the account last signed in.
+
+`account` and `console` are this node's own audiences: an `audiences.json` entry by either name
+never opens them to newcomers. The sites listed as open are each audience's redirect origin.
 
 ## Access codes
 
@@ -124,7 +154,8 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 
 A sponsor passes on (their scopes ∩ `delegable`) — never more than they hold — plus `baseline` on
 every invite; an `id:anchor` holder also grants `anchorGrantable` outright, and an anchored invite
-carries every `resident` scope. A scope the file doesn't mention is never granted through the
+carries every `resident` scope — less, in every case, anything the operator withholds from that
+sponsor (`hn user restrict --withhold`, read live). A scope the file doesn't mention is never granted through the
 console.
 
 ## Operator CLI

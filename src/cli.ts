@@ -206,6 +206,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     /* data dir missing: first run, nothing to protect */
   }
   const accounts = new AccountStore(join(cfg.dataDir, 'accounts.json'));
+  if (!accounts.writable()) die(`${join(cfg.dataDir, 'accounts.json')} can't be read or fails validation — fix it first (nothing here would be true of it)`);
   const [sub, rawName] = pos;
   const scopesFlag = flag.get('scopes')?.split(',').map((s) => s.trim()).filter(Boolean);
   const setupLink = (code: string) => `${cfg.publicUrl}/account/setup#code=${code}`;
@@ -221,6 +222,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
 
+  /** A row a Google sign-in made by itself (an open audience, or a code). */
+  const signedUpRow = (x: HumanAccount): boolean => Boolean(x.google?.sub) && x.sub === `human:google:${x.google!.sub}`;
+
   /** --google <email>: an invite by address, checked against everyone else's. */
   const googleFlag = (forSub?: string): { email: string } | null | undefined => {
     const v = flag.get('google');
@@ -228,19 +232,43 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     if (v === 'none') return null;
     if (!looksLikeEmail(v)) die(`--google wants an email address (or "none"), got "${v}"`);
     const k = emailKey(v);
-    const clash = accounts.all().find((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
-    if (clash) die(`${v} is already on ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}`);
+    const clashes = accounts.all().filter((x) => x.sub !== forSub && x.google && emailKey(x.google.email) === k);
+    if (clashes.length) {
+      // Someone who signed up by signing in already has an account: the
+      // operator gives THAT one access, knowingly (an address can change
+      // hands, and outside Gmail it's only what their Google account
+      // reported — so nothing is granted to it by address alone).
+      const gmail = /@(gmail|googlemail)\.com$/i.test(v.trim());
+      const lines = clashes.map((clash) => {
+        const who = clash.username ?? clash.sub;
+        const state =
+          (clash.disabled ? '; DISABLED' : '') +
+          (clash.scopes?.length ? `; holds ${clash.scopes.join(',')}` : '') +
+          (clash.withhold?.length ? `; withheld: ${clash.withhold.join(',')}` : '') +
+          (clash.ignoreRoles?.length ? `; roles set aside: ${clash.ignoreRoles.join(',')}` : '');
+        return `  ${clash.sub}${clash.google?.sub ? ' (linked)' : ' (invited)'}` +
+          (signedUpRow(clash) ? ` — signed up by signing in ("${displayName(clash)}", ${clash.notes ?? 'no notes'}, Google linked ${clash.google!.linkedAt?.slice(0, 10) ?? '?'})` : '') +
+          state +
+          `. If it's the person: ${clash.disabled ? `hn user enable ${who} && ` : ''}hn user set ${who} --scopes … (replaces the list)`;
+      });
+      const reported = clashes.some((c) => c.google?.sub);
+      die(
+        `${v} is already on ${clashes.length === 1 ? 'an account' : `${clashes.length} accounts`}:\n${lines.join('\n')}` +
+          (reported && !gmail ? `\n  (an address outside Gmail is only what that Google account reported — Google vouches for it only on a Workspace domain; matching it is not the check)` : '') +
+          `\n  If it isn't them: hn user add ${rawName ?? '<name>'} --scopes … (no --google) and send the setup link — they can link Google after.`,
+      );
+    }
     return { email: v.trim() };
   };
 
   switch (sub) {
     case 'add': {
       const username = normalizeUsername(rawName ?? die('usage: hn user add <username> [--scopes a,b] [--name "Display"]'));
+      const tier = flag.get('tier');
+      const google = googleFlag(); // first: an address already on an account says whose, whatever the username
       const bad = usernameProblem(username, accounts, (n) => principals.nameTaken(n));
       if (bad) die(bad);
-      const google = googleFlag();
       const { code, setup } = newSetupCode();
-      const tier = flag.get('tier');
       accounts.add({
         sub: `human:local:${username}`,
         username,
@@ -255,6 +283,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       console.error(`[hn] account human:local:${username} created [${(scopesFlag ?? []).join(' ') || 'no scopes yet — hn user set --scopes'}]`);
       if (google) {
         console.error(`[hn] they sign in with "Continue with Google" as ${google.email} (the first sign-in links it). For a password too: hn user reset ${username}`);
+        if (!/@(gmail|googlemail)\.com$/i.test(google.email)) {
+          console.error(`[hn] note: only a Gmail or Google Workspace address can be claimed this way (Google vouches for nothing else). If ${google.email.split('@')[1]} isn't on Workspace: hn user set ${username} --google none && hn user reset ${username} — a setup link — and they link Google after.`);
+        }
         return;
       }
       console.error(`[hn] send them this one-time link (valid 72h) to set a password:`);
@@ -300,6 +331,9 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         const clash = accounts.all().some((x) => x.sub !== a.sub && (x.username === n || x.name?.toLowerCase() === n));
         if (clash || principals.nameTaken(n)) die(`the name "${newName}" is already in use here`);
       }
+      if (flag.has('google') && a.sub.startsWith('human:google:')) {
+        die(`${a.sub} IS a Google identity — its Google link can't be changed (make a new account for another address)`);
+      }
       const google = googleFlag(a.sub);
       if (google !== undefined && a.google?.sub) console.error(`[hn] note: replacing the linked Google account (${a.google.email}) on ${a.sub}`);
       const next = accounts.update(a.sub, (x) => {
@@ -319,6 +353,14 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     }
     case 'restrict': {
       // A Discord person with no row yet gets one (their sub stays human:discord:<id>).
+      // flags first: a bad one must not leave a fresh row behind
+      const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
+      const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
+      if (flag.has('clear') && (flag.has('ignore-roles') || flag.has('withhold'))) die('--clear lifts restrictions; it can’t go with --ignore-roles or --withhold');
+      for (const [f, list] of [['ignore-roles', ign], ['withhold', wh]] as const) {
+        if (flag.has(f) && (flag.get(f) === 'true' || !list?.length)) die(`--${f} wants a value (comma-separated); to lift restrictions use --clear`);
+      }
+      if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
       let a = rawName ? (accounts.byUsername(rawName) ?? accounts.bySub(rawName) ?? accounts.byDiscord(rawName.replace(/^human:discord:/, ''))) : undefined;
       if (!a && rawName && /^(human:discord:)?\d{15,22}$/.test(rawName)) {
         const id = rawName.replace(/^human:discord:/, '');
@@ -326,9 +368,6 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
         console.error(`[hn] made a row for ${a.sub} (their name fills in at their next Discord sign-in)`);
       }
       if (!a) die('usage: hn user restrict <username | sub | discord-id> [--ignore-roles <role id>,…] [--withhold a,b] [--clear]');
-      const ign = flag.get('ignore-roles')?.split(',').map((s) => s.trim()).filter(Boolean);
-      const wh = flag.get('withhold')?.split(',').map((s) => s.trim()).filter(Boolean);
-      if (ign?.some((r) => !/^\d{15,22}$/.test(r))) die('--ignore-roles wants Discord role ids (see config/roles.json)');
       const next = accounts.update(a.sub, (x) => {
         const n: HumanAccount = { ...x, ...(ign ? { ignoreRoles: ign } : {}), ...(wh ? { withhold: wh } : {}) };
         // the last Discord check's grant predates the restriction: drop it, so only a fresh check counts
@@ -413,4 +452,9 @@ function codeCmd(cfg: ServerConfig, pos: string[], flag: Map<string, string>): v
   }
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  // e.g. a store refusing to overwrite a file it can't read (stores.ts)
+  die((err as Error).message);
+}

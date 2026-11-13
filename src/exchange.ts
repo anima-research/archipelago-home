@@ -34,9 +34,11 @@ export interface ExchangeDeps {
 
 export type ExchangeResult =
   | { status: 200; body: Record<string, unknown> }
-  | { status: 400 | 403; body: { error: string } };
+  | { status: 400 | 403 | 503; body: { error: string } };
 
 const DEFAULT_AGENT_TTL = '7d';
+/** The longest lifetime an invite may set for its agent's tokens. */
+const MAX_TTL_MS = 366 * 86_400_000;
 /** Guests enrolled via invite default to a short leash unless the invite says otherwise. */
 const DEFAULT_ENROLL_TTL = '72h';
 
@@ -132,7 +134,7 @@ export function handleTokenRequest(body: unknown, deps: ExchangeDeps): ExchangeR
 export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult {
   const nowMs = deps.nowMs?.() ?? Date.now();
   const req = body as EnrollRequest;
-  const fail = (status: 400 | 403, error: string): ExchangeResult => {
+  const fail = (status: 400 | 403 | 503, error: string): ExchangeResult => {
     console.error(`[hn] /enroll rejected (${req?.name ?? 'no-name'}): ${error}`);
     return { status, body: { error } };
   };
@@ -143,6 +145,9 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   const freshErr = checkFreshness(req.timestamp, nowMs);
   if (freshErr) return fail(400, freshErr);
 
+  // Re-read both files first: a revocation by `hn` a moment ago counts, and
+  // neither file may be one we can't read (it would take no write).
+  if (!deps.invites.writable() || !deps.principals.writable()) return fail(503, 'enrollment is unavailable right now — try again later');
   const inv = deps.invites.check(req.invite, nowMs);
   if (typeof inv === 'string') return fail(403, `invite ${inv}`);
 
@@ -168,10 +173,20 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
     notes: `enrolled via invite ${inv.code}${inv.label ? ` (${inv.label})` : ''}`,
   };
   if (deps.principals.bySub(p.sub)) return fail(403, 'name taken'); // slug collision
-  deps.principals.add(p);
-  deps.invites.consume(inv.code);
+  // Everything that can refuse, before anything is written. (Two files: a
+  // write that fails after these checks — a full disk — can still leave the
+  // principal without its invite spent.)
   const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];
   if (!aud) return fail(400, 'no audience configured');
+  let ttlMs = NaN;
+  try {
+    ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse
+  } catch {
+    /* refused just below */
+  }
+  if (!(ttlMs > 0 && ttlMs <= MAX_TTL_MS)) return fail(400, 'this invite has a bad token lifetime — ask for a new one');
+  deps.principals.add(p);
+  deps.invites.consume(inv.code);
   return {
     status: 200,
     body: { sub: p.sub, token: mintFor(deps, p, aud, 'enroll', nowMs).token },

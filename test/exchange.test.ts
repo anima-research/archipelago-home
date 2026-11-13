@@ -1,6 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKey } from '../src/keys.js';
@@ -16,6 +16,7 @@ const ISS = 'id.test';
 let deps: ExchangeDeps;
 let principals: PrincipalStore;
 let invites: InviteStore;
+let testDir: string;
 
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), 'hn-test-'));
@@ -36,6 +37,7 @@ beforeEach(() => {
   );
   principals = new PrincipalStore(join(dir, 'principals.json'));
   invites = new InviteStore(join(dir, 'invites.json'));
+  testDir = dir;
   deps = {
     issuer,
     iss: ISS,
@@ -149,4 +151,49 @@ test('a malformed ttl is refused before the proof is checked', () => {
   const req = { ...makeTokenRequest(agentKey.privateKey, agentKey.id, ISS, 'eidoverse'), ttl: 'forever' };
   const res = handleTokenRequest(req, deps);
   assert.equal(res.status, 400);
+});
+
+test('enroll: while invites.json can’t be read, nothing is written — no principal left behind an unspent invite', () => {
+  invites.mint({ code: 'inv_y', scopes: ['worlds:join'], maxUses: 1 });
+  const path = join(testDir, 'invites.json');
+  writeFileSync(path, '{ not json');
+  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  const guest = generateKey();
+  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_y', 'Wren'), deps);
+  assert.equal(res.status, 503);
+  assert.equal(principals.byKey(guest.id), undefined);
+  assert.equal(readFileSync(path, 'utf8'), '{ not json'); // the damaged file, untouched
+});
+
+test('enroll: while principals.json can’t be read, a valid invite stays unspent and nothing is written', () => {
+  invites.mint({ code: 'inv_z', scopes: ['worlds:join'], maxUses: 1 });
+  const path = join(testDir, 'principals.json');
+  writeFileSync(path, '{ not json');
+  utimesSync(path, new Date(), new Date(Date.now() + 5000));
+  const guest = generateKey();
+  assert.equal(handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_z', 'Moss'), deps).status, 503);
+  assert.equal(typeof invites.check('inv_z', Date.now()), 'object'); // still claimable
+  assert.equal(readFileSync(path, 'utf8'), '{ not json');
+});
+
+test('enroll: with no audience to mint for, it refuses before writing anything', () => {
+  invites.mint({ code: 'inv_n', scopes: ['worlds:join'], maxUses: 1 });
+  const guest = generateKey();
+  const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_n', 'Nook'), { ...deps, knownAudiences: () => [] });
+  assert.equal(res.status, 400);
+  assert.match(String((res.body as { error: string }).error), /no audience configured/);
+  assert.equal(principals.byKey(guest.id), undefined);
+  assert.equal(typeof invites.check('inv_n', Date.now()), 'object');
+});
+
+test('enroll: an invite whose token lifetime is unusable (unparseable, zero) refuses before writing anything', () => {
+  for (const [code, ttl] of [['inv_t', 'forever'], ['inv_0', '0m']] as const) {
+    invites.mint({ code, scopes: ['worlds:join'], maxUses: 1, tokenTtl: ttl });
+    const guest = generateKey();
+    const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, code, `Tern ${code}`), deps);
+    assert.equal(res.status, 400, ttl);
+    assert.match(String((res.body as { error: string }).error), /bad token lifetime/);
+    assert.equal(principals.byKey(guest.id), undefined);
+    assert.equal(typeof invites.check(code, Date.now()), 'object');
+  }
 });

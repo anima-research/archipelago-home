@@ -91,7 +91,7 @@ const AUDIENCE_LABEL: Record<string, string> = { account: 'your sign-in settings
 
 // ── /login ──
 
-export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; nonce: string }): string {
+export function loginPage(o: { iss: string; audience: string; state: string; discord: boolean; google: boolean; open?: boolean; nonce: string }): string {
   const target = AUDIENCE_LABEL[o.audience] ?? o.audience;
   const body = `
 <h1>Sign in</h1>
@@ -128,7 +128,11 @@ export function loginPage(o: { iss: string; audience: string; state: string; dis
   <button id="back" class="btn block" type="button">Start over</button>
 </section>
 <p class="dim small" style="margin-top:2rem">${
-    o.discord
+    o.open && (o.google || o.discord)
+      ? (o.google
+        ? 'New here? Continue with Google — this one is open to everyone, and your account is made as you sign in.'
+        : 'New here? Continue with Discord — this one is open to everyone.')
+      : o.discord
       ? 'No username yet? Continue with Discord, then add a password or passkey under <a href="/login?audience=account">sign-in settings</a>.'
       : 'Accounts are created by this home’s operator.'
   }</p>`;
@@ -144,6 +148,7 @@ $('pw').onsubmit = async (e) => {
   const username = $('u').value.trim(), password = $('p').value;
   if (!username || !password) return err('Enter your username and password.');
   busy($('pw'), true);
+  if (!(await codeGate())) return busy($('pw'), false);
   const r = await post('/login/password', { state: S.state, username, password }).catch(() => ({ body: { error: 'Network error.' } }));
   busy($('pw'), false);
   if (go(r)) return;
@@ -168,14 +173,32 @@ function restart() { ticket = null; $('step2').hidden = true; $('step1').hidden 
 $('back').onclick = () => { err(''); restart(); };
 
 const SIGNUP = ${scriptJson([o.google && 'Google', o.discord && 'Discord'].filter(Boolean))};
-async function useCode(code) {
+// Every way to finish signing in waits for a code check still in flight,
+// so the code is on the sign-in before it completes. A refused code stops
+// the first try (its reason stays up); the next one goes on without it.
+let codePending = Promise.resolve(true), codeError = '';
+function useCode(code) {
+  codePending = checkCode(code).catch(() => { codeError = 'That code didn’t work.'; err(codeError); return false; });
+  return codePending;
+}
+async function codeGate() {
+  if (await codePending) return true;
+  codePending = Promise.resolve(true);
+  err(codeError + ' Sign in again to go on without it.');
+  return false;
+}
+document.querySelectorAll('a[href^="/login/google"],a[href^="/login/discord"]').forEach((a) => {
+  a.addEventListener('click', async (e) => { e.preventDefault(); if (await codeGate()) location.assign(a.href); });
+});
+async function checkCode(code) {
   err('');
-  const r = await post('/login/code', { state: S.state, code }).catch(() => ({ body: { error: 'Network error.' } }));
-  if (!r.body.label) return err(r.body.error || 'That code didn’t work.');
+  const r = await post('/login/code', { state: S.state, code }).catch(() => ({ status: 0, body: { error: 'Network error.' } }));
+  if (r.status !== 200) { codeError = r.body.error || 'That code didn’t work.'; err(codeError); return false; }
   $('code-box').hidden = true; $('code-box').open = false;
   const ok = $('code-ok'); ok.hidden = false;
   ok.textContent = 'Code accepted — ' + r.body.label + ' (access to ' + r.body.audiences.join(', ') + '). Now sign in' +
     (SIGNUP.length ? ' — new here? Continue with ' + SIGNUP.join(' or ') + ' to make your account.' : '.');
+  return true;
 }
 $('cf').onsubmit = (e) => { e.preventDefault(); const c = $('code').value.trim(); if (c) useCode(c); else err('Enter the code.'); };
 // A shared link can carry the code in its fragment: /login?audience=…#code=…
@@ -194,6 +217,7 @@ async function passkey(mode) {
   catch (e) { if (mode === 'modal') err(webauthnError(e)); return; }
   if (!cred) return;
   err('');
+  if (!(await codeGate())) return;
   const r = await post('/login/passkey/finish', { state: S.state, credential: credJSON(cred) }).catch(() => ({ body: { error: 'Network error.' } }));
   if (!go(r)) err(r.body.error || 'Passkey sign-in failed.');
 }
@@ -249,7 +273,9 @@ const fmt = (iso) => iso ? new Date(iso).toLocaleDateString(undefined, { year: '
 function render(extra) {
   const until = new Date(me.exp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   let s = '<div class="card"><p>Signed in as <b>' + h(me.name) + '</b></p><p class="dim small mono">' + h(me.sub) + '</p>' +
-    '<p class="dim small">This page stays signed in until ' + until + '.</p></div>';
+    '<p class="dim small">This page stays signed in until ' + until + '.</p>' +
+    ((me.open || []).length ? '<p>Open to everyone: ' + me.open.map((o) => '<a href="' + h(o.url) + '">' + h(o.host) + '</a>').join(', ') + '</p>' : '') +
+    '</div>';
 
   // username + password
   s += '<div class="card"><h2>Username &amp; password</h2>';
@@ -323,7 +349,7 @@ function render(extra) {
     s += '<div class="card"><h2>Google</h2>';
     if (me.google && me.google.linked) s += '<p>Linked to <b>' + h(me.google.email) + '</b>. Continue with Google signs in here. (Google adds no access by itself.)</p><button id="g-off" class="btn sm danger" type="button">Unlink</button>';
     else {
-      if (me.google) s += '<p>Invited as <b>' + h(me.google.email) + '</b> — Continue with Google with that address links it on first use. Or link a different Google account:</p>';
+      if (me.google) s += '<p>Invited as <b>' + h(me.google.email) + '</b> — Continue with Google with that address links it on first use, if it’s a Gmail or Google Workspace address. Or link a different Google account:</p>';
       else s += '<p class="dim">Link a Google account so Continue with Google signs in here. Google adds no access by itself.</p>';
       s += '<button id="g-link" class="btn block" type="button">Link Google</button>';
     }

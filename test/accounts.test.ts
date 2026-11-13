@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -96,4 +96,40 @@ test('grant merge: union of scopes, later claims win, all-null → null', () => 
     scopes: ['a', 'b', 'c'], claims: { tier: 'y' },
   });
   assert.deepEqual(mergeGrants(null, { scopes: [] }), { scopes: [] });
+});
+
+test('store: restriction fields must be string lists — a bad hand edit is refused', () => {
+  const { store } = fresh();
+  store.add({ sub: 'human:local:w', createdAt: '' });
+  assert.throws(() => store.update('human:local:w', (x) => ({ ...x, withhold: 'worlds:join' as unknown as string[] })), /bad withhold/);
+  assert.throws(() => store.update('human:local:w', (x) => ({ ...x, ignoreRoles: [42] as unknown as string[] })), /bad ignoreRoles/);
+  assert.equal(store.bySub('human:local:w')!.withhold, undefined);
+});
+
+test('store: a file it can’t read is never overwritten — writes are refused until it’s fixed', () => {
+  const { path } = fresh();
+  const good = { sub: 'human:local:keep', username: 'keep', createdAt: '' };
+  writeFileSync(path, JSON.stringify({ accounts: [good, { sub: 'human:local:bad', withhold: 'x', createdAt: '' }] }));
+  const store = new AccountStore(path);
+  assert.deepEqual(store.all(), []); // loads as nothing…
+  assert.throws(() => store.add({ sub: 'human:google:new', createdAt: '' }), /refusing to overwrite/); // …and writes nothing
+  assert.match(readFileSync(path, 'utf8'), /human:local:keep/);
+  writeFileSync(path, JSON.stringify({ accounts: [good] })); // the operator fixes it
+  store.add({ sub: 'human:google:new', createdAt: '' });
+  assert.deepEqual(new AccountStore(path).all().map((a) => a.sub).sort(), ['human:google:new', 'human:local:keep']);
+});
+
+test('store: a file it can’t READ (permissions) is not taken for missing — writes refused', { skip: process.getuid?.() === 0 }, () => {
+  const { path } = fresh();
+  writeFileSync(path, JSON.stringify({ accounts: [{ sub: 'human:local:keep', createdAt: '' }] }));
+  chmodSync(path, 0o000);
+  try {
+    const store = new AccountStore(path);
+    assert.equal(store.writable(), false);
+    assert.throws(() => store.add({ sub: 'human:google:new', createdAt: '' }), /refusing to overwrite/);
+  } finally {
+    chmodSync(path, 0o600);
+  }
+  assert.match(readFileSync(path, 'utf8'), /human:local:keep/);
+  assert.doesNotMatch(readFileSync(path, 'utf8'), /human:google:new/);
 });
