@@ -280,22 +280,25 @@ export class PrincipalStore {
   }
 
   add(p: Principal): void {
-    if (this.bySub(p.sub)) throw new Error(`duplicate sub ${p.sub}`);
-    if (this.nameTaken(p.name)) throw new Error(`name "${p.name}" already taken`);
-    if (p.key && this.byKey(p.key)) throw new Error(`key already enrolled`);
-    this.store.set({ principals: [...this.all(), p] });
+    const name = p.name.toLowerCase();
+    this.store.update((f) => {
+      if (f.principals.some((x) => x.sub === p.sub)) throw new Error(`duplicate sub ${p.sub}`);
+      if (f.principals.some((x) => x.name.toLowerCase() === name)) throw new Error(`name "${p.name}" already taken`);
+      if (p.key && f.principals.some((x) => x.key === p.key)) throw new Error(`key already enrolled`);
+      return { principals: [...f.principals, p] };
+    });
   }
 
   /** Revocation = stop issuance (archipelago rule 2: no CRLs; outstanding
    *  tokens live out their exp). Record kept for audit. */
   revoke(sub: string, nowIso = new Date().toISOString()): boolean {
-    const list = this.all();
-    const p = list.find((x) => x.sub === sub);
-    if (!p) return false;
-    this.store.set({
-      principals: list.map((x) => (x.sub === sub ? { ...x, expires: nowIso } : x)),
+    let found = false;
+    this.store.update((f) => {
+      if (!f.principals.some((x) => x.sub === sub)) return f;
+      found = true;
+      return { principals: f.principals.map((x) => (x.sub === sub ? { ...x, expires: nowIso } : x)) };
     });
-    return true;
+    return found;
   }
 }
 
@@ -377,25 +380,32 @@ export class InviteStore {
   }
 
   consume(code: string): void {
-    this.store.set({
-      invites: this.all().map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)),
-    });
+    this.store.update((f) =>
+      f.invites.some((i) => i.code === code)
+        ? { invites: f.invites.map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)) }
+        : f,
+    );
   }
 
   mint(inv: Omit<Invite, 'code'> & { code?: string }): Invite {
     const code = inv.code ?? `inv_${randomBytes(6).toString('base64url')}`;
-    if (this.all().some((i) => i.code === code)) throw new Error(`duplicate invite code ${code}`);
     const full: Invite = { uses: 0, ...inv, code };
-    this.store.set({ invites: [...this.all(), full] });
+    this.store.update((f) => {
+      if (f.invites.some((i) => i.code === code)) throw new Error(`duplicate invite code ${code}`);
+      return { invites: [...f.invites, full] };
+    });
     return full;
   }
 
   revoke(code: string): boolean {
-    const before = this.all();
-    const after = before.filter((i) => i.code !== code);
-    if (after.length === before.length) return false;
-    this.store.set({ invites: after });
-    return true;
+    let found = false;
+    this.store.update((f) => {
+      const after = f.invites.filter((i) => i.code !== code);
+      if (after.length === f.invites.length) return f;
+      found = true;
+      return { invites: after };
+    });
+    return found;
   }
 }
 
