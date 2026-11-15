@@ -148,3 +148,24 @@ test('bare hn invite defaults to single-use and 72h expiry; open forms are named
     assert.equal(readFileSync(join(dir, 'invites.json'), 'utf8'), snap);
   }
 });
+
+test('hn invite keeps a use count, a lifetime and a date that are given', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hn-inv-cli-'));
+  writeFileSync(join(dir, 'principals.json'), JSON.stringify({ principals: [] }));
+  const stored = (code: string) => new InviteStore(join(dir, 'invites.json')).all().find((i) => i.code === code)!;
+
+  const before = Date.now();
+  const counted = runHn(dir, 'invite', '--scopes', 'worlds:join', '--max-uses', '3', '--expires', '14d');
+  assert.equal(counted.status, 0, counted.stderr);
+  assert.match(counted.stderr, /3 uses · ends /);
+  const c = stored(counted.stdout.trim());
+  assert.equal(c.maxUses, 3);
+  const days = (Date.parse(c.expiresAt!) - before) / 86_400_000;
+  assert.ok(days > 13.99 && days < 14.01, `expected ~14d, got ${days}d`);
+
+  const dated = runHn(dir, 'invite', '--scopes', 'worlds:join', '--expires', '2099-01-01');
+  assert.equal(dated.status, 0, dated.stderr);
+  const d = stored(dated.stdout.trim());
+  assert.equal(Date.parse(d.expiresAt!), Date.parse('2099-01-01T00:00:00Z'));
+  assert.equal(d.maxUses, 1);
+});
