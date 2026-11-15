@@ -49,7 +49,7 @@ test('the console client script escapes every rendered field while storing invit
   const base = `http://127.0.0.1:${await node.start()}`;
   const now = Math.floor(Date.now() / 1000);
   try {
-    const rawLabel = '<img src=x onerror="1">';
+    const rawLabel = '<label-tag "q">';
     const tok = mintToken(node.issuer.privateKey, {
       v: 1,
       iss: 'id.test',
@@ -82,6 +82,7 @@ test('the console client script escapes every rendered field while storing invit
     };
     let doneResolve!: () => void;
     const done = new Promise<void>((r) => { doneResolve = r; });
+    let postStep: 'ok' | 'err' = 'ok';
 
     const sandbox = {
       URLSearchParams,
@@ -96,11 +97,11 @@ test('the console client script escapes every rendered field while storing invit
             status: 200,
             json: async () => ({
               sub: 'human:discord:<sub-tag>',
-              name: '<img src=x onerror="name">',
-              delegable: ['worlds:join', '<scope>'],
+              name: '<name-tag>',
+              delegable: ['worlds:join', '<deleg-tag>'],
               canAnchor: true,
-              home: 'id.test<home>',
-              residentScopes: ['<res>'],
+              home: 'id.test<home-tag>',
+              residentScopes: ['<res-tag>'],
             }),
           };
         }
@@ -111,31 +112,58 @@ test('the console client script escapes every rendered field while storing invit
             json: async () => ({
               invites: [
                 {
-                  code: 'inv_<code>',
+                  code: 'inv_<code-tag>',
                   label: rawLabel,
-                  status: 'claimed<st>',
-                  expiresAt: '2026-11-<d>',
-                  agent: { name: '<svg onload=1>', sub: 'agent:<sub2>' },
+                  status: 'claimed<status-tag>',
+                  expiresAt: '<i>2026-11-30T00:00:00Z',
+                  agent: { name: '<agent-name>', sub: 'agent:<agent-sub>' },
                 },
               ],
             }),
           };
         }
+        if (postStep === 'ok') {
+          return {
+            status: 200,
+            json: async () => ({ invite: { code: 'inv_<mint-code>' } }),
+          };
+        }
         return {
           status: 403,
-          json: async () => ({ error: '<script>bad</script>' }),
+          json: async () => ({ error: '<err-tag>' }),
         };
       },
     };
     vm.runInNewContext(scriptMatch[1]!, sandbox);
     await done;
-    assert.ok(!els.app.innerHTML.includes('<img'), `unescaped <img> in app.innerHTML: ${els.app.innerHTML}`);
-    assert.ok(!els.app.innerHTML.includes('<svg'), `unescaped <svg> in app.innerHTML: ${els.app.innerHTML}`);
-    assert.ok(els.app.innerHTML.includes('&lt;img src=x onerror=&quot;1&quot;&gt;'));
 
+    const appPairs: Array<[string, string]> = [
+      ['inv_<code-tag>', 'inv_&lt;code-tag&gt;'],
+      [rawLabel, '&lt;label-tag &quot;q&quot;&gt;'],
+      ['claimed<status-tag>', 'claimed&lt;status-tag&gt;'],
+      ['<i>2026-11', '&lt;i&gt;2026-11'],
+      ['<agent-name>', '&lt;agent-name&gt;'],
+      ['agent:<agent-sub>', 'agent:&lt;agent-sub&gt;'],
+      ['<name-tag>', '&lt;name-tag&gt;'],
+      ['human:discord:<sub-tag>', 'human:discord:&lt;sub-tag&gt;'],
+      ['<deleg-tag>', '&lt;deleg-tag&gt;'],
+      ['id.test<home-tag>', 'id.test&lt;home-tag&gt;'],
+      ['<res-tag>', '&lt;res-tag&gt;'],
+    ];
+    for (const [raw, escaped] of appPairs) {
+      assert.ok(!els.app.innerHTML.includes(raw), `unescaped ${raw} in app.innerHTML`);
+      assert.ok(els.app.innerHTML.includes(escaped), `missing escaped ${escaped} in app.innerHTML`);
+    }
+
+    postStep = 'ok';
     await els.mint.onclick!();
-    assert.ok(!els.minted.innerHTML.includes('<script>'), `unescaped error in minted.innerHTML: ${els.minted.innerHTML}`);
-    assert.ok(els.minted.innerHTML.includes('&lt;script&gt;bad&lt;/script&gt;'));
+    assert.ok(!els.minted.innerHTML.includes('inv_<mint-code>'));
+    assert.ok(els.minted.innerHTML.includes('inv_&lt;mint-code&gt;'));
+
+    postStep = 'err';
+    await els.mint.onclick!();
+    assert.ok(!els.minted.innerHTML.includes('<err-tag>'));
+    assert.ok(els.minted.innerHTML.includes('&lt;err-tag&gt;'));
   } finally {
     node.stop();
   }
