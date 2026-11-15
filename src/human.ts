@@ -21,7 +21,8 @@
  * Whatever the method, the result is the same as it always was: a 10-minute,
  * single-use aid1 token delivered to the audience in the URL fragment. The
  * home node keeps no sessions — the account page's credential is its own
- * login token, so "recently authenticated" holds by construction.
+ * login token, good only in the browser that signed in, so "recently
+ * authenticated" holds by construction.
  *
  * Ceremony state (login states, TOTP tickets, WebAuthn challenges, pending
  * TOTP secrets, failure counters) is in memory: a restart just means
@@ -107,19 +108,23 @@ export interface HumanDeps {
   fetchImpl?: FetchLike;
 }
 
-/** A link state is bound to the browser that asked for it (`nonce`, also in
- *  an HttpOnly cookie): a link URL handed to someone else can't attach
- *  THEIR Discord or Google to the sender's account. `pkce` is the Google
- *  leg's code verifier, set when that leg starts. */
-type LoginState = { audience: string; exp: number; pkce?: string } & (
+/** A state is bound to the browser that asked for it (`browser`, also in an
+ *  HttpOnly cookie): a provider's return finishes only there, so a sign-in
+ *  or link URL handed to someone else can't sign them in as the sender, or
+ *  attach THEIR Discord or Google to the sender's account. `pkce` is the
+ *  Google leg's code verifier, set when that leg starts. */
+type LoginState = { audience: string; exp: number; browser: string; pkce?: string } & (
   /** `code`: an access code entered on the sign-in page, redeemed when the sign-in finishes. */
   | { intent: 'login'; code?: string }
-  | { intent: 'link'; provider: 'discord' | 'google'; sub: string; nonce: string }
+  | { intent: 'link'; provider: 'discord' | 'google'; sub: string }
 );
 type FactorCheck = 'ok' | 'bad' | 'locked';
-const LINK_COOKIE = 'hn_link';
+const BROWSER_COOKIE = 'hn_browser';
+const BROWSER_VALUE = /^[A-Za-z0-9_-]{32}$/;
+const PAGE_COOKIE = { account: 'hn_account', console: 'hn_console' } as const;
+export type NodePage = keyof typeof PAGE_COOKIE;
 type Who = { sub: string; name: string; grant: RoleGrant | null; account?: HumanAccount; note?: string };
-type Outcome = { ok: true; redirect: string } | { ok: false; status: number; error: string };
+type Outcome = { ok: true; redirect: string; cookie?: string } | { ok: false; status: number; error: string };
 
 /** Map with per-entry expiry and a size bound — for ceremony state. */
 class Pending<T extends { exp: number }> {
@@ -242,7 +247,7 @@ export class HumanAuth {
       else if (p === '/account/me') this.me(req, res);
       else if (!isLogin) return false;
       else if (!this.d.allow(ip)) json(res, 429, { error: 'too many requests — wait a minute' });
-      else if (p === '/login') this.loginPage(url, res);
+      else if (p === '/login') this.loginPage(req, url, res);
       else if (p === '/login/discord') this.discordStart(url, res);
       else if (p === '/oauth/callback') await this.callback(req, url, res);
       else if (p === '/login/google') this.googleStart(url, res);
@@ -284,10 +289,10 @@ export class HumanAuth {
     '/account/passkeys/begin': (q, res) => this.withAccount(q, res, (t) => this.passkeyAddBegin(res, t)),
     '/account/passkeys/finish': (q, res, b) => this.withAccount(q, res, (t) => this.passkeyAddFinish(res, t, b)),
     '/account/passkeys/remove': (q, res, b) => this.withAccount(q, res, (t) => this.passkeyRemove(res, t, b)),
-    '/account/discord/link': (q, res) => this.withAccount(q, res, (t) => this.discordLink(res, t)),
+    '/account/discord/link': (q, res) => this.withAccount(q, res, (t) => this.discordLink(q, res, t)),
     '/account/discord/unlink': (q, res) => this.withAccount(q, res, (t) => this.discordUnlink(res, t)),
     '/account/code': (q, res, b) => this.withAccount(q, res, (t) => this.accountCode(res, t, b)),
-    '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(res, t)),
+    '/account/google/link': (q, res) => this.withAccount(q, res, (t) => this.googleLink(q, res, t)),
     '/account/google/unlink': (q, res) => this.withAccount(q, res, (t) => this.googleUnlink(res, t)),
   };
 
@@ -299,12 +304,55 @@ export class HumanAuth {
     return state;
   }
 
-  private loginPage(url: URL, res: ServerResponse): void {
+  private get https(): boolean {
+    return this.d.cfg.publicUrl.startsWith('https:');
+  }
+
+  /** `__Host-` under https: the browser then takes it only with Secure,
+   *  Path=/ and no Domain, so a page on a sibling domain can't plant it. */
+  private cookieName(base: string): string {
+    return this.https ? `__Host-${base}` : base;
+  }
+
+  private cookieLine(base: string, value: string, maxAgeS: number, sameSite: 'Lax' | 'Strict'): string {
+    return `${this.cookieName(base)}=${value}; Path=/; Max-Age=${maxAgeS}; HttpOnly; SameSite=${sameSite}${this.https ? '; Secure' : ''}`;
+  }
+
+  /** This browser's value: the one its cookie holds, or a new one where it
+   *  has none; the cookie is renewed either way. Lax, since the provider's
+   *  return is a top-level navigation from another site. */
+  private browserValue(req: IncomingMessage, res: ServerResponse): string {
+    const had = cookie(req, this.cookieName(BROWSER_COOKIE));
+    const value = BROWSER_VALUE.test(had) ? had : randomBytes(24).toString('base64url');
+    res.setHeader('set-cookie', this.cookieLine(BROWSER_COOKIE, value, STATE_TTL_MS / 1000, 'Lax'));
+    return value;
+  }
+
+  private returnedHere(req: IncomingMessage, st: LoginState): boolean {
+    return safeEqual(cookie(req, this.cookieName(BROWSER_COOKIE)), st.browser);
+  }
+
+  private refuseElsewhere(res: ServerResponse, st: LoginState, provider: 'Discord' | 'Google'): void {
+    console.error(`[hn] login refused at ${st.audience}: the ${provider} sign-in finished in a browser that didn't start it`);
+    html(res, 403, page('sign-in refused', `<p>Signing in with ${provider} has to finish in the same browser that started it. <a href="/login?audience=${esc(encodeURIComponent(st.audience))}">Start again in this browser</a>.</p>`));
+  }
+
+  /** For `/account` and `/console`: true when this request carries the
+   *  cookie that the sign-in which made this token set; otherwise false,
+   *  with a 401 written. */
+  signedInHere(req: IncomingMessage, res: ServerResponse, nodePage: NodePage, jti: string | undefined): boolean {
+    if (safeEqual(cookie(req, this.cookieName(PAGE_COOKIE[nodePage])), jti ?? '')) return true;
+    json(res, 401, { error: 'this browser has no current sign-in for this page — sign in again' });
+    return false;
+  }
+
+  private loginPage(req: IncomingMessage, url: URL, res: ServerResponse): void {
     const audience = url.searchParams.get('audience') ?? '';
     if (!this.audienceRedirect(audience)) {
       return html(res, 400, page('unknown audience', `<p>Unknown audience <code>${esc(audience)}</code>.</p>`));
     }
-    const state = this.newState({ intent: 'login', audience, exp: Date.now() + STATE_TTL_MS });
+    const browser = this.browserValue(req, res);
+    const state = this.newState({ intent: 'login', audience, browser, exp: Date.now() + STATE_TTL_MS });
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
     if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
     securePage(res, 200, (nonce) =>
@@ -336,12 +384,11 @@ export class HumanAuth {
       return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
     }
     if (st.intent === 'link') {
-      res.setHeader('set-cookie', this.linkCookie('', 0, '/oauth/callback')); // spent either way
-      if (st.provider !== 'discord' || !safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
+      if (st.provider !== 'discord' || !this.returnedHere(req, st)) {
         console.error(`[hn] link refused for ${st.sub}: finished in a browser that didn't start it`);
         return html(res, 403, page('link refused', '<p>Linking Discord has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
       }
-    }
+    } else if (!this.returnedHere(req, st)) return this.refuseElsewhere(res, st, 'Discord');
     if (!code || !this.discordOn) {
       return html(res, 400, page('login failed', '<p>Discord did not complete the login.</p>'));
     }
@@ -379,7 +426,7 @@ export class HumanAuth {
       if (!acct) return html(res, 400, page('link failed', '<p>That account can’t take a Discord link right now. Start again from your sign-in settings.</p>'));
       console.error(`[hn] account: ${acct.sub} linked discord:${user.id} (${discordName})`);
       const out = this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'oauth');
-      return out.ok ? redirect(res, out.redirect) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
+      return out.ok ? this.redirectOk(res, out) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
     }
 
     let acct = this.d.accounts.byDiscord(user.id);
@@ -402,7 +449,7 @@ export class HumanAuth {
       ? { sub: acct.sub, name: displayName(acct), grant, account: acct }
       : { sub: `human:discord:${user.id}`, name: discordName, grant };
     const out = this.issue(st.audience, who, 'oauth');
-    if (out.ok) return redirect(res, out.redirect);
+    if (out.ok) return this.redirectOk(res, out);
     console.error(`[hn] login refused: discord:${user.id} (${user.username}) at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — your Discord account
 doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '' : ' (you are not in the guild)'}. If you were given an access code, enter it on the sign-in page; otherwise ask an operator for access.</p>${this.openHint(st.audience)}`));
@@ -641,6 +688,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       }
     }
     const nowMs = Date.now();
+    const jti = newJti();
     const payload: Aid1Payload = {
       v: 1,
       iss: this.d.cfg.iss,
@@ -652,7 +700,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       ...(grant?.claims ? { claims: grant.claims } : {}),
       iat: Math.floor(nowMs / 1000),
       exp: Math.floor((nowMs + LOGIN_TOKEN_TTL_MS) / 1000),
-      jti: newJti(),
+      jti,
     };
     const token = mintToken(this.d.issuer.privateKey, payload);
     this.d.mintLog.append({
@@ -660,12 +708,22 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     });
     console.error(`[hn] login (${by}): ${payload.sub} (${payload.name}) → ${payload.aud} [${payload.scopes.join(' ')}]`);
     // Token rides the fragment — never hits logs or Referer headers (§8).
-    return { ok: true, redirect: `${target}#token=${token}` };
+    const to = `${target}#token=${token}`;
+    if (audience !== 'account' && audience !== 'console') return { ok: true, redirect: to };
+    // Strict: only the page's own calls need it, and they come from this site.
+    return { ok: true, redirect: to, cookie: this.cookieLine(PAGE_COOKIE[audience], jti, LOGIN_TOKEN_TTL_MS / 1000, 'Strict') };
+  }
+
+  private redirectOk(res: ServerResponse, out: Extract<Outcome, { ok: true }>): void {
+    if (out.cookie) res.setHeader('set-cookie', out.cookie);
+    redirect(res, out.redirect);
   }
 
   private respond(res: ServerResponse, out: Outcome): void {
-    if (out.ok) json(res, 200, { redirect: out.redirect });
-    else json(res, out.status, { error: out.status === 403 && !/disabled/.test(out.error) ? `signed in, but no access: ${out.error}` : out.error });
+    if (out.ok) {
+      if (out.cookie) res.setHeader('set-cookie', out.cookie);
+      json(res, 200, { redirect: out.redirect });
+    } else json(res, out.status, { error: out.status === 403 && !/disabled/.test(out.error) ? `signed in, but no access: ${out.error}` : out.error });
   }
 
   // ── account page API (Bearer = an aud:"account" login token; 401 here
@@ -680,6 +738,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       json(res, 401, { error: v.ok ? 'not a person' : v.reason });
       return null;
     }
+    if (!this.signedInHere(req, res, 'account', v.payload.jti)) return null;
     if (this.d.accounts.bySub(v.payload.sub)?.disabled) {
       json(res, 403, { error: 'account disabled' });
       return null;
@@ -893,21 +952,13 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
     json(res, 200, this.view(t));
   }
 
-  private discordLink(res: ServerResponse, t: Aid1Payload): void {
+  private discordLink(req: IncomingMessage, res: ServerResponse, t: Aid1Payload): void {
     const a = this.d.accounts.bySub(t.sub);
     if (!this.discordOn) return json(res, 400, { error: 'Discord login is not configured on this node' });
     if (!a || t.sub.startsWith('human:discord:') || a.discord) return json(res, 400, { error: 'nothing to link' });
-    const nonce = randomBytes(24).toString('base64url');
-    const state = this.newState({ intent: 'link', provider: 'discord', sub: t.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
-    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000, '/oauth/callback'));
+    const browser = this.browserValue(req, res);
+    const state = this.newState({ intent: 'link', provider: 'discord', sub: t.sub, browser, audience: 'account', exp: Date.now() + STATE_TTL_MS });
     json(res, 200, { url: `${this.d.cfg.publicUrl}/login/discord?state=${state}` });
-  }
-
-  /** HttpOnly, scoped to that provider's callback; Lax so the provider's
-   *  redirect back (a top-level GET) carries it. */
-  private linkCookie(value: string, maxAgeS: number, path: '/oauth/callback' | '/oauth/google/callback'): string {
-    const secure = this.d.cfg.publicUrl.startsWith('https:') ? '; Secure' : '';
-    return `${LINK_COOKIE}=${value}; Path=${path}; Max-Age=${maxAgeS}; HttpOnly; SameSite=Lax${secure}`;
   }
 
   private discordUnlink(res: ServerResponse, t: Aid1Payload): void {
@@ -997,12 +1048,11 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       return html(res, 400, page('login expired', '<p>Login attempt expired or invalid — start again from the service.</p>'));
     }
     if (st.intent === 'link') {
-      res.setHeader('set-cookie', this.linkCookie('', 0, '/oauth/google/callback')); // spent either way
-      if (st.provider !== 'google' || !safeEqual(cookie(req, LINK_COOKIE), st.nonce)) {
+      if (st.provider !== 'google' || !this.returnedHere(req, st)) {
         console.error(`[hn] google link refused for ${st.sub}: wrong provider, or finished in a browser that didn't start it`);
         return html(res, 403, page('link refused', '<p>Linking Google has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
       }
-    }
+    } else if (!this.returnedHere(req, st)) return this.refuseElsewhere(res, st, 'Google');
     const code = url.searchParams.get('code') ?? '';
     if (!code || !st.pkce || !this.googleOn) {
       const cancelled = url.searchParams.get('error') === 'access_denied';
@@ -1048,7 +1098,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       if (!acct) return html(res, 400, page('link failed', '<p>That account can’t take a Google link right now. Start again from your sign-in settings.</p>'));
       console.error(`[hn] account: ${acct.sub} linked google:${g.sub} (${label})`);
       const out = this.issue('account', { sub: acct.sub, name: displayName(acct), grant: this.storedGrant(acct), account: acct }, 'google');
-      return out.ok ? redirect(res, out.redirect) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
+      return out.ok ? this.redirectOk(res, out) : html(res, out.status, page('no access', `<p>${esc(out.error)}</p>`));
     }
 
     let acct = this.d.accounts.byGoogle(g.sub);
@@ -1145,19 +1195,18 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     const who = await this.resolve(acct);
     if (this.d.accounts.bySub(acct.sub)?.disabled) return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
     const out = this.issue(st.audience, who, 'google');
-    if (out.ok) return redirect(res, out.redirect);
+    if (out.ok) return this.redirectOk(res, out);
     console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${this.openHint(st.audience)}`));
   }
 
-  private googleLink(res: ServerResponse, t: Aid1Payload): void {
+  private googleLink(req: IncomingMessage, res: ServerResponse, t: Aid1Payload): void {
     if (!this.googleOn) return json(res, 400, { error: 'Google login is not configured on this node' });
     const a = this.ensureAccount(t);
     if (!a) return json(res, 404, { error: 'no account' });
     if (a.google?.sub) return json(res, 400, { error: 'a Google account is already linked — unlink it first' });
-    const nonce = randomBytes(24).toString('base64url');
-    const state = this.newState({ intent: 'link', provider: 'google', sub: a.sub, nonce, audience: 'account', exp: Date.now() + STATE_TTL_MS });
-    res.setHeader('set-cookie', this.linkCookie(nonce, STATE_TTL_MS / 1000, '/oauth/google/callback'));
+    const browser = this.browserValue(req, res);
+    const state = this.newState({ intent: 'link', provider: 'google', sub: a.sub, browser, audience: 'account', exp: Date.now() + STATE_TTL_MS });
     json(res, 200, { url: `${this.d.cfg.publicUrl}/login/google?state=${state}` });
   }
 

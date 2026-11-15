@@ -12,8 +12,8 @@
  * Design constraints, in order:
  *  - No sessions at the home node. The console authenticates with an aid1
  *    token for the built-in `console` audience, held in page memory,
- *    verified offline per request — the home node consuming its own
- *    credential format.
+ *    good only in the browser that signed in, verified offline per
+ *    request — the home node consuming its own credential format.
  *  - Delegation never exceeds the sponsor: an invite's scopes are the
  *    sponsor's scopes ∩ the policy's `delegable` ones. You cannot mint your
  *    agent into rooms you can't enter yourself. The bounded exceptions are

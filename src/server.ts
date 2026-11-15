@@ -252,6 +252,7 @@ export class HomeNode {
       json(res, 401, { error: v.reason });
       return null;
     }
+    if (!this.human.signedInHere(req, res, 'console', v.payload.jti)) return null;
     // The gate holds live too: a scope the operator now withholds no longer opens the console.
     const missing = gate.filter((s) => !this.sponsor(v.payload).scopes.includes(s));
     if (missing.length) {
