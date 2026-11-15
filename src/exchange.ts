@@ -182,7 +182,7 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   const known = deps.knownAudiences();
   const exchangeable = (list: string[]) => list.find((a) => !NODE_AUDIENCES.has(a) && known.includes(a));
   const aud = inv.audiences?.length ? exchangeable(inv.audiences) : exchangeable(known);
-  if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience an agent can hold — ask for a new one' : 'this node has no audience for agents — ask whoever runs it');
+  if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience this node registers for agents — ask whoever runs it, or ask for a new invite' : 'this node has no audience for agents — ask whoever runs it');
   let ttlMs = NaN;
   try {
     ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse
