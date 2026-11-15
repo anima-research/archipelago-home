@@ -24,7 +24,7 @@
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
-import type { Invite, InviteStore, PrincipalStore } from './stores.js';
+import { NODE_AUDIENCES, type Invite, type InviteStore, type PrincipalStore } from './stores.js';
 import { audiencesFor, consoleRequiredScopes, scopesWithRole, type InvitePolicy } from './policy.js';
 
 /** Active = still claimable. The budget counts these, not lifetime mints. */
@@ -117,6 +117,11 @@ export function mintSponsoredInvite(
   // consume the invite and every token request after it would fail.
   if (!audiences.length) {
     return { ok: false, status: 403, error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match' };
+  }
+  // Enrollment takes no token for the node's own audiences, so an invite
+  // that lists only those enrolls no one.
+  if (audiences.every((a) => NODE_AUDIENCES.has(a))) {
+    return { ok: false, status: 403, error: 'the invite policy gives this invite only the node\'s own audiences, which no agent can hold — the operator needs a rule for another audience' };
   }
   const invite = invites.mint({
     scopes,

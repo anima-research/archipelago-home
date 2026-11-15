@@ -177,9 +177,12 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   // Everything that can refuse, before anything is written. (Two files: a
   // write that fails after these checks — a full disk — can still leave the
   // principal without its invite spent.)
-  const exchangeable = (list: string[]) => list.find((a) => !NODE_AUDIENCES.has(a));
-  const aud = inv.audiences?.length ? exchangeable(inv.audiences) : exchangeable(deps.knownAudiences());
-  if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience an agent can hold — ask for a new one' : 'no audience configured');
+  // The first token is for the first audience that audiences.json registers
+  // and that isn't the node's own. An invite with none stays unspent.
+  const known = deps.knownAudiences();
+  const exchangeable = (list: string[]) => list.find((a) => !NODE_AUDIENCES.has(a) && known.includes(a));
+  const aud = inv.audiences?.length ? exchangeable(inv.audiences) : exchangeable(known);
+  if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience an agent can hold — ask for a new one' : 'this node has no audience for agents — ask whoever runs it');
   let ttlMs = NaN;
   try {
     ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse

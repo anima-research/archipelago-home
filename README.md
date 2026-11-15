@@ -139,7 +139,7 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 ```jsonc
 {
   "console": { "requiredScopes": ["worlds:join"] },     // who may open the console and mint
-  "primaryAudience": "eidoverse",                       // enrollment's first token is for this one
+  "primaryAudience": "eidoverse",                       // leads an invite's list; enrollment's first token is for the first registered one that isn't console or account
   "scopes": {                                           // roles: delegable · anchorGrantable · baseline · resident
     "worlds:join": ["delegable", "resident"],
     "docs:use":    ["delegable", "baseline", "resident"]

@@ -317,6 +317,8 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
+      // A body can take minutes to arrive: an expiry or a disable meanwhile counts.
+      if (!this.consoleAuth(req, res)) return true;
       const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), this.sponsor(who),
         typeof body?.label === 'string' ? body.label : undefined,
         { anchorDomain: body?.anchor === true ? this.cfg.iss : null,
