@@ -14,7 +14,7 @@ import {
   type EnrollRequest,
   type TokenRequest,
 } from './statements.js';
-import type { InviteStore, MintLog, Principal, PrincipalStore } from './stores.js';
+import { NODE_AUDIENCES, type InviteStore, type MintLog, type Principal, type PrincipalStore } from './stores.js';
 
 export interface ExchangeDeps {
   issuer: IssuerKey;
@@ -110,6 +110,7 @@ export function handleTokenRequest(body: unknown, deps: ExchangeDeps): ExchangeR
   const freshErr = checkFreshness(req.timestamp, nowMs);
   if (freshErr) return fail(400, freshErr);
   if (!deps.knownAudiences().includes(req.audience)) return fail(400, 'unknown audience');
+  if (NODE_AUDIENCES.has(req.audience)) return fail(403, 'audience not allowed');
 
   const p = deps.principals.byKey(req.id);
   if (!p) return fail(403, 'no principal for key');
@@ -176,8 +177,9 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   // Everything that can refuse, before anything is written. (Two files: a
   // write that fails after these checks — a full disk — can still leave the
   // principal without its invite spent.)
-  const aud = inv.audiences?.[0] ?? deps.knownAudiences()[0];
-  if (!aud) return fail(400, 'no audience configured');
+  const exchangeable = (list: string[]) => list.find((a) => !NODE_AUDIENCES.has(a));
+  const aud = inv.audiences?.length ? exchangeable(inv.audiences) : exchangeable(deps.knownAudiences());
+  if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience an agent can hold — ask for a new one' : 'no audience configured');
   let ttlMs = NaN;
   try {
     ttlMs = parseTtl(p.tokenTtl ?? DEFAULT_AGENT_TTL); // what minting will parse

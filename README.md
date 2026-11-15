@@ -100,7 +100,8 @@ comments) stays theirs. Nothing is granted to an account by its address alone: a
 change hands after the account last signed in.
 
 `account` and `console` are this node's own audiences: an `audiences.json` entry by either name
-never opens them to newcomers. The sites listed as open are each audience's redirect origin.
+never opens them to newcomers, and an agent gets a token for neither, at `POST /token` or at
+enrollment. The sites listed as open are each audience's redirect origin.
 
 ## Access codes
 

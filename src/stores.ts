@@ -464,7 +464,7 @@ export type AudiencesConfig = Record<string, AudienceConfig>;
 
 /** This node's own audiences: never opened to newcomers by an audiences.json
  *  entry of the same name (a `console` entry would hand strangers the
- *  sponsor console). */
+ *  sponsor console), and never minted at the agents' exchange (exchange.ts). */
 export const NODE_AUDIENCES: ReadonlySet<string> = new Set(['account', 'console']);
 
 /** What an open audience gives anyone who signs in to it, or null if it isn't open. */

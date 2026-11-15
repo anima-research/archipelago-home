@@ -236,8 +236,9 @@ export class HomeNode {
 
   // ── sponsor console (see console.ts header for the design) ──
 
-  /** Offline-verify a Bearer console token; null (+401 written) on failure.
-   *  The scopes it must carry are the invite policy's console gate. */
+  /** Verify a Bearer console token, a person's whose account isn't disabled;
+   *  null (the refusal written) on failure. The scopes it must carry are the
+   *  invite policy's console gate. */
   private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
     const gate = consoleRequiredScopes(this.invitePolicy.get());
     if (gate === null) {
@@ -248,8 +249,12 @@ export class HomeNode {
     const v = m
       ? verifyToken(m[1]!, { issuerId: this.issuer.id, iss: this.cfg.iss, aud: 'console', requireScopes: gate })
       : ({ ok: false, reason: 'no bearer token' } as const);
-    if (!v.ok) {
-      json(res, 401, { error: v.reason });
+    if (!v.ok || v.payload.kind !== 'human') {
+      json(res, 401, { error: v.ok ? 'not a person' : v.reason });
+      return null;
+    }
+    if (this.accounts.bySub(v.payload.sub)?.disabled) {
+      json(res, 403, { error: 'account disabled' });
       return null;
     }
     // The gate holds live too: a scope the operator now withholds no longer opens the console.
