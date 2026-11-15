@@ -241,7 +241,8 @@ export class HomeNode {
       json(res, 404, { error: 'not found' });
     } catch (err) {
       console.error(`[hn] ${req.method} ${url.pathname} error: ${(err as Error).message}`);
-      json(res, 500, { error: 'internal error' });
+      if (!res.headersSent) json(res, 500, { error: 'internal error' });
+      else res.end();
     }
   }
 
