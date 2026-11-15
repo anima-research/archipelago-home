@@ -142,8 +142,6 @@ test('an anchored invite carries the full resident grant, whatever the sponsor h
   const r = mintSponsoredInvite(invites, POLICY, anchor, 'resident', { anchorDomain: 'id.test', knownAudiences: KNOWN });
   assert.ok(r.ok);
   assert.deepEqual([...r.invite.scopes].sort(), RESIDENT);
-  // eidoverse first: enrollment's token is for audiences[0]
-  // eidoverse first (enrollment's token is for audiences[0]), then the policy's rule order
   assert.deepEqual(r.invite.audiences, ['eidoverse', 'docs', 'orrery', 'music', 'board', 'body', 'canon', 'clawblox-mesa']);
   assert.equal(r.invite.tokenTtl, '7d');
   // never LESS than a plain invite: extra delegable scopes the sponsor holds survive

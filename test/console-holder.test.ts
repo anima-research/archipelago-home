@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKey } from '../src/keys.js';
@@ -8,11 +9,15 @@ import { HomeNode } from '../src/server.js';
 import { makeEnrollRequest, makeTokenRequest } from '../src/statements.js';
 import { mintToken, verifyToken } from '../src/token.js';
 
-function startTestNode(audiences: Record<string, unknown>) {
+function startTestNode(audiences: Record<string, unknown>, policyOverride?: unknown) {
   const dir = mkdtempSync(join(tmpdir(), 'hn-holder-'));
   writeFileSync(join(dir, 'principals.json'), JSON.stringify({ principals: [] }));
   writeFileSync(join(dir, 'audiences.json'), JSON.stringify(audiences));
-  copyFileSync(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json'), join(dir, 'invite-policy.json'));
+  if (policyOverride !== undefined) {
+    writeFileSync(join(dir, 'invite-policy.json'), JSON.stringify(policyOverride));
+  } else {
+    copyFileSync(join(import.meta.dirname, '..', 'config', 'invite-policy.example.json'), join(dir, 'invite-policy.json'));
+  }
   return new HomeNode({
     iss: 'id.test',
     publicUrl: 'https://id.test',
@@ -23,7 +28,7 @@ function startTestNode(audiences: Record<string, unknown>) {
   });
 }
 
-test('the console refuses non-person tokens with 401 and disabled accounts with 403', async () => {
+test('the console refuses non-person tokens with 401, disabled accounts with 403, and Discord-only tokens whose Discord id was linked elsewhere with 401', async () => {
   const node = startTestNode({ eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
   const base = `http://127.0.0.1:${await node.start()}`;
   const now = Math.floor(Date.now() / 1000);
@@ -96,6 +101,47 @@ test('the console refuses non-person tokens with 401 and disabled accounts with 
       assert.equal(r.status, 403, `${method} ${path}`);
       assert.deepEqual(await r.json(), { error: 'account disabled' });
     }
+
+    const discordOnlyTok = mintToken(node.issuer.privateKey, {
+      v: 1,
+      iss: 'id.test',
+      sub: 'human:discord:5555',
+      kind: 'human',
+      name: 'DiscordOnly',
+      aud: 'console',
+      scopes: ['worlds:join'],
+      iat: now,
+      exp: now + 600,
+    });
+    const dcBefore = await fetch(`${base}/console/me`, {
+      headers: { authorization: `Bearer ${discordOnlyTok}`, 'x-real-ip': '198.51.100.13' },
+    });
+    assert.equal(dcBefore.status, 200);
+
+    node.accounts.add({
+      sub: 'human:local:linked',
+      username: 'linked',
+      discord: { id: '5555', name: 'DiscordOnly' },
+      scopes: ['worlds:join'],
+      createdAt: '2026-11-15T00:00:00Z',
+    });
+    for (const [method, path, body] of [
+      ['GET', '/console/me', undefined],
+      ['GET', '/console/invites', undefined],
+      ['POST', '/console/invites', { label: 'after link' }],
+    ] as const) {
+      const r = await fetch(`${base}${path}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${discordOnlyTok}`,
+          'x-real-ip': '198.51.100.14',
+          ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      assert.equal(r.status, 401, `linked Discord ${method} ${path}`);
+      assert.deepEqual(await r.json(), { error: 'this Discord account is now linked to another account here; sign in again' });
+    }
   } finally {
     node.stop();
   }
@@ -160,7 +206,7 @@ test('POST /token refuses a listed console or account with 403, and an unlisted 
   }
 });
 
-test('POST /enroll skips node audiences and refuses an invite listing only node audiences without writing', async () => {
+test('POST /enroll skips node and unregistered audiences, refuses node-only or unregistered-only invites without writing, and names when no agent audience exists', async () => {
   const node = startTestNode({
     console: { redirect: 'https://id.test/console' },
     account: { redirect: 'https://id.test/account' },
@@ -190,18 +236,162 @@ test('POST /enroll skips node audiences and refuses an invite listing only node 
     const b2 = (await r2.json()) as { token: string };
     assert.ok(verifyToken(b2.token, { issuerId: node.issuer.id, iss: 'id.test', aud: 'eidoverse' }).ok);
 
-    node.invites.mint({ code: 'inv_node_only', scopes: ['worlds:join'], audiences: ['console', 'account'], maxUses: 1 });
-    const k3 = generateKey();
-    const r3 = await fetch(`${base}/enroll`, {
+    node.invites.mint({ code: 'inv_unreg_first', scopes: ['worlds:join'], audiences: ['console', 'misspelled', 'eidoverse'], maxUses: 1 });
+    const kUnregFirst = generateKey();
+    const rUnregFirst = await fetch(`${base}/enroll`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-real-ip': '198.51.100.32' },
-      body: JSON.stringify(makeEnrollRequest(k3.privateKey, k3.id, 'id.test', 'inv_node_only', 'Three')),
+      headers: { 'content-type': 'application/json', 'x-real-ip': '198.51.100.33' },
+      body: JSON.stringify(makeEnrollRequest(kUnregFirst.privateKey, kUnregFirst.id, 'id.test', 'inv_unreg_first', 'TwoB')),
     });
-    assert.equal(r3.status, 400);
-    assert.match(String(((await r3.json()) as { error: string }).error), /ask for a new one/);
-    assert.equal(node.principals.byKey(k3.id), undefined);
-    assert.equal(typeof node.invites.check('inv_node_only'), 'object');
+    assert.equal(rUnregFirst.status, 200);
+    const bUnregFirst = (await rUnregFirst.json()) as { token: string };
+    assert.ok(verifyToken(bUnregFirst.token, { issuerId: node.issuer.id, iss: 'id.test', aud: 'eidoverse' }).ok);
+
+    for (const [code, auds, name, ip] of [
+      ['inv_node_only', ['console', 'account'], 'Three', '198.51.100.32'],
+      ['inv_unreg_only', ['misspelled'], 'Four', '198.51.100.34'],
+    ] as const) {
+      node.invites.mint({ code, scopes: ['worlds:join'], audiences: [...auds], maxUses: 1 });
+      const k = generateKey();
+      const r = await fetch(`${base}/enroll`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-real-ip': ip },
+        body: JSON.stringify(makeEnrollRequest(k.privateKey, k.id, 'id.test', code, name)),
+      });
+      assert.equal(r.status, 400, code);
+      assert.match(String(((await r.json()) as { error: string }).error), /ask for a new one/);
+      assert.equal(node.principals.byKey(k.id), undefined);
+      assert.equal(typeof node.invites.check(code), 'object');
+    }
   } finally {
     node.stop();
+  }
+
+  const nodeOnlyConsole = startTestNode({
+    console: { redirect: 'https://id.test/console' },
+  });
+  const baseOnlyConsole = `http://127.0.0.1:${await nodeOnlyConsole.start()}`;
+  try {
+    nodeOnlyConsole.invites.mint({ code: 'inv_any', scopes: ['worlds:join'], maxUses: 1 });
+    const kAny = generateKey();
+    const rAny = await fetch(`${baseOnlyConsole}/enroll`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-real-ip': '198.51.100.35' },
+      body: JSON.stringify(makeEnrollRequest(kAny.privateKey, kAny.id, 'id.test', 'inv_any', 'Five')),
+    });
+    assert.equal(rAny.status, 400);
+    assert.deepEqual(await rAny.json(), { error: 'this node has no audience for agents — ask whoever runs it' });
+    assert.equal(nodeOnlyConsole.principals.byKey(kAny.id), undefined);
+    assert.equal(typeof nodeOnlyConsole.invites.check('inv_any'), 'object');
+  } finally {
+    nodeOnlyConsole.stop();
+  }
+});
+
+test('POST /console/invites rechecks the holder after the body ends and refuses policies that grant only node audiences', async () => {
+  const node = startTestNode({ eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
+  const port = await node.start();
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    node.accounts.add({
+      sub: 'human:local:inflight',
+      username: 'inflight',
+      scopes: ['worlds:join'],
+      createdAt: '2026-11-15T00:00:00Z',
+    });
+    const inflightTok = mintToken(node.issuer.privateKey, {
+      v: 1,
+      iss: 'id.test',
+      sub: 'human:local:inflight',
+      kind: 'human',
+      name: 'inflight',
+      aud: 'console',
+      scopes: ['worlds:join'],
+      iat: now,
+      exp: now + 600,
+    });
+
+    const origBySub = node.accounts.bySub.bind(node.accounts);
+    let resolveFirstAuth!: () => void;
+    const firstAuthDone = new Promise<void>((r) => { resolveFirstAuth = r; });
+    let seenFirst = false;
+    node.accounts.bySub = (sub: string) => {
+      const res = origBySub(sub);
+      if (sub === 'human:local:inflight' && !seenFirst) {
+        seenFirst = true;
+        setImmediate(resolveFirstAuth);
+      }
+      return res;
+    };
+
+    const payload = '{"label":"slow"}';
+    const part1 = payload.slice(0, 9);
+    const part2 = payload.slice(9);
+    const rawResp = await new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const sock = createConnection({ host: '127.0.0.1', port }, () => {
+        sock.write(
+          `POST /console/invites HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${inflightTok}\r\n` +
+            `X-Real-IP: 198.51.100.40\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n` +
+            `Connection: close\r\n\r\n${part1}`,
+        );
+      });
+      firstAuthDone.then(() => {
+        node.accounts.update('human:local:inflight', (a) => ({ ...a, disabled: true }));
+        sock.write(part2);
+      }, reject);
+      sock.on('data', (c: Buffer) => chunks.push(c));
+      sock.on('error', reject);
+      sock.on('close', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+
+    assert.match(rawResp, /^HTTP\/1\.1 403\b/);
+    assert.match(rawResp, /"account disabled"/);
+    assert.equal(node.invites.all().length, 0);
+  } finally {
+    node.stop();
+  }
+
+  const nodeConsoleOnlyPolicy = startTestNode(
+    {
+      console: { redirect: 'https://id.test/console' },
+      eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
+    },
+    {
+      console: { requiredScopes: ['worlds:join'] },
+      primaryAudience: 'console',
+      scopes: {
+        'worlds:join': ['delegable', 'resident'],
+      },
+      audiences: [{ audience: 'console', always: true }],
+    },
+  );
+  const basePolicy = `http://127.0.0.1:${await nodeConsoleOnlyPolicy.start()}`;
+  try {
+    const sponsorTok = mintToken(nodeConsoleOnlyPolicy.issuer.privateKey, {
+      v: 1,
+      iss: 'id.test',
+      sub: 'human:discord:7777',
+      kind: 'human',
+      name: 'PolicySponsor',
+      aud: 'console',
+      scopes: ['worlds:join'],
+      iat: now,
+      exp: now + 600,
+    });
+    const rMint = await fetch(`${basePolicy}/console/invites`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${sponsorTok}`,
+        'content-type': 'application/json',
+        'x-real-ip': '198.51.100.41',
+      },
+      body: JSON.stringify({ label: 'useless' }),
+    });
+    assert.equal(rMint.status, 403);
+    assert.match(String(((await rMint.json()) as { error: string }).error), /only the node's own audiences, which no agent can hold/);
+    assert.equal(nodeConsoleOnlyPolicy.invites.all().length, 0);
+  } finally {
+    nodeConsoleOnlyPolicy.stop();
   }
 });
