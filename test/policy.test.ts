@@ -62,7 +62,11 @@ test('an invite the rules give no audience is refused, not minted', () => {
   const policy = invitePolicyStore(join(dir, 'p.json')).get();
   const invites = new InviteStore(join(dir, 'store.json'));
   const r = mintSponsoredInvite(invites, policy, { sub: 'human:local:a', name: 'a', scopes: ['a:use'] }, undefined, { knownAudiences: ['vault'] });
-  assert.ok(!r.ok && /no audience/.test(r.error));
+  assert.deepEqual(r, {
+    ok: false,
+    status: 403,
+    error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match',
+  });
   assert.equal(invites.all().length, 0);
 });
 
