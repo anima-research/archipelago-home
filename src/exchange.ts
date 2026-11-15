@@ -14,7 +14,17 @@ import {
   type EnrollRequest,
   type TokenRequest,
 } from './statements.js';
-import { NODE_AUDIENCES, agentCanHold, type InviteStore, type MintLog, type Principal, type PrincipalStore } from './stores.js';
+import {
+  NODE_AUDIENCES,
+  PrincipalConflict,
+  agentCanHold,
+  type Invite,
+  type InviteRejection,
+  type InviteStore,
+  type MintLog,
+  type Principal,
+  type PrincipalStore,
+} from './stores.js';
 
 export interface ExchangeDeps {
   issuer: IssuerKey;
@@ -190,8 +200,14 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
     /* refused just below */
   }
   if (!(ttlMs > 0 && ttlMs <= MAX_TTL_MS)) return fail(400, 'this invite has a bad token lifetime — ask for a new one');
-  deps.principals.add(p);
-  deps.invites.consume(inv.code);
+  let spent: Invite | InviteRejection;
+  try {
+    spent = deps.invites.consume(inv.code, nowMs, () => deps.principals.add(p));
+  } catch (err) {
+    if (err instanceof PrincipalConflict) return fail(403, err.field === 'key' ? 'key already enrolled' : 'name taken');
+    throw err;
+  }
+  if (typeof spent === 'string') return fail(403, `invite ${spent}`);
   return {
     status: 200,
     body: { sub: p.sub, token: mintFor(deps, p, aud, 'enroll', nowMs).token },
