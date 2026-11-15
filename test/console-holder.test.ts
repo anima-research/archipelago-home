@@ -101,7 +101,7 @@ test('the console refuses non-person tokens with 401 and disabled accounts with 
   }
 });
 
-test('POST /token refuses console and account even when audiences.json lists them', async () => {
+test('POST /token refuses a listed console or account with 403, and an unlisted node audience still gets 400', async () => {
   const node = startTestNode({
     console: { redirect: 'https://id.test/console' },
     eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
@@ -133,6 +133,30 @@ test('POST /token refuses console and account even when audiences.json lists the
     assert.deepEqual(await unlisted.json(), { error: 'unknown audience' });
   } finally {
     node.stop();
+  }
+
+  const node2 = startTestNode({
+    account: { redirect: 'https://id.test/account' },
+    eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
+  });
+  node2.principals.add({
+    sub: 'agent:fable@id.test',
+    name: 'Fable',
+    kind: 'agent',
+    key: agent.id,
+    scopes: ['worlds:join'],
+  });
+  const base2 = `http://127.0.0.1:${await node2.start()}`;
+  try {
+    const listedAcct = await fetch(`${base2}/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-real-ip': '198.51.100.22' },
+      body: JSON.stringify(makeTokenRequest(agent.privateKey, agent.id, 'id.test', 'account')),
+    });
+    assert.equal(listedAcct.status, 403);
+    assert.deepEqual(await listedAcct.json(), { error: 'audience not allowed' });
+  } finally {
+    node2.stop();
   }
 });
 
