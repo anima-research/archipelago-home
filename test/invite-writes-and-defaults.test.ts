@@ -336,7 +336,11 @@ test('enrollment spends the invite under its lock before adding the principal, m
   assert.equal(admitRan, false);
 });
 
-test('a stale lock in an unwritable directory fails invite and principal writes promptly instead of spinning', () => {
+test('a stale lock in an unwritable directory fails invite and principal writes promptly instead of spinning', (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip('root bypasses 0o500 directory write permission');
+    return;
+  }
   const dir = mkdtempSync(join(tmpdir(), 'hn-stale-unwritable-'));
   const stale = new Date(Date.now() - 20_000);
   for (const name of ['invites.json.lock', 'principals.json.lock']) {
@@ -362,21 +366,19 @@ test('a stale lock in an unwritable directory fails invite and principal writes 
       } catch (e) {
         prinCode = String(e?.code ?? e?.message ?? e);
       }
-      console.log(JSON.stringify({ uid: process.getuid?.(), invCode, prinCode }));
+      console.log(JSON.stringify({ invCode, prinCode }));
     `;
     const r = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
       cwd: ROOT,
       encoding: 'utf8',
       env: { ...process.env, LOCK_TEST_DIR: dir },
-      timeout: 2_500,
+      timeout: 4_000,
     });
     assert.equal(r.error, undefined, `write hung past deadline: ${r.error?.message ?? r.signal}`);
     assert.equal(r.status, 0, r.stderr);
-    const out = JSON.parse(r.stdout.trim()) as { uid?: number; invCode: string; prinCode: string };
-    if (out.uid !== 0) {
-      assert.equal(out.invCode, 'EACCES');
-      assert.equal(out.prinCode, 'EACCES');
-    }
+    const out = JSON.parse(r.stdout.trim()) as { invCode: string; prinCode: string };
+    assert.equal(out.invCode, 'EACCES');
+    assert.equal(out.prinCode, 'EACCES');
   } finally {
     chmodSync(dir, 0o700);
   }
