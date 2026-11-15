@@ -259,7 +259,9 @@ test('POST /enroll skips node and unregistered audiences, refuses node-only or u
         body: JSON.stringify(makeEnrollRequest(k.privateKey, k.id, 'id.test', code, name)),
       });
       assert.equal(r.status, 400, code);
-      assert.match(String(((await r.json()) as { error: string }).error), /ask for a new one/);
+      assert.deepEqual(await r.json(), {
+        error: 'this invite names no audience this node registers for agents — ask whoever runs it, or ask for a new invite',
+      });
       assert.equal(node.principals.byKey(k.id), undefined);
       assert.equal(typeof node.invites.check(code), 'object');
     }
