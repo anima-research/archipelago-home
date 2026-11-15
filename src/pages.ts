@@ -45,10 +45,12 @@ ul.list li:first-child{border-top:0}
 #msg:empty,#err:empty{display:none}
 `;
 
+export const JS_ESCAPE = `const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);`;
+
 /** Client helpers every page shares: base64url ⇄ ArrayBuffer, JSON POST, HTML escape. */
 const JS_COMMON = `
 const $ = (id) => document.getElementById(id);
-const h = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+${JS_ESCAPE}
 const enc = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
 const dec = (s) => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4 - s.length % 4) % 4);
   return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)).buffer; };

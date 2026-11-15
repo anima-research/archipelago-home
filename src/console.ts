@@ -26,6 +26,8 @@
  */
 import type { Invite, InviteStore, PrincipalStore } from './stores.js';
 import { audiencesFor, consoleRequiredScopes, scopesWithRole, type InvitePolicy } from './policy.js';
+import { esc } from './http.js';
+import { JS_ESCAPE } from './pages.js';
 
 /** Active = still claimable. The budget counts these, not lifetime mints. */
 const SPONSOR_BUDGET = 3;
@@ -161,9 +163,9 @@ export function sponsorInviteView(
 }
 
 /** The console page — vanilla JS, token in memory only, ~10-minute login. */
-export function consolePage(iss: string): string {
+export function consolePage(iss: string, nonce: string): string {
   return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>agent invites — ${iss}</title>
+<title>agent invites — ${esc(iss)}</title>
 <style>
 body{font:16px/1.5 system-ui;max-width:44rem;margin:8vh auto;padding:0 1rem;color:#ddd;background:#111}
 h1{font-size:1.4rem} a{color:#8cf} button{font:inherit;padding:.45em 1em;border-radius:8px;border:1px solid #444;background:#1b2733;color:#ddd;cursor:pointer}
@@ -174,7 +176,8 @@ code{background:#222;padding:.1em .35em;border-radius:5px;word-break:break-all} 
 </style>
 <h1>invites for your agents</h1>
 <div id="app"><p class="dim">checking sign-in…</p></div>
-<script>
+<script nonce="${nonce}">
+${JS_ESCAPE}
 const app = document.getElementById('app');
 let token = new URLSearchParams(location.hash.slice(1)).get('token');
 if (token) history.replaceState(null, '', '/console');
@@ -200,17 +203,17 @@ async function main() {
 async function render(me) {
   const list = await api('/console/invites');
   const rows = (list.body.invites || []).map((i) =>
-    '<tr><td><code>' + i.code + '</code></td><td>' + (i.label || '') + '</td><td>' + i.status +
-    (i.agent ? ' <span class="ok">→ ' + i.agent.name + '</span> <span class="dim">(' + i.agent.sub + ')</span>' : '') +
-    '</td><td class="dim">' + (i.expiresAt || '').slice(0, 10) + '</td></tr>').join('');
+    '<tr><td><code>' + h(i.code) + '</code></td><td>' + h(i.label) + '</td><td>' + h(i.status) +
+    (i.agent ? ' <span class="ok">→ ' + h(i.agent.name) + '</span> <span class="dim">(' + h(i.agent.sub) + ')</span>' : '') +
+    '</td><td class="dim">' + h((i.expiresAt || '').slice(0, 10)) + '</td></tr>').join('');
   app.innerHTML =
-    '<p>Signed in as <b>' + me.name + '</b> <span class="dim">(' + me.sub + ')</span>. ' +
-    'You can delegate: <code>' + me.delegable.join(' ') + '</code></p>' +
+    '<p>Signed in as <b>' + h(me.name) + '</b> <span class="dim">(' + h(me.sub) + ')</span>. ' +
+    'You can delegate: <code>' + h(me.delegable.join(' ')) + '</code></p>' +
     '<div id="mint-row"><input id="label" placeholder="agent name / note (optional)" maxlength="60">' +
     (me.canAnchor
       ? '<label style="display:flex;align-items:center;gap:.4em"><input type="checkbox" id="anchor">' +
-        'anchor at <code>' + me.home + '</code> <span class="dim">(a resident this home stands behind — not a guest; ' +
-        'gets the full resident set: <code>' + (me.residentScopes || []).join(' ') + '</code>)</span></label>'
+        'anchor at <code>' + h(me.home) + '</code> <span class="dim">(a resident this home stands behind — not a guest; ' +
+        'gets the full resident set: <code>' + h((me.residentScopes || []).join(' ')) + '</code>)</span></label>'
       : '') +
     '<button id="mint">mint invite</button></div><div id="minted"></div>' +
     (rows ? '<table><tr><th>code</th><th>label</th><th>status</th><th>expires</th></tr>' + rows + '</table>'
@@ -223,8 +226,8 @@ async function render(me) {
       body: JSON.stringify({ label: document.getElementById('label').value,
         anchor: Boolean(document.getElementById('anchor')?.checked) }) });
     document.getElementById('minted').innerHTML = r.status === 200
-      ? '<p>New invite: <code>' + r.body.invite.code + '</code> — copy it now, then see the table below.</p>'
-      : '<p style="color:#f88">' + (r.body.error || 'mint failed') + '</p>';
+      ? '<p>New invite: <code>' + h(r.body.invite.code) + '</code> — copy it now, then see the table below.</p>'
+      : '<p style="color:#f88">' + h(r.body.error || 'mint failed') + '</p>';
     if (r.status === 200) render(me);
   };
 }
