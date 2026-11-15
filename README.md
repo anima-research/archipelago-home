@@ -163,7 +163,8 @@ console.
 ```sh
 hn fingerprint                                                     # issuer pubkey id
 hn mint --name ferro --aud eidoverse --scopes worlds:join --ttl 72h  # manual guest admission
-hn invite --scopes worlds:join --max-uses 1 --expires 72h            # self-enroll invite code
+hn invite --scopes worlds:join                                     # self-enroll invite code: one use, ends in 72h
+hn invite --scopes worlds:join --max-uses 5 --expires 14d          # five uses, 14 days; --max-uses any / --expires never lift a limit
 hn ls        hn revoke agent:ferro@guest        hn revoke-invite <code>
 ```
 
