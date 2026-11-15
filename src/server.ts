@@ -18,7 +18,7 @@ import { AccountStore } from './accounts.js';
 import { HumanAuth } from './human.js';
 import { CodeStore } from './codes.js';
 import type { FetchLike } from './oauth.js';
-import { esc, html, json, page, readJson } from './http.js';
+import { esc, html, json, page, readJson, securePage } from './http.js';
 import {
   audiencesStore,
   InviteStore,
@@ -293,7 +293,7 @@ export class HomeNode {
       return true;
     }
     if (url.pathname === '/console' && req.method === 'GET') {
-      html(res, 200, consolePage(this.cfg.iss));
+      securePage(res, 200, (nonce) => consolePage(this.cfg.iss, nonce));
       return true;
     }
     if (url.pathname === '/console/me' && req.method === 'GET') {
