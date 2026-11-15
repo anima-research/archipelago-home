@@ -31,11 +31,21 @@ test('GET /console sends the credential-page CSP with a matching script nonce an
     assert.equal(r.headers.get('x-frame-options'), 'DENY');
     assert.equal(r.headers.get('referrer-policy'), 'no-referrer');
     assert.equal(r.headers.get('cache-control'), 'no-store');
+    const rAccount = await fetch(`${base}/account`, { headers: { 'x-real-ip': '198.51.100.50' } });
+    assert.equal(rAccount.status, 200);
     const csp = r.headers.get('content-security-policy') ?? '';
-    assert.match(csp, /default-src 'none'/);
-    assert.match(csp, /frame-ancestors 'none'/);
+    const accountCsp = rAccount.headers.get('content-security-policy') ?? '';
     const m = /script-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(csp);
+    const mAccount = /script-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(accountCsp);
     assert.ok(m, `missing script nonce in CSP: ${csp}`);
+    assert.ok(mAccount, `missing script nonce in /account CSP: ${accountCsp}`);
+    assert.notEqual(m[1], mAccount[1]);
+    assert.equal(csp.replace(m[1]!, '<nonce>'), accountCsp.replace(mAccount[1]!, '<nonce>'));
+    assert.equal(
+      csp,
+      `default-src 'none'; script-src 'nonce-${m[1]}'; style-src 'unsafe-inline'; img-src 'self' data:; ` +
+        `connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+    );
     const body = await r.text();
     assert.ok(body.includes(`<script nonce="${m[1]}">`), 'script tag must carry the response nonce');
     assert.ok(body.includes('<title>agent invites — id.test&lt;/title&gt;&lt;x&gt;&amp;&quot;</title>'));
@@ -49,7 +59,7 @@ test('the console client script escapes every rendered field while storing invit
   const base = `http://127.0.0.1:${await node.start()}`;
   const now = Math.floor(Date.now() / 1000);
   try {
-    const rawLabel = '<label-tag "q">';
+    const rawLabel = '<label-tag "q"> R&D \'co\'';
     const tok = mintToken(node.issuer.privateKey, {
       v: 1,
       iss: 'id.test',
@@ -139,7 +149,8 @@ test('the console client script escapes every rendered field while storing invit
 
     const appPairs: Array<[string, string]> = [
       ['inv_<code-tag>', 'inv_&lt;code-tag&gt;'],
-      [rawLabel, '&lt;label-tag &quot;q&quot;&gt;'],
+      [rawLabel, '&lt;label-tag &quot;q&quot;&gt; R&amp;D &#39;co&#39;'],
+      ['R&D', 'R&amp;D'],
       ['claimed<status-tag>', 'claimed&lt;status-tag&gt;'],
       ['<i>2026-11', '&lt;i&gt;2026-11'],
       ['<agent-name>', '&lt;agent-name&gt;'],
