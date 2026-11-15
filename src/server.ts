@@ -107,7 +107,13 @@ export class HomeNode {
   readonly codes: CodeStore;
   readonly human: HumanAuth;
   private limiter = new RateLimit();
-  private server = createServer((req, res) => void this.route(req, res));
+  private server = createServer((req, res) => {
+    this.route(req, res).catch((err: unknown) => {
+      console.error(`[hn] ${req.method} request failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (!res.headersSent) json(res, 500, { error: 'internal error' });
+      else res.end();
+    });
+  });
 
   constructor(readonly cfg: ServerConfig, opts: { fetchImpl?: FetchLike } = {}) {
     this.issuer = loadOrCreateIssuerKey(join(cfg.dataDir, 'issuer-key.pem'));
@@ -176,9 +182,14 @@ export class HomeNode {
   // ── routing ──
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-    const ip = clientIp(req);
+    let url: URL;
     try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      return json(res, 400, { error: 'bad request' });
+    }
+    try {
+      const ip = clientIp(req);
       if (req.method === 'GET' && url.pathname === '/.well-known/mcpl-identity') {
         return json(res, 200, { scheme: 'ed25519', domain: this.cfg.iss, publicKey: this.issuer.id });
       }
