@@ -14,7 +14,7 @@ import {
   type EnrollRequest,
   type TokenRequest,
 } from './statements.js';
-import { NODE_AUDIENCES, type InviteStore, type MintLog, type Principal, type PrincipalStore } from './stores.js';
+import { NODE_AUDIENCES, agentCanHold, type InviteStore, type MintLog, type Principal, type PrincipalStore } from './stores.js';
 
 export interface ExchangeDeps {
   issuer: IssuerKey;
@@ -180,7 +180,7 @@ export function handleEnroll(body: unknown, deps: ExchangeDeps): ExchangeResult 
   // The first token is for the first audience that audiences.json registers
   // and that isn't the node's own. An invite with none stays unspent.
   const known = deps.knownAudiences();
-  const exchangeable = (list: string[]) => list.find((a) => !NODE_AUDIENCES.has(a) && known.includes(a));
+  const exchangeable = (list: string[]) => list.find((a) => agentCanHold(a, known));
   const aud = inv.audiences?.length ? exchangeable(inv.audiences) : exchangeable(known);
   if (!aud) return fail(400, inv.audiences?.length ? 'this invite names no audience this node registers for agents — ask whoever runs it, or ask for a new invite' : 'this node has no audience for agents — ask whoever runs it');
   let ttlMs = NaN;
