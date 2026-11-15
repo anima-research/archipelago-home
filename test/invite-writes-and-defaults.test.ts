@@ -112,6 +112,9 @@ test("PrincipalStore and InviteStore preserve another writer's changes and check
   assert.equal(i2.revoke(a.code), true);
   i1.consume(a.code);
   assert.deepEqual(new InviteStore(iPath).all().map((i) => i.code), ['inv_b']);
+  i2.mint({ code: 'inv_c', scopes: ['worlds:join'], maxUses: 1 });
+  assert.equal(i1.revoke('inv_c'), true);
+  assert.deepEqual(new InviteStore(iPath).all().map((i) => i.code), ['inv_b']);
 });
 
 test('bare hn invite defaults to single-use and 72h expiry; open forms are named and bad flags refused', () => {
