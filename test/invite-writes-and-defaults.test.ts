@@ -36,6 +36,7 @@ test('a CLI invite revocation survives a concurrent console mint before the poll
     configDir: dir,
   });
   const base = `http://127.0.0.1:${await node.start()}`;
+  node.invites.stopWatching();
   const now = Math.floor(Date.now() / 1000);
   try {
     const sponsorTok = mintToken(node.issuer.privateKey, {
@@ -84,7 +85,7 @@ test('a CLI invite revocation survives a concurrent console mint before the poll
   }
 });
 
-test('PrincipalStore and InviteStore preserve another writer changes and check duplicates against disk', () => {
+test("PrincipalStore and InviteStore preserve another writer's changes and check duplicates against disk", () => {
   const dir = mkdtempSync(join(tmpdir(), 'hn-two-writers-'));
   const pPath = join(dir, 'principals.json');
   const p1 = new PrincipalStore(pPath);
