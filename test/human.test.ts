@@ -469,7 +469,9 @@ test('an agent can’t enroll under a person’s username', async () => {
 
 test('disabled accounts get nothing, by any method; account API refuses foreign tokens', async () => {
   const consoleTok = rawToken((await passwordLogin('frank', 'frank password 1', 'console')).body.redirect);
-  assert.equal((await post('/account/totp/begin', {}, consoleTok)).status, 401);
+  const foreign = await post('/account/totp/begin', {}, consoleTok);
+  assert.equal(foreign.status, 401);
+  assert.match(foreign.body.error, /audience mismatch/);
 
   node.accounts.update('human:discord:42', (a) => ({ ...a, disabled: true }));
   assert.equal((await passwordLogin('dee', 'dee password 1', 'eidoverse')).status, 403);

@@ -76,6 +76,20 @@ const nextHeaders = (extra: Record<string, string> = {}) => ({
 const cookiePair = (setCookieHeader: string | null) => (setCookieHeader ?? '').split(';')[0]!;
 const rawToken = (redirect: string) => /#token=(.+)$/.exec(redirect)![1]!;
 
+function applySetCookies(jar: Map<string, string>, setCookies: string[]) {
+  for (const sc of setCookies) {
+    const parts = sc.split(';').map((p) => p.trim());
+    const eq = parts[0]!.indexOf('=');
+    if (eq <= 0) continue;
+    const name = parts[0]!.slice(0, eq);
+    const val = parts[0]!.slice(eq + 1);
+    const cleared = val === '' || parts.slice(1).some((a) => /^max-age\s*=\s*-?0$/i.test(a) || /^expires\s*=\s*thu,\s*01\s+jan\s+1970/i.test(a));
+    if (cleared) jar.delete(name);
+    else jar.set(name, val);
+  }
+}
+const jarHeader = (jar: Map<string, string>) => [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+
 function verifyRedirectToken(redirect: string, aud: string, targetNode = node): Aid1Payload {
   const v = verifyToken(rawToken(redirect), { issuerId: targetNode.issuer.id, iss: 'id.test', aud });
   assert.ok(v.ok, !v.ok ? v.reason : '');
@@ -90,6 +104,7 @@ async function rawGet(path: string, extra: Record<string, string> = {}, b = base
     text: await r.text(),
     location: r.headers.get('location'),
     setCookie,
+    setCookies: r.headers.getSetCookie(),
     cookie: cookiePair(setCookie),
   };
 }
@@ -105,6 +120,7 @@ async function rawPost(path: string, body: unknown, extra: Record<string, string
     status: r.status,
     body: (await r.json()) as Record<string, any>,
     setCookie,
+    setCookies: r.headers.getSetCookie(),
     cookie: cookiePair(setCookie),
   };
 }
@@ -183,12 +199,14 @@ test('Google sign-in refuses a callback without the starting browser cookie and 
 test('linking Discord or Google after a setup link mints a browser cookie, refuses another browser, and leaves sibling states intact', async () => {
   const s1 = newSetupCode();
   node.accounts.add({ sub: 'human:local:lena', username: 'lena', scopes: ['worlds:join'], setup: s1.setup, createdAt: '' });
+  const lenaJar = new Map<string, string>();
   const setup1 = await rawPost('/account/setup', { code: s1.code, password: 'lena password 1' });
   assert.equal(setup1.status, 200);
+  applySetCookies(lenaJar, setup1.setCookies);
   const lenaTok = rawToken(setup1.body.redirect);
-  const lenaAuth = { authorization: `Bearer ${lenaTok}`, ...(setup1.cookie ? { cookie: setup1.cookie } : {}) };
 
-  const dLink1 = await rawPost('/account/discord/link', {}, lenaAuth);
+  const dLink1 = await rawPost('/account/discord/link', {}, { authorization: `Bearer ${lenaTok}`, cookie: jarHeader(lenaJar) });
+  applySetCookies(lenaJar, dLink1.setCookies);
   assert.equal(dLink1.status, 200);
   assert.match(dLink1.setCookie ?? '', /^__Host-hn_browser=[A-Za-z0-9_-]{32}; Path=\/; Max-Age=600; HttpOnly; SameSite=Lax; Secure$/);
   const dState1 = new URL(dLink1.body.url).searchParams.get('state')!;
@@ -198,26 +216,30 @@ test('linking Discord or Google after a setup link mints a browser cookie, refus
   assert.match(otherBrowser.text, /Linking Discord has to finish in the same browser/);
   assert.equal(node.accounts.byUsername('lena')!.discord, undefined);
 
-  const dLink2 = await rawPost('/account/discord/link', {}, { ...lenaAuth, cookie: [setup1.cookie, dLink1.cookie].filter(Boolean).join('; ') });
+  const dLink2 = await rawPost('/account/discord/link', {}, { authorization: `Bearer ${lenaTok}`, cookie: jarHeader(lenaJar) });
+  applySetCookies(lenaJar, dLink2.setCookies);
   assert.equal(dLink2.cookie, dLink1.cookie);
-  const siblingLogin = await rawGet('/login?audience=notes&via=google', { cookie: dLink1.cookie });
+  const siblingLogin = await rawGet('/login?audience=notes&via=google', { cookie: jarHeader(lenaJar) });
+  applySetCookies(lenaJar, siblingLogin.setCookies);
   assert.equal(siblingLogin.cookie, dLink1.cookie);
 
-  const dStart2 = await rawGet(new URL(dLink2.body.url).pathname + new URL(dLink2.body.url).search, { cookie: dLink1.cookie });
+  const dStart2 = await rawGet(new URL(dLink2.body.url).pathname + new URL(dLink2.body.url).search, { cookie: jarHeader(lenaJar) });
+  applySetCookies(lenaJar, dStart2.setCookies);
   assert.equal(dStart2.status, 302);
   const dState2 = new URL(dStart2.location!).searchParams.get('state')!;
   discordUser = { id: '5102', username: 'lena_dc', global_name: 'Lena' };
-  const dDone = await rawGet(`/oauth/callback?state=${dState2}&code=x`, { cookie: dLink1.cookie });
+  const dDone = await rawGet(`/oauth/callback?state=${dState2}&code=x`, { cookie: jarHeader(lenaJar) });
+  applySetCookies(lenaJar, dDone.setCookies);
   assert.equal(dDone.status, 302);
   const postLinkPayload = verifyRedirectToken(dDone.location!, 'account');
   assert.equal(postLinkPayload.sub, 'human:local:lena');
   assert.equal(dDone.cookie, `__Host-hn_account=${postLinkPayload.jti}`);
   assert.equal(node.accounts.byUsername('lena')!.discord!.id, '5102');
-  assert.equal((await rawGet('/account/me', { authorization: `Bearer ${rawToken(dDone.location!)}`, cookie: dDone.cookie })).status, 200);
+  assert.equal((await rawGet('/account/me', { authorization: `Bearer ${rawToken(dDone.location!)}`, cookie: jarHeader(lenaJar) })).status, 200);
 
   googleUser = { sub: 'g-5103', email: 'sibling@gmail.com', email_verified: true, name: 'Sibling' };
   const siblingState = new URL(siblingLogin.location!).searchParams.get('state')!;
-  const siblingFinish = await rawGet(`/oauth/google/callback?state=${siblingState}&code=x`, { cookie: dLink1.cookie });
+  const siblingFinish = await rawGet(`/oauth/google/callback?state=${siblingState}&code=x`, { cookie: jarHeader(lenaJar) });
   assert.equal(siblingFinish.status, 302);
 
   const s2 = newSetupCode();
