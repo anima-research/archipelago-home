@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleEnroll } from '../src/exchange.js';
@@ -334,4 +334,50 @@ test('enrollment spends the invite under its lock before adding the principal, m
     /is unreadable or invalid/,
   );
   assert.equal(admitRan, false);
+});
+
+test('a stale lock in an unwritable directory fails invite and principal writes promptly instead of spinning', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hn-stale-unwritable-'));
+  const stale = new Date(Date.now() - 20_000);
+  for (const name of ['invites.json.lock', 'principals.json.lock']) {
+    const lp = join(dir, name);
+    writeFileSync(lp, 'stale');
+    utimesSync(lp, stale, stale);
+  }
+  chmodSync(dir, 0o500);
+  try {
+    const script = `
+      import { join } from 'node:path';
+      import { InviteStore, PrincipalStore } from './src/stores.ts';
+      const dir = process.env.LOCK_TEST_DIR;
+      let invCode = '';
+      try {
+        new InviteStore(join(dir, 'invites.json')).mint({ scopes: ['worlds:join'] });
+      } catch (e) {
+        invCode = String(e?.code ?? e?.message ?? e);
+      }
+      let prinCode = '';
+      try {
+        new PrincipalStore(join(dir, 'principals.json')).add({ sub: 'agent:x@guest', name: 'X', kind: 'agent', key: null, scopes: [] });
+      } catch (e) {
+        prinCode = String(e?.code ?? e?.message ?? e);
+      }
+      console.log(JSON.stringify({ uid: process.getuid?.(), invCode, prinCode }));
+    `;
+    const r = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      env: { ...process.env, LOCK_TEST_DIR: dir },
+      timeout: 2_500,
+    });
+    assert.equal(r.error, undefined, `write hung past deadline: ${r.error?.message ?? r.signal}`);
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout.trim()) as { uid?: number; invCode: string; prinCode: string };
+    if (out.uid !== 0) {
+      assert.equal(out.invCode, 'EACCES');
+      assert.equal(out.prinCode, 'EACCES');
+    }
+  } finally {
+    chmodSync(dir, 0o700);
+  }
 });
