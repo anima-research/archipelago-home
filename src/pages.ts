@@ -255,7 +255,7 @@ async function api(path, body) {
     ? { headers: { authorization: 'Bearer ' + token } }
     : { method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401) { signIn('Your sign-in here expired (it lasts 10 minutes). Sign in again to keep going.'); throw new Error('expired'); }
+  if (r.status === 401) { signIn('Your sign-in here has ended. It lasts 10 minutes, and a newer sign-in to this page in another tab ends it too. Sign in again to keep going.'); throw new Error('expired'); }
   return { status: r.status, body: j };
 }
 function signIn(text) {

@@ -80,22 +80,38 @@ after(() => node.stop());
 // Each request from its own address so the per-IP limiter stays out of the way.
 const hdrs = (extra: Record<string, string> = {}) => ({ 'x-real-ip': `10.0.${ipSeq >> 8 & 255}.${ipSeq++ & 255}`, ...extra });
 
+const cookieFor = new Map<string, string>();
+const setCookie = (r: Response) => (r.headers.get('set-cookie') ?? '').split(';')[0]!;
+function keepPageCookie(redirect: unknown, cookie: string) {
+  const tok = typeof redirect === 'string' ? /#token=(.+)$/.exec(redirect)?.[1] : undefined;
+  if (tok && cookie) cookieFor.set(tok, cookie);
+}
+
 async function get(path: string, b = base, extra: Record<string, string> = {}) {
-  const r = await fetch(b + path, { headers: hdrs(extra), redirect: 'manual' });
-  return { status: r.status, text: await r.text(), location: r.headers.get('location'), headers: r.headers };
+  const bearer = /^Bearer (.+)$/.exec(extra.authorization ?? '')?.[1];
+  const page = bearer ? cookieFor.get(bearer) : undefined;
+  const r = await fetch(b + path, { headers: hdrs({ ...(page ? { cookie: page } : {}), ...extra }), redirect: 'manual' });
+  const out = { status: r.status, text: await r.text(), location: r.headers.get('location'), headers: r.headers, cookie: setCookie(r) };
+  keepPageCookie(out.location, out.cookie);
+  return out;
 }
 async function post(path: string, body: unknown, token?: string, b = base) {
+  const page = token ? cookieFor.get(token) : undefined;
   const r = await fetch(b + path, {
     method: 'POST', body: JSON.stringify(body),
-    headers: hdrs({ 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }),
+    headers: hdrs({ 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}), ...(page ? { cookie: page } : {}) }),
   });
-  return { status: r.status, body: (await r.json()) as Record<string, any>, cookie: (r.headers.get('set-cookie') ?? '').split(';')[0]! };
+  const out = { status: r.status, body: (await r.json()) as Record<string, any>, cookie: setCookie(r) };
+  keepPageCookie(out.body.redirect, out.cookie);
+  return out;
 }
 
 async function loginState(audience: string, b = base): Promise<string> {
   const r = await get(`/login?audience=${audience}`, b);
   assert.equal(r.status, 200);
-  return /"state":"([^"]+)"/.exec(r.text)![1]!;
+  const state = /"state":"([^"]+)"/.exec(r.text)![1]!;
+  cookieFor.set(state, r.cookie);
+  return state;
 }
 function tokenFrom(redirect: string, aud: string, n = node): Aid1Payload {
   const tok = /#token=(.+)$/.exec(redirect)![1]!;
@@ -117,13 +133,13 @@ async function googleLogin(audience: string, b = base) {
   const start = await get(`/login?audience=${audience}&via=google`, b);
   assert.equal(start.status, 302);
   const state = new URL(start.location!).searchParams.get('state')!;
-  return get(`/oauth/google/callback?state=${state}&code=x`, b);
+  return get(`/oauth/google/callback?state=${state}&code=x`, b, { cookie: start.cookie });
 }
 async function discordLogin(audience: string, b = base) {
   const start = await get(`/login?audience=${audience}&via=discord`, b);
   assert.equal(start.status, 302);
   const state = new URL(start.location!).searchParams.get('state')!;
-  return get(`/oauth/callback?state=${state}&code=x`, b);
+  return get(`/oauth/callback?state=${state}&code=x`, b, { cookie: start.cookie });
 }
 
 test('chooser page: CSP + no framing, unknown audience refused', async () => {
@@ -253,7 +269,7 @@ test('Discord person adds a password: same sub either way; roles come from the D
   const tok = rawToken(a.location!);
   const me = await get('/account/me'); // no bearer
   assert.equal(me.status, 401);
-  const view = await fetch(base + '/account/me', { headers: hdrs({ authorization: `Bearer ${tok}` }) }).then((r) => r.json());
+  const view = await fetch(base + '/account/me', { headers: hdrs({ authorization: `Bearer ${tok}`, cookie: cookieFor.get(tok)! }) }).then((r) => r.json());
   assert.equal(view.hasPassword, false);
   assert.equal(view.discord.canUnlink, false);
 
@@ -288,7 +304,7 @@ test('a local account links Discord: Continue with Discord then opens it; one Di
   const tok = await accountToken('erin', 'erin password 1'); // no scopes: the account page still opens
   const link = await post('/account/discord/link', {}, tok);
   assert.equal(link.status, 200);
-  assert.match(link.cookie, /^hn_link=/);
+  assert.match(link.cookie, /^__Host-hn_browser=/);
   const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
   assert.equal(start.status, 302);
   assert.match(start.location!, /^https:\/\/discord\.com\/oauth2\/authorize/);
@@ -321,7 +337,7 @@ test('a Discord-link URL handed to someone else links nothing (bound to the brow
   const tok = await accountToken('mallory', 'mallory password 1');
   const link = await post('/account/discord/link', {}, tok);
   const state = new URL(link.body.url).searchParams.get('state')!;
-  // the victim opens the URL and completes Discord in THEIR browser (no hn_link cookie)
+  // the victim opens the URL and completes Discord in THEIR browser (no cookie of mallory's)
   discordUser = { id: '999', username: 'victim', global_name: 'Victim' };
   discordRoles = ['r-member', 'r-orrery'];
   const cb = await get(`/oauth/callback?state=${state}&code=x`);
@@ -332,7 +348,7 @@ test('a Discord-link URL handed to someone else links nothing (bound to the brow
   // a wrong cookie is no better
   const link2 = await post('/account/discord/link', {}, tok);
   const st2 = new URL(link2.body.url).searchParams.get('state')!;
-  assert.equal((await get(`/oauth/callback?state=${st2}&code=x`, base, { cookie: 'hn_link=guess' })).status, 403);
+  assert.equal((await get(`/oauth/callback?state=${st2}&code=x`, base, { cookie: `__Host-hn_browser=${'g'.repeat(32)}` })).status, 403);
 });
 
 test('setup link: sets the password once, lands on the account page; 2FA still guards a reset', async () => {
@@ -453,7 +469,9 @@ test('an agent can’t enroll under a person’s username', async () => {
 
 test('disabled accounts get nothing, by any method; account API refuses foreign tokens', async () => {
   const consoleTok = rawToken((await passwordLogin('frank', 'frank password 1', 'console')).body.redirect);
-  assert.equal((await post('/account/totp/begin', {}, consoleTok)).status, 401);
+  const foreign = await post('/account/totp/begin', {}, consoleTok);
+  assert.equal(foreign.status, 401);
+  assert.match(foreign.body.error, /audience mismatch/);
 
   node.accounts.update('human:discord:42', (a) => ({ ...a, disabled: true }));
   assert.equal((await passwordLogin('dee', 'dee password 1', 'eidoverse')).status, 403);
@@ -513,7 +531,7 @@ test('Google: chooser offers it; the trip out is OIDC code flow with PKCE and on
   assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
   // the verifier sent at the token step is the one the challenge was made from
   googleUser = { sub: 'g-nobody', email: 'nobody@gmail.com', email_verified: true };
-  await get(`/oauth/google/callback?state=${u.searchParams.get('state')}&code=x`);
+  await get(`/oauth/google/callback?state=${u.searchParams.get('state')}&code=x`, base, { cookie: start.cookie });
   const { createHash } = await import('node:crypto');
   assert.equal(createHash('sha256').update(googleTokenBody!.get('code_verifier')!).digest('base64url'), u.searchParams.get('code_challenge'));
   assert.equal(googleTokenBody!.get('client_secret'), 'gsecret');
@@ -576,7 +594,7 @@ test('Google: link from sign-in settings (bound to this browser), then Continue 
 
   const link = await post('/account/google/link', {}, tok);
   assert.equal(link.status, 200);
-  assert.match(link.cookie, /^hn_link=/);
+  assert.match(link.cookie, /^__Host-hn_browser=/);
   const start = await get(new URL(link.body.url).pathname + new URL(link.body.url).search);
   assert.equal(start.status, 302);
   assert.match(start.location!, /^https:\/\/accounts\.google\.com\//);
@@ -635,7 +653,7 @@ test('Google: a Google-only account can’t unlink its last way in; a Discord pe
 test('Google: cancelled at Google, or no Google configured', async () => {
   const start = await get('/login?audience=eidoverse&via=google');
   const state = new URL(start.location!).searchParams.get('state')!;
-  const r = await get(`/oauth/google/callback?state=${state}&error=access_denied`);
+  const r = await get(`/oauth/google/callback?state=${state}&error=access_denied`, base, { cookie: start.cookie });
   assert.equal(r.status, 400);
   assert.match(r.text, /cancelled/);
   const n2 = makeNode({ googleClientId: undefined, googleClientSecret: undefined });
@@ -656,7 +674,7 @@ async function withCode(audience: string, code: string, via: 'google' | 'discord
   if (c.status !== 200) return { code: c, cb: null };
   const start = await get(`/login/${via}?state=${state}`);
   assert.equal(start.status, 302);
-  return { code: c, cb: await get(`${via === 'google' ? '/oauth/google/callback' : '/oauth/callback'}?state=${state}&code=x`) };
+  return { code: c, cb: await get(`${via === 'google' ? '/oauth/google/callback' : '/oauth/callback'}?state=${state}&code=x`, base, { cookie: cookieFor.get(state)! }) };
 }
 
 test('codes: a newcomer signs up with Google + a code; the code opens ONLY its own audiences', async () => {
