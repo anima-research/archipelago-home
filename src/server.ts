@@ -236,9 +236,10 @@ export class HomeNode {
 
   // ── sponsor console (see console.ts header for the design) ──
 
-  /** Verify a Bearer console token, a person's whose account isn't disabled;
-   *  null (the refusal written) on failure. The scopes it must carry are the
-   *  invite policy's console gate. */
+  /** Verify a Bearer console token, a person's whose account isn't disabled
+   *  and whose Discord-only identity no other row has linked since; null (the
+   *  refusal written) on failure. The scopes it must carry are the invite
+   *  policy's console gate. */
   private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
     const gate = consoleRequiredScopes(this.invitePolicy.get());
     if (gate === null) {
@@ -255,6 +256,10 @@ export class HomeNode {
     }
     if (this.accounts.bySub(v.payload.sub)?.disabled) {
       json(res, 403, { error: 'account disabled' });
+      return null;
+    }
+    if (this.accounts.linkedElsewhere(v.payload.sub)) {
+      json(res, 401, { error: 'this Discord account is now linked to another account here; sign in again' });
       return null;
     }
     // The gate holds live too: a scope the operator now withholds no longer opens the console.
