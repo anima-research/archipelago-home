@@ -186,8 +186,9 @@ export function withFileLock<R>(lockPath: string, fn: () => R): R {
           unlinkSync(lockPath);
           continue;
         }
-      } catch {
-        continue; // released between our open and stat
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; // released between our open and stat
+        throw e;
       }
       if (Date.now() > deadline) throw new Error(`${lockPath} held for over ${LOCK_WAIT_MS} ms`);
       Atomics.wait(sleeper, 0, 0, 5);
