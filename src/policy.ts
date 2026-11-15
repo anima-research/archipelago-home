@@ -33,7 +33,9 @@
  * when any of the invite's scopes matches a `when` pattern (exact, or
  * `prefix:*`). An audience ending in `*` stands for every REGISTERED
  * audience (audiences.json) it matches, e.g. one per world. The primary
- * audience leads the list: enrollment's first token is for audiences[0].
+ * audience leads the list. Enrollment's first token is for the first audience
+ * in the list that audiences.json registers and that isn't the node's own
+ * (`console`, `account`).
  *
  * The console gate: `console.requiredScopes` are what a person must hold to
  * open the console and mint at all. It is required — `[]` deliberately opens

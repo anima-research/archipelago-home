@@ -192,6 +192,13 @@ export class AccountStore {
   byDiscord(id: string): HumanAccount | undefined {
     return this.all().find((a) => a.discord?.id === id);
   }
+  /** A Discord-only identity with no row of its own, whose Discord account
+   *  another row has linked since: that row is the person now, and a token
+   *  for this sub speaks for nobody. */
+  linkedElsewhere(sub: string): boolean {
+    const m = /^human:discord:(\d+)$/.exec(sub);
+    return Boolean(m && !this.bySub(sub) && this.byDiscord(m[1]!));
+  }
   byGoogle(sub: string): HumanAccount | undefined {
     return this.all().find((a) => a.google?.sub === sub);
   }

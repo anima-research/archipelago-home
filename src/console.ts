@@ -24,7 +24,7 @@
  *  - Sponsorship is visible: the invite (and every principal enrolled
  *    through it) carries who vouched — their standing rides on it.
  */
-import type { Invite, InviteStore, PrincipalStore } from './stores.js';
+import { agentCanHold, type Invite, type InviteStore, type PrincipalStore } from './stores.js';
 import { audiencesFor, consoleRequiredScopes, scopesWithRole, type InvitePolicy } from './policy.js';
 import { esc } from './http.js';
 import { JS_ESCAPE } from './pages.js';
@@ -81,7 +81,7 @@ export function mintSponsoredInvite(
   policy: InvitePolicy,
   sponsor: SponsorIdentity,
   label: string | undefined,
-  opts?: { anchorDomain?: string | null; knownAudiences?: string[] },
+  opts: { anchorDomain?: string | null; knownAudiences: string[] },
   nowMs = Date.now(),
 ): ConsoleMintResult {
   // What the operator withholds is out of the sponsor's authority too (the
@@ -94,7 +94,7 @@ export function mintSponsoredInvite(
   const missing = gate.filter((s) => !sponsor.scopes.includes(s));
   if (missing.length) return { ok: false, status: 403, error: `minting requires ${missing.join(', ')}` };
   const delegable = delegableScopes(policy, sponsor.scopes);
-  if (opts?.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
+  if (opts.anchorDomain && !sponsor.scopes.includes(ANCHOR_SCOPE)) {
     return { ok: false, status: 403, error: 'anchoring at the home domain requires the id:anchor grant' };
   }
   const active = activeSponsorInvites(invites, sponsor.sub, nowMs);
@@ -105,7 +105,7 @@ export function mintSponsoredInvite(
       error: `you already have ${active.length} unclaimed invites — revoke one or wait for a claim/expiry`,
     };
   }
-  const anchored = Boolean(opts?.anchorDomain);
+  const anchored = Boolean(opts.anchorDomain);
   // Anchored: the resident grant, plus anything else the sponsor could pass
   // down anyway — never less than a plain invite. Plain: what the sponsor
   // can delegate. Either way, plus the baseline every invite carries.
@@ -114,11 +114,16 @@ export function mintSponsoredInvite(
   const withhold = sponsor.withhold ?? [];
   const scopes = (anchored ? union(scopesWithRole(policy, 'resident'), delegable, baseline) : union(delegable, baseline))
     .filter((s) => !withhold.includes(s));
-  const audiences = audiencesFor(policy, scopes, anchored, opts?.knownAudiences);
+  const audiences = audiencesFor(policy, scopes, anchored, opts.knownAudiences);
   // An empty list would be saved as "no audience allowed": enrollment would
   // consume the invite and every token request after it would fail.
   if (!audiences.length) {
     return { ok: false, status: 403, error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match' };
+  }
+  // Enrollment refuses an invite with no audience an agent can hold, so the
+  // console doesn't mint one.
+  if (!audiences.some((a) => agentCanHold(a, opts.knownAudiences))) {
+    return { ok: false, status: 403, error: 'the invite policy gives this invite no audience that this node registers for agents — the operator needs to register one in audiences.json, or change the policy' };
   }
   const invite = invites.mint({
     scopes,
@@ -128,7 +133,7 @@ export function mintSponsoredInvite(
     audiences,
     tokenTtl: AGENT_TOKEN_TTL,
     sponsor: sponsor.sub,
-    ...(anchored ? { domain: opts!.anchorDomain! } : {}),
+    ...(anchored ? { domain: opts.anchorDomain! } : {}),
     // Rides into the enrolled principal and thence into every token it is
     // ever issued: audiences can see (and render) who vouched.
     claims: { tier: anchored ? 'resident' : 'sponsored', sponsor: sponsor.sub, sponsorName: sponsor.name },

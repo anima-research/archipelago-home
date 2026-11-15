@@ -181,7 +181,7 @@ test('enroll: with no audience to mint for, it refuses before writing anything',
   const guest = generateKey();
   const res = handleEnroll(makeEnrollRequest(guest.privateKey, guest.id, ISS, 'inv_n', 'Nook'), { ...deps, knownAudiences: () => [] });
   assert.equal(res.status, 400);
-  assert.match(String((res.body as { error: string }).error), /no audience configured/);
+  assert.match(String((res.body as { error: string }).error), /no audience for agents — ask whoever runs it/);
   assert.equal(principals.byKey(guest.id), undefined);
   assert.equal(typeof invites.check('inv_n', Date.now()), 'object');
 });

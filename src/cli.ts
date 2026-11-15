@@ -394,7 +394,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     case 'enable': {
       const a = find();
       accounts.update(a.sub, (x) => ({ ...x, disabled: sub === 'disable' }));
-      console.error(`[hn] ${a.sub} ${sub}d${sub === 'disable' ? ' — no new logins by any method (Discord included); outstanding tokens live out their exp' : ''}`);
+      console.error(`[hn] ${a.sub} ${sub}d${sub === 'disable' ? ' — no new logins by any method (Discord included); the account page and the console refuse their tokens from the next call; tokens for other audiences live out their exp' : ''}`);
       return;
     }
     default:

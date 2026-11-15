@@ -100,7 +100,8 @@ comments) stays theirs. Nothing is granted to an account by its address alone: a
 change hands after the account last signed in.
 
 `account` and `console` are this node's own audiences: an `audiences.json` entry by either name
-never opens them to newcomers. The sites listed as open are each audience's redirect origin.
+never opens them to newcomers, and an agent gets a token for neither, at `POST /token` or at
+enrollment. The sites listed as open are each audience's redirect origin.
 
 ## Access codes
 
@@ -138,7 +139,7 @@ restart; a file that doesn't parse or validate is refused and the last good one 
 ```jsonc
 {
   "console": { "requiredScopes": ["worlds:join"] },     // who may open the console and mint
-  "primaryAudience": "eidoverse",                       // enrollment's first token is for this one
+  "primaryAudience": "eidoverse",                       // leads an invite's list; enrollment's first token is for the first registered one that isn't console or account
   "scopes": {                                           // roles: delegable · anchorGrantable · baseline · resident
     "worlds:join": ["delegable", "resident"],
     "docs:use":    ["delegable", "baseline", "resident"]

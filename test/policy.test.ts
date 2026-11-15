@@ -44,13 +44,13 @@ test('another home brings its own policy: scopes, baseline, anchoring and audien
   // anchoring: the resident grant, anchor-grantable only for id:anchor holders
   const keeper = { ...gardener, sub: 'human:local:kay', scopes: ['garden:tend', 'id:anchor'] };
   assert.deepEqual(delegableScopes(policy, keeper.scopes), ['garden:tend', 'garden:prune']);
-  const a = mintSponsoredInvite(invites, policy, keeper, 'resident', { anchorDomain: 'id.garden' });
+  const a = mintSponsoredInvite(invites, policy, keeper, 'resident', { anchorDomain: 'id.garden', knownAudiences: ['plot-b', 'garden', 'plot-a', 'library', 'vault'] });
   assert.ok(a.ok);
   assert.deepEqual([...a.invite.scopes].sort(), ['garden:prune', 'garden:tend', 'library:read', 'vault:open']);
   assert.ok(a.invite.audiences!.includes('vault'));
 
   // the console gate is the policy's too
-  const outsider = mintSponsoredInvite(invites, policy, { ...gardener, sub: 'human:local:zed', scopes: ['worlds:join'] }, undefined);
+  const outsider = mintSponsoredInvite(invites, policy, { ...gardener, sub: 'human:local:zed', scopes: ['worlds:join'] }, undefined, { knownAudiences: ['garden', 'library'] });
   assert.ok(!outsider.ok && /garden:tend/.test(outsider.error));
 });
 
@@ -61,8 +61,12 @@ test('an invite the rules give no audience is refused, not minted', () => {
   }));
   const policy = invitePolicyStore(join(dir, 'p.json')).get();
   const invites = new InviteStore(join(dir, 'store.json'));
-  const r = mintSponsoredInvite(invites, policy, { sub: 'human:local:a', name: 'a', scopes: ['a:use'] }, undefined);
-  assert.ok(!r.ok && /no audience/.test(r.error));
+  const r = mintSponsoredInvite(invites, policy, { sub: 'human:local:a', name: 'a', scopes: ['a:use'] }, undefined, { knownAudiences: ['vault'] });
+  assert.deepEqual(r, {
+    ok: false,
+    status: 403,
+    error: 'the invite policy gives this invite no audience — the operator needs an always rule, or one these scopes match',
+  });
   assert.equal(invites.all().length, 0);
 });
 
@@ -71,7 +75,7 @@ test('no policy: the console mints nothing and says why', () => {
   const dir = fresh();
   const missing = invitePolicyStore(join(dir, 'nope.json')).get();
   assert.equal(missing.configured, false);
-  const r = mintSponsoredInvite(new InviteStore(join(dir, 'store.json')), missing, { sub: 'human:local:a', name: 'a', scopes: ['worlds:join'] }, undefined);
+  const r = mintSponsoredInvite(new InviteStore(join(dir, 'store.json')), missing, { sub: 'human:local:a', name: 'a', scopes: ['worlds:join'] }, undefined, { knownAudiences: ['worlds'] });
   assert.ok(!r.ok && r.status === 403 && /no invite policy/.test(r.error));
 });
 

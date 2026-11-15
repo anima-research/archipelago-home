@@ -248,8 +248,10 @@ export class HomeNode {
 
   // ── sponsor console (see console.ts header for the design) ──
 
-  /** Offline-verify a Bearer console token; null (+401 written) on failure.
-   *  The scopes it must carry are the invite policy's console gate. */
+  /** Verify a Bearer console token, a person's whose account isn't disabled
+   *  and whose Discord-only identity no other row has linked since; null (the
+   *  refusal written) on failure. The scopes it must carry are the invite
+   *  policy's console gate. */
   private consoleAuth(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
     const gate = consoleRequiredScopes(this.invitePolicy.get());
     if (gate === null) {
@@ -260,8 +262,16 @@ export class HomeNode {
     const v = m
       ? verifyToken(m[1]!, { issuerId: this.issuer.id, iss: this.cfg.iss, aud: 'console', requireScopes: gate })
       : ({ ok: false, reason: 'no bearer token' } as const);
-    if (!v.ok) {
-      json(res, 401, { error: v.reason });
+    if (!v.ok || v.payload.kind !== 'human') {
+      json(res, 401, { error: v.ok ? 'not a person' : v.reason });
+      return null;
+    }
+    if (this.accounts.bySub(v.payload.sub)?.disabled) {
+      json(res, 403, { error: 'account disabled' });
+      return null;
+    }
+    if (this.accounts.linkedElsewhere(v.payload.sub)) {
+      json(res, 401, { error: 'this Discord account is now linked to another account here; sign in again' });
       return null;
     }
     // The gate holds live too: a scope the operator now withholds no longer opens the console.
@@ -319,6 +329,8 @@ export class HomeNode {
       const who = this.consoleAuth(req, res);
       if (!who) return true;
       const body = (await readJson(req)) as { label?: unknown; anchor?: unknown } | null;
+      // A body can take minutes to arrive: an expiry or a disable meanwhile counts.
+      if (!this.consoleAuth(req, res)) return true;
       const r = mintSponsoredInvite(this.invites, this.invitePolicy.get(), this.sponsor(who),
         typeof body?.label === 'string' ? body.label : undefined,
         { anchorDomain: body?.anchor === true ? this.cfg.iss : null,

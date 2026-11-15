@@ -502,8 +502,15 @@ export type AudiencesConfig = Record<string, AudienceConfig>;
 
 /** This node's own audiences: never opened to newcomers by an audiences.json
  *  entry of the same name (a `console` entry would hand strangers the
- *  sponsor console). */
+ *  sponsor console), and never minted at the agents' exchange (exchange.ts). */
 export const NODE_AUDIENCES: ReadonlySet<string> = new Set(['account', 'console']);
+
+/** An audience an agent can hold: one that audiences.json registers
+ *  (`known`) and that isn't the node's own. Enrollment's first token is for
+ *  the first of an invite's that is, and the console mints no invite with none. */
+export function agentCanHold(audience: string, known: readonly string[]): boolean {
+  return !NODE_AUDIENCES.has(audience) && known.includes(audience);
+}
 
 /** What an open audience gives anyone who signs in to it, or null if it isn't open. */
 export function signupGrant(all: AudiencesConfig, name: string): RoleGrant | null {
