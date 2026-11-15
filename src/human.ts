@@ -728,7 +728,8 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   }
 
   // ── account page API (Bearer = an aud:"account" login token; 401 here
-  //    always means that token is bad/expired — wrong codes/passwords are 400) ──
+  //    always means that token can't be used: bad, expired, or not this
+  //    browser's current sign-in — wrong codes/passwords are 400) ──
 
   private accountToken(req: IncomingMessage, res: ServerResponse): Aid1Payload | null {
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
