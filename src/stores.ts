@@ -122,12 +122,14 @@ export class JsonStore<T> {
    * lock file beside the data file), re-reading the file inside the lock —
    * for stores that both the server and the hn CLI write, so neither drops
    * the other's change. `fn` throwing aborts with nothing written; `fn`
-   * returning its argument unchanged writes nothing either.
+   * returning its argument unchanged writes nothing either. A file that is
+   * there but can't be read throws before `fn` runs.
    */
   update(fn: (cur: T) => T): T {
     return withFileLock(`${this.path}.lock`, () => {
       const fresh = this.loadOnce();
       if (fresh !== null) this.value = fresh;
+      else if (this.broken) throw this.refusal();
       const next = fn(this.value);
       if (next !== this.value) this.set(next); // fn returning its input = nothing changed, nothing written
       return next;
@@ -141,9 +143,13 @@ export class JsonStore<T> {
     return !this.broken;
   }
 
+  private refusal(): Error {
+    return new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
+  }
+
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
-    if (!this.writable()) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
+    if (!this.writable()) throw this.refusal();
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
     const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
@@ -239,6 +245,16 @@ function validatePrincipals(raw: unknown): PrincipalsFile | null {
   return f;
 }
 
+/** A principal that `add` refuses because the file as read under the lock
+ *  already has its sub, its name or its key. */
+export class PrincipalConflict extends Error {
+  readonly field: 'sub' | 'name' | 'key';
+  constructor(field: 'sub' | 'name' | 'key', message: string) {
+    super(message);
+    this.field = field;
+  }
+}
+
 export class PrincipalStore {
   private store: JsonStore<PrincipalsFile>;
 
@@ -282,9 +298,9 @@ export class PrincipalStore {
   add(p: Principal): void {
     const name = p.name.toLowerCase();
     this.store.update((f) => {
-      if (f.principals.some((x) => x.sub === p.sub)) throw new Error(`duplicate sub ${p.sub}`);
-      if (f.principals.some((x) => x.name.toLowerCase() === name)) throw new Error(`name "${p.name}" already taken`);
-      if (p.key && f.principals.some((x) => x.key === p.key)) throw new Error(`key already enrolled`);
+      if (f.principals.some((x) => x.sub === p.sub)) throw new PrincipalConflict('sub', `duplicate sub ${p.sub}`);
+      if (f.principals.some((x) => x.name.toLowerCase() === name)) throw new PrincipalConflict('name', `name "${p.name}" already taken`);
+      if (p.key && f.principals.some((x) => x.key === p.key)) throw new PrincipalConflict('key', `key already enrolled`);
       return { principals: [...f.principals, p] };
     });
   }
@@ -348,6 +364,13 @@ function validateInvites(raw: unknown): InvitesFile | null {
   return f;
 }
 
+function usable(inv: Invite | undefined, nowMs: number): Invite | InviteRejection {
+  if (!inv) return 'unknown';
+  if (inv.expiresAt && Date.parse(inv.expiresAt) <= nowMs) return 'expired';
+  if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
+  return inv;
+}
+
 export class InviteStore {
   private store: JsonStore<InvitesFile>;
 
@@ -372,19 +395,23 @@ export class InviteStore {
   }
 
   check(code: string, nowMs = Date.now()): Invite | InviteRejection {
-    const inv = this.all().find((i) => i.code === code);
-    if (!inv) return 'unknown';
-    if (inv.expiresAt && Date.parse(inv.expiresAt) <= nowMs) return 'expired';
-    if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
-    return inv;
+    return usable(this.all().find((i) => i.code === code), nowMs);
   }
 
-  consume(code: string): void {
-    this.store.update((f) =>
-      f.invites.some((i) => i.code === code)
-        ? { invites: f.invites.map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)) }
-        : f,
-    );
+  /**
+   * Spend one use of `code`, checked against the file as read under the
+   * invite lock. `admit` runs under that lock, after the check and before the
+   * use is counted; if it throws, nothing here is written.
+   */
+  consume(code: string, nowMs = Date.now(), admit?: (inv: Invite) => void): Invite | InviteRejection {
+    let out: Invite | InviteRejection = 'unknown';
+    this.store.update((f) => {
+      out = usable(f.invites.find((i) => i.code === code), nowMs);
+      if (typeof out === 'string') return f;
+      admit?.(out);
+      return { invites: f.invites.map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)) };
+    });
+    return out;
   }
 
   mint(inv: Omit<Invite, 'code'> & { code?: string }): Invite {
