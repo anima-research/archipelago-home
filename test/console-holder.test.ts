@@ -290,7 +290,7 @@ test('POST /enroll skips node and unregistered audiences, refuses node-only or u
   }
 });
 
-test('POST /console/invites rechecks the holder after the body ends and refuses policies that grant only node audiences', async () => {
+test('POST /console/invites rechecks the holder after the body ends and refuses policies with no registered agent audience', async () => {
   const node = startTestNode({ eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] } });
   const port = await node.start();
   const now = Math.floor(Date.now() / 1000);
@@ -391,9 +391,55 @@ test('POST /console/invites rechecks the holder after the body ends and refuses 
       body: JSON.stringify({ label: 'useless' }),
     });
     assert.equal(rMint.status, 403);
-    assert.match(String(((await rMint.json()) as { error: string }).error), /only the node's own audiences, which no agent can hold/);
+    assert.deepEqual(await rMint.json(), {
+      error: 'the invite policy gives this invite no audience that this node registers for agents — the operator needs to register one in audiences.json, or change the policy',
+    });
     assert.equal(nodeConsoleOnlyPolicy.invites.all().length, 0);
   } finally {
     nodeConsoleOnlyPolicy.stop();
+  }
+
+  const nodeUnregisteredPolicy = startTestNode(
+    {
+      eidoverse: { redirect: 'https://worlds.test/auth', requiredScopes: ['worlds:join'] },
+    },
+    {
+      console: { requiredScopes: ['worlds:join'] },
+      primaryAudience: 'unregistered-world',
+      scopes: {
+        'worlds:join': ['delegable', 'resident'],
+      },
+      audiences: [{ audience: 'unregistered-world', always: true }],
+    },
+  );
+  const baseUnreg = `http://127.0.0.1:${await nodeUnregisteredPolicy.start()}`;
+  try {
+    const sponsorTok = mintToken(nodeUnregisteredPolicy.issuer.privateKey, {
+      v: 1,
+      iss: 'id.test',
+      sub: 'human:discord:7778',
+      kind: 'human',
+      name: 'UnregPolicySponsor',
+      aud: 'console',
+      scopes: ['worlds:join'],
+      iat: now,
+      exp: now + 600,
+    });
+    const rUnreg = await fetch(`${baseUnreg}/console/invites`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${sponsorTok}`,
+        'content-type': 'application/json',
+        'x-real-ip': '198.51.100.42',
+      },
+      body: JSON.stringify({ label: 'unregistered' }),
+    });
+    assert.equal(rUnreg.status, 403);
+    assert.deepEqual(await rUnreg.json(), {
+      error: 'the invite policy gives this invite no audience that this node registers for agents — the operator needs to register one in audiences.json, or change the policy',
+    });
+    assert.equal(nodeUnregisteredPolicy.invites.all().length, 0);
+  } finally {
+    nodeUnregisteredPolicy.stop();
   }
 });
