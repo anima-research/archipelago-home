@@ -21,8 +21,9 @@
  * Whatever the method, the result is the same as it always was: a 10-minute,
  * single-use aid1 token delivered to the audience in the URL fragment. The
  * home node keeps no sessions — the account page's credential is its own
- * login token, good only in the browser that signed in, so "recently
- * authenticated" holds by construction.
+ * login token, so "recently authenticated" holds by construction. The
+ * token works only with the cookie its sign-in set, which a browser
+ * handed the token in a link doesn't have.
  *
  * Ceremony state (login states, TOTP tickets, WebAuthn challenges, pending
  * TOTP secrets, failure counters) is in memory: a restart just means

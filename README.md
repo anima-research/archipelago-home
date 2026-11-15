@@ -60,7 +60,8 @@ so audiences change nothing. `?via=discord` / `?via=google` skips the chooser.
 People manage their own sign-in at **`/account`**: set a username + password (a Discord person
 keeps their `human:discord:` sub), turn TOTP on (QR + ten single-use recovery codes), add or
 remove passkeys, link Discord to a local account, link or unlink Google. The page's credential is its own login token,
-good only in the browser that signed in, so it is always a recent sign-in.
+so it is always a recent sign-in. The token works only with the cookie its sign-in set, which a browser
+handed the token in a link doesn't have.
 
 Accounts for people without Discord come from the operator, from an access code (below), or — while
 an audience is open to newcomers (below) — from a Google newcomer's first sign-in. Run
