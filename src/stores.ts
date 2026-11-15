@@ -122,12 +122,14 @@ export class JsonStore<T> {
    * lock file beside the data file), re-reading the file inside the lock —
    * for stores that both the server and the hn CLI write, so neither drops
    * the other's change. `fn` throwing aborts with nothing written; `fn`
-   * returning its argument unchanged writes nothing either.
+   * returning its argument unchanged writes nothing either. A file that is
+   * there but can't be read throws before `fn` runs.
    */
   update(fn: (cur: T) => T): T {
     return withFileLock(`${this.path}.lock`, () => {
       const fresh = this.loadOnce();
       if (fresh !== null) this.value = fresh;
+      else if (this.broken) throw this.refusal();
       const next = fn(this.value);
       if (next !== this.value) this.set(next); // fn returning its input = nothing changed, nothing written
       return next;
@@ -141,9 +143,13 @@ export class JsonStore<T> {
     return !this.broken;
   }
 
+  private refusal(): Error {
+    return new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
+  }
+
   /** Atomic write-through (tmp+rename); pollers never see a half-write. */
   set(next: T): void {
-    if (!this.writable()) throw new Error(`${this.label}: ${this.path} is unreadable or invalid — refusing to overwrite it; fix the file first`);
+    if (!this.writable()) throw this.refusal();
     mkdirSync(dirname(this.path), { recursive: true });
     // Per-writer tmp name: the server and the CLI never share one.
     const tmp = `${this.path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
@@ -180,8 +186,9 @@ export function withFileLock<R>(lockPath: string, fn: () => R): R {
           unlinkSync(lockPath);
           continue;
         }
-      } catch {
-        continue; // released between our open and stat
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue; // released between our open and stat
+        throw e;
       }
       if (Date.now() > deadline) throw new Error(`${lockPath} held for over ${LOCK_WAIT_MS} ms`);
       Atomics.wait(sleeper, 0, 0, 5);
@@ -239,6 +246,16 @@ function validatePrincipals(raw: unknown): PrincipalsFile | null {
   return f;
 }
 
+/** A principal that `add` refuses because the file as read under the lock
+ *  already has its sub, its name or its key. */
+export class PrincipalConflict extends Error {
+  readonly field: 'sub' | 'name' | 'key';
+  constructor(field: 'sub' | 'name' | 'key', message: string) {
+    super(message);
+    this.field = field;
+  }
+}
+
 export class PrincipalStore {
   private store: JsonStore<PrincipalsFile>;
 
@@ -280,22 +297,25 @@ export class PrincipalStore {
   }
 
   add(p: Principal): void {
-    if (this.bySub(p.sub)) throw new Error(`duplicate sub ${p.sub}`);
-    if (this.nameTaken(p.name)) throw new Error(`name "${p.name}" already taken`);
-    if (p.key && this.byKey(p.key)) throw new Error(`key already enrolled`);
-    this.store.set({ principals: [...this.all(), p] });
+    const name = p.name.toLowerCase();
+    this.store.update((f) => {
+      if (f.principals.some((x) => x.sub === p.sub)) throw new PrincipalConflict('sub', `duplicate sub ${p.sub}`);
+      if (f.principals.some((x) => x.name.toLowerCase() === name)) throw new PrincipalConflict('name', `name "${p.name}" already taken`);
+      if (p.key && f.principals.some((x) => x.key === p.key)) throw new PrincipalConflict('key', `key already enrolled`);
+      return { principals: [...f.principals, p] };
+    });
   }
 
   /** Revocation = stop issuance (archipelago rule 2: no CRLs; outstanding
    *  tokens live out their exp). Record kept for audit. */
   revoke(sub: string, nowIso = new Date().toISOString()): boolean {
-    const list = this.all();
-    const p = list.find((x) => x.sub === sub);
-    if (!p) return false;
-    this.store.set({
-      principals: list.map((x) => (x.sub === sub ? { ...x, expires: nowIso } : x)),
+    let found = false;
+    this.store.update((f) => {
+      if (!f.principals.some((x) => x.sub === sub)) return f;
+      found = true;
+      return { principals: f.principals.map((x) => (x.sub === sub ? { ...x, expires: nowIso } : x)) };
     });
-    return true;
+    return found;
   }
 }
 
@@ -345,6 +365,13 @@ function validateInvites(raw: unknown): InvitesFile | null {
   return f;
 }
 
+function usable(inv: Invite | undefined, nowMs: number): Invite | InviteRejection {
+  if (!inv) return 'unknown';
+  if (inv.expiresAt && Date.parse(inv.expiresAt) <= nowMs) return 'expired';
+  if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
+  return inv;
+}
+
 export class InviteStore {
   private store: JsonStore<InvitesFile>;
 
@@ -369,33 +396,44 @@ export class InviteStore {
   }
 
   check(code: string, nowMs = Date.now()): Invite | InviteRejection {
-    const inv = this.all().find((i) => i.code === code);
-    if (!inv) return 'unknown';
-    if (inv.expiresAt && Date.parse(inv.expiresAt) <= nowMs) return 'expired';
-    if (inv.maxUses !== undefined && (inv.uses ?? 0) >= inv.maxUses) return 'exhausted';
-    return inv;
+    return usable(this.all().find((i) => i.code === code), nowMs);
   }
 
-  consume(code: string): void {
-    this.store.set({
-      invites: this.all().map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)),
+  /**
+   * Spend one use of `code`, checked against the file as read under the
+   * invite lock. `admit` runs under that lock, after the check and before the
+   * use is counted; if it throws, nothing here is written.
+   */
+  consume(code: string, nowMs = Date.now(), admit?: (inv: Invite) => void): Invite | InviteRejection {
+    let out: Invite | InviteRejection = 'unknown';
+    this.store.update((f) => {
+      out = usable(f.invites.find((i) => i.code === code), nowMs);
+      if (typeof out === 'string') return f;
+      admit?.(out);
+      return { invites: f.invites.map((i) => (i.code === code ? { ...i, uses: (i.uses ?? 0) + 1 } : i)) };
     });
+    return out;
   }
 
   mint(inv: Omit<Invite, 'code'> & { code?: string }): Invite {
     const code = inv.code ?? `inv_${randomBytes(6).toString('base64url')}`;
-    if (this.all().some((i) => i.code === code)) throw new Error(`duplicate invite code ${code}`);
     const full: Invite = { uses: 0, ...inv, code };
-    this.store.set({ invites: [...this.all(), full] });
+    this.store.update((f) => {
+      if (f.invites.some((i) => i.code === code)) throw new Error(`duplicate invite code ${code}`);
+      return { invites: [...f.invites, full] };
+    });
     return full;
   }
 
   revoke(code: string): boolean {
-    const before = this.all();
-    const after = before.filter((i) => i.code !== code);
-    if (after.length === before.length) return false;
-    this.store.set({ invites: after });
-    return true;
+    let found = false;
+    this.store.update((f) => {
+      const after = f.invites.filter((i) => i.code !== code);
+      if (after.length === f.invites.length) return f;
+      found = true;
+      return { invites: after };
+    });
+    return found;
   }
 }
 

@@ -5,7 +5,7 @@
  *   hn serve
  *   hn fingerprint
  *   hn mint   --name ferro --aud eidoverse --scopes worlds:join --ttl 72h [--kind agent] [--tier sonnet-event]
- *   hn invite --scopes worlds:join [--label x] [--max-uses 1] [--expires 72h] [--aud eidoverse] [--ttl 72h]
+ *   hn invite --scopes worlds:join [--label x] [--max-uses 1|N|any] [--expires 72h|<date>|never] [--aud eidoverse] [--ttl 72h]
  *   hn ls [--json]
  *   hn revoke <sub>            hn revoke-invite <code>
  *
@@ -132,19 +132,27 @@ function main(): void {
 
     case 'invite': {
       const scopes = flag.get('scopes')?.split(',').map((s) => s.trim()).filter(Boolean) ?? die('--scopes required');
-      const expires = flag.get('expires');
+      const uses = flag.get('max-uses') ?? '1';
+      const maxUses = uses === 'any' ? undefined : Number(uses);
+      if (maxUses !== undefined && !(Number.isInteger(maxUses) && maxUses > 0)) die('--max-uses wants a positive whole number, or any');
+      const expires = flag.get('expires') ?? '72h';
+      let expiresAt: string | undefined;
+      if (/^\d+[mhd]$/.test(expires)) expiresAt = new Date(Date.now() + parseTtl(expires)).toISOString();
+      else if (/^\d{4}-\d{2}-\d{2}/.test(expires) && !Number.isNaN(Date.parse(expires))) expiresAt = new Date(expires).toISOString();
+      else if (expires !== 'never') die('--expires wants a lifetime (72h, 14d), a date (2026-12-01), or never');
       const inv = invites.mint({
         scopes,
         ...(flag.get('domain') ? { domain: flag.get('domain') } : {}),
         ...(flag.get('label') ? { label: flag.get('label') } : {}),
-        ...(flag.get('max-uses') ? { maxUses: Number(flag.get('max-uses')) } : {}),
+        ...(maxUses !== undefined ? { maxUses } : {}),
         ...(flag.get('aud') ? { audiences: flag.get('aud')!.split(',') } : {}),
         ...(flag.get('ttl') ? { tokenTtl: flag.get('ttl') } : {}),
-        ...(expires
-          ? { expiresAt: /^\d+[mhd]$/.test(expires) ? new Date(Date.now() + parseTtl(expires)).toISOString() : expires }
-          : {}),
+        ...(expiresAt ? { expiresAt } : {}),
       });
-      console.error(`[hn] invite minted (scopes: ${scopes.join(' ')})`);
+      console.error(
+        `[hn] invite minted (scopes: ${scopes.join(' ')}) · ${maxUses === undefined ? 'any number of uses' : maxUses === 1 ? '1 use' : `${maxUses} uses`}` +
+          ` · ${expiresAt ? `ends ${expiresAt.slice(0, 16)}Z` : 'no end date'}`,
+      );
       console.log(inv.code);
       return;
     }
