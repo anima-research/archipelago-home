@@ -61,6 +61,15 @@ test('expiry enforced', () => {
   assert.ok(!v.ok && v.reason === 'expired');
 });
 
+test('cnf: a well-formed key is accepted, anything else refused', () => {
+  const ok = verifyToken(mintToken(issuer.privateKey, payload({ cnf: other.id })), OPTS);
+  assert.ok(ok.ok && ok.payload.cnf === other.id);
+  for (const cnf of ['ed25519:short', 'x25519:abc', 42, null]) {
+    const v = verifyToken(mintToken(issuer.privateKey, payload({ cnf } as any)), OPTS);
+    assert.ok(!v.ok && v.reason === 'malformed cnf', String(cnf));
+  }
+});
+
 test('requireScopes enforced', () => {
   const tok = mintToken(issuer.privateKey, payload());
   assert.ok(verifyToken(tok, { ...OPTS, requireScopes: ['worlds:join'] }).ok);

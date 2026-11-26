@@ -34,6 +34,8 @@ export interface Aid1Payload {
   exp: number;
   /** Replay guard for single-use login-redirect tokens. */
   jti?: string;
+  /** The holder's key, `ed25519:<b64url raw 32B>`, on tokens minted for agents (FEDERATION.md §9.7). */
+  cnf?: string;
 }
 
 export function mintToken(privateKey: KeyObject, payload: Aid1Payload): string {
@@ -99,6 +101,9 @@ export function verifyToken(token: string, opts: VerifyOpts): VerifyOutcome {
   if (typeof payload.name !== 'string' || !payload.name) return fail('missing name');
   if (!Array.isArray(payload.scopes) || !payload.scopes.every((s) => typeof s === 'string')) {
     return fail('malformed scopes');
+  }
+  if (payload.cnf !== undefined && (typeof payload.cnf !== 'string' || !fingerprintToRaw(payload.cnf))) {
+    return fail('malformed cnf');
   }
   const now = (opts.nowMs ?? Date.now()) / 1000;
   if (typeof payload.exp !== 'number' || payload.exp <= now) return fail('expired');
