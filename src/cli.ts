@@ -122,6 +122,8 @@ function main(): void {
         ...(p.claims ? { claims: p.claims } : {}),
         iat: Math.floor(nowMs / 1000),
         exp: Math.floor((nowMs + parseTtl(ttl)) / 1000),
+        // Same rule as /token: an agent's token names its key (FEDERATION.md §9.7).
+        ...(p.kind === 'agent' && p.key ? { cnf: p.key } : {}),
       };
       const token = mintToken(issuer.privateKey, payload);
       mintLog.append({ at: new Date(nowMs).toISOString(), sub: p.sub, aud, scopes: p.scopes, exp: payload.exp, by: 'cli' });

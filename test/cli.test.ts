@@ -152,3 +152,21 @@ test('cli: the clash shows an invited row’s state too, and no "Google account 
   assert.match(r.out, /human:local:cora \(invited\); DISABLED; withheld: x:y\. If it's the person: hn user enable cora && hn user set cora/);
   assert.doesNotMatch(r.out, /Google account reported/);
 });
+
+test('cli: hn mint for an enrolled agent with a key names it in cnf, like /token', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hn-cli-'));
+  const key = 'ed25519:' + Buffer.alloc(32, 7).toString('base64url');
+  writeFileSync(join(dir, 'principals.json'), JSON.stringify({ principals: [
+    { sub: 'agent:keyed@guest', name: 'keyed', kind: 'agent', key, scopes: ['mail:use'] },
+    { sub: 'agent:bare@guest', name: 'bare', kind: 'agent', key: null, scopes: ['mail:use'] },
+  ] }));
+  const cnf = (name: string) => {
+    const r = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', 'mint', '--name', name, '--aud', 'islandmail'], {
+      cwd: ROOT, encoding: 'utf8', env: { ...process.env, HN_DATA_DIR: dir, HN_CONFIG_DIR: dir },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(Buffer.from(r.stdout.trim().split('.')[1], 'base64url').toString('utf8')).cnf;
+  };
+  assert.equal(cnf('keyed'), key);
+  assert.equal(cnf('bare'), undefined);
+});
