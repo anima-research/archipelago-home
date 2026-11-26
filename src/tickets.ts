@@ -252,6 +252,11 @@ export class TicketStore {
     });
     return out;
   }
+
+  /** The ticket one account took up is another's now (their accounts were merged). */
+  reassign(from: string, to: string): void {
+    this.store.update((f) => (f.tickets.some((t) => t.claimedBy === from) ? { ...f, tickets: f.tickets.map((t) => (t.claimedBy === from ? { ...t, claimedBy: to } : t)) } : f));
+  }
 }
 
 // ── config/ticket-defaults.json: what a ticket grants unless told otherwise ──

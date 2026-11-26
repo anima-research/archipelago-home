@@ -107,6 +107,8 @@ export interface HumanAccount {
   /** One-time setup link (hn user add / reset): sha256 of the code + expiry. */
   setup?: { hash: string; exp: string };
   disabled?: boolean;
+  /** Subs of accounts folded into this one (`hn user merge`): who this person used to be here. */
+  was?: string[];
   createdAt: string;
   notes?: string;
 }
@@ -175,6 +177,7 @@ function accountsProblem(raw: unknown): string | null {
     if (a.scopes !== undefined && !strings(a.scopes)) return 'bad scopes';
     if (a.ignoreRoles !== undefined && !strings(a.ignoreRoles)) return 'bad ignoreRoles';
     if (a.withhold !== undefined && !strings(a.withhold)) return 'bad withhold';
+    if (a.was !== undefined && !strings(a.was)) return 'bad was';
   }
   return null;
 }
@@ -264,6 +267,22 @@ export class AccountStore {
       next = fn(structuredClone(cur));
       if (JSON.stringify(next) === JSON.stringify(cur)) return f; // unchanged: no write
       return checked({ accounts: f.accounts.map((a) => (a.sub === sub ? next! : a)) });
+    });
+    return next;
+  }
+
+  /**
+   * Two accounts become one, in one write under the lock (`hn user merge`):
+   * `fn` gets both as they are now (undefined = no row yet, a Discord person
+   * who never needed one) and returns the row that stays under `intoSub`;
+   * the row under `fromSub` goes. `fn` throwing aborts with nothing written.
+   */
+  fold(fromSub: string, intoSub: string, fn: (from: HumanAccount | undefined, into: HumanAccount | undefined) => HumanAccount): HumanAccount {
+    let next!: HumanAccount;
+    this.store.update((f) => {
+      next = fn(structuredClone(f.accounts.find((a) => a.sub === fromSub)), structuredClone(f.accounts.find((a) => a.sub === intoSub)));
+      const rest = f.accounts.filter((a) => a.sub !== fromSub);
+      return checked({ accounts: rest.some((a) => a.sub === intoSub) ? rest.map((a) => (a.sub === intoSub ? next : a)) : [...rest, next] });
     });
     return next;
   }

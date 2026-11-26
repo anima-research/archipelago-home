@@ -113,11 +113,19 @@ async function accountToken(username: string, password: string): Promise<string>
   assert.equal(r.status, 200, JSON.stringify(r.body));
   return rawToken(r.body.redirect);
 }
+/** A Google sign-in. A Google account the node has never seen is shown the first-time page
+ *  (same-person.ts) and answers it "I'm new here": the result is what that answer gave, with the
+ *  page itself in `first`. test/same-person.test.ts covers the other answers. */
 async function googleLogin(audience: string, b = base) {
   const start = await get(`/login?audience=${audience}&via=google`, b);
   assert.equal(start.status, 302);
   const state = new URL(start.location!).searchParams.get('state')!;
-  return get(`/oauth/google/callback?state=${state}&code=x`, b);
+  // the browser that started it sends back the cookie /login gave it
+  const r = await get(`/oauth/google/callback?state=${state}&code=x`, b, { cookie: start.headers.getSetCookie().map((c) => c.split(';')[0]!).join('; ') });
+  const id = r.status === 200 ? /const S = \{"id":"([^"]+)"\}/.exec(r.text)?.[1] : undefined;
+  if (!id) return { ...r, first: undefined as string | undefined };
+  const a = await post('/login/new', { id, as: 'new' }, undefined, b);
+  return { status: a.body.redirect ? 302 : a.status, text: String(a.body.error ?? ''), location: (a.body.redirect as string | undefined) ?? null, headers: r.headers, first: r.text as string | undefined };
 }
 async function discordLogin(audience: string, b = base) {
   const start = await get(`/login?audience=${audience}&via=discord`, b);
@@ -818,8 +826,9 @@ test('open somewhere: a Google newcomer who starts at the wrong door gets an acc
   const closed = await googleLogin('eidoverse');
   assert.equal(closed.status, 403);
   assert.match(closed.text, /signed in, but/);
-  assert.match(closed.text, /open <a href="\/account">your account<\/a>/);
-  assert.match(closed.text, /Open to everyone: <a href="https:\/\/notes\.test">notes\.test<\/a>/);
+  // the page they answered on carries the pointers, shown when the answer ends in "no access"
+  assert.match(closed.first!, /open <a href="\/account">your account<\/a>/);
+  assert.match(closed.first!, /Open to everyone: <a href="https:\/\/notes\.test">notes\.test<\/a>/);
   const row = node.accounts.bySub('human:google:g-open-2');
   assert.ok(row);
   assert.equal(row.scopes, undefined);

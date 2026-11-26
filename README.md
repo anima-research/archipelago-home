@@ -33,7 +33,10 @@ password hashes, TOTP secrets and passkey keys — back it up with the issuer ke
 the same way.
 
 Discord app setup: dev portal → OAuth2 → redirect URI `https://<HN_DOMAIN>/oauth/callback`.
-Scopes requested at login: `identify guilds.members.read` (no bot).
+Scopes requested at login: `identify email guilds.members.read` (no bot), or `identify email`
+with `HN_BOT_TOKEN`. `email` is asked for one thing — recognising the same person behind a Google
+account (below) — and the address itself is not kept, only a hash of it (a plain hash: out of
+sight, though someone who can read the file can test a guess against it).
 
 Google setup: Cloud console → Google Auth Platform → Branding (app name, support email), Audience
 External → Publish; Data Access: `openid`, `…/auth/userinfo.email`, `…/auth/userinfo.profile`
@@ -80,12 +83,49 @@ hn user ls                                                # who has what (no sec
 hn user reset alice [--clear-2fa] [--clear-passkeys]      # → new setup link
 hn user set alice --scopes worlds:join,orrery:use         # operator grant (Discord roles add on top)
 hn user set alice --google alice@work.example             # (re)invite by Google address; --google none drops it
+hn user dupes                                             # one person, two accounts: the pairs the node can see
+hn user merge <from> <into> [--yes]                       # fold one into the other (shows first; --yes does it)
 hn user disable alice    hn user enable alice
 ```
 
 Throttles: 5 wrong passwords lock that username for 15 minutes; 10 wrong codes lock its second
 factor for 15 minutes; a sign-in ticket allows 5 code tries. Passkeys are never throttled by
 these, so they remain a way in during a lockout.
+
+## One person, one account
+
+Someone who signs in with Discord one day and Google the next is one person. Three things keep
+them on one account (`src/same-person.ts`):
+
+- **The same address on both sides.** When Discord vouches for an account's address (the
+  account's verified email) and Google is authoritative for the same one (Gmail or Workspace),
+  the second provider to show up becomes another way into the account the first one has. A
+  Google account arriving later joins the Discord identity (`human:discord:<id>`, its roles read
+  live); a Discord account nobody has used here joins the account its Google address made. To
+  recognise the Google side later, the node keeps a hash of the address each Discord account
+  last vouched for (`data/discord-addresses.json`, 0600) — so this starts working for a Discord
+  person at their first Discord sign-in after it is deployed.
+  **Never automatic** for anyone holding `hn:admin` or `id:anchor`, or under `hn user restrict`:
+  for them a second provider would be a second way in that nobody chose. They link by hand at
+  `/account`. A recycled Workspace address is the one thing this trusts that it can't check: if
+  an address passes to someone new while the previous holder's Discord account still carries it,
+  the two would be joined.
+- **Different addresses: the node asks.** A Google account the node has never seen is shown a
+  page before any account is made: **I’ve signed in here with Discord** (one Discord sign-in,
+  in the same browser, and the Google account joins that account), **Add this Google account to
+  …** (when the browser is signed in here already), or **I’m new here** (a new account, as
+  before). Shown only where Discord sign-in is on or the browser has a session — and only in the
+  browser that started the sign-in (a cookie set at `/login`): the page offers to put that Google
+  account on whoever is looking at it, so a return link opened in someone else's browser gets the
+  old behaviour, never the page.
+- **Two accounts already.** `hn user dupes` lists the pairs the node can see (the same vouched
+  address on a Discord account and on another account's Google). `hn user merge <from> <into>`
+  shows what each holds and where each has signed in, and with `--yes` folds `<from>` into
+  `<into>`: `<into>` keeps its id and name and takes `<from>`'s ways in, grants, codes, sponsored
+  agents and invites; restrictions add up; `<from>`'s id is recorded on the row (`was`). Either
+  side may be a Discord person with no row (give the Discord id). **Services keep what they hold
+  under `<from>`'s id** — documents, shares, comments — so pick as `<into>` the id that holds
+  more out there.
 
 ## Audiences open to newcomers
 

@@ -375,6 +375,17 @@ export class InviteStore {
     this.store.set({ invites: after });
     return true;
   }
+
+  /** The invites one person made become another's (their accounts were merged). Returns how many. */
+  reassign(from: string, to: string): number {
+    const mine = this.all().filter((i) => i.sponsor === from);
+    if (mine.length) {
+      this.store.set({
+        invites: this.all().map((i) => (i.sponsor === from ? { ...i, sponsor: to, ...(i.claims?.sponsor === from ? { claims: { ...i.claims, sponsor: to } } : {}) } : i)),
+      });
+    }
+    return mine.length;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,5 +580,27 @@ export class MintLog {
     } catch (err) {
       console.error(`[hn] mint log write failed: ${(err as Error).message}`);
     }
+  }
+
+  /** Every token this sub was ever given here — "has this identity been used?" and "where?". Reads the whole log. */
+  forSub(sub: string): MintRecord[] {
+    let text: string;
+    try {
+      text = readFileSync(this.path, 'utf8');
+    } catch {
+      return [];
+    }
+    const needle = `"sub":${JSON.stringify(sub)}`;
+    const out: MintRecord[] = [];
+    for (const line of text.split('\n')) {
+      if (!line.includes(needle)) continue;
+      try {
+        const r = JSON.parse(line) as MintRecord;
+        if (r.sub === sub) out.push(r);
+      } catch {
+        /* a torn line */
+      }
+    }
+    return out;
   }
 }
