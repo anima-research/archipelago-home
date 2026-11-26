@@ -93,6 +93,8 @@ function mintFor(
     ...(p.claims ? { claims: p.claims } : {}),
     iat: Math.floor(nowMs / 1000),
     exp: Math.floor((nowMs + ttlMs) / 1000),
+    // The agent's own key, so an audience can bind the token to it (FEDERATION.md §9.7).
+    ...(p.kind === 'agent' && p.key ? { cnf: p.key } : {}),
   };
   const token = mintToken(deps.issuer.privateKey, payload);
   deps.mintLog.append({

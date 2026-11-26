@@ -55,6 +55,7 @@ test('key-proof exchange mints a verifiable token', () => {
   const v = verifyToken((res.body as { token: string }).token, { issuerId: issuer.id, iss: ISS, aud: 'eidoverse' });
   assert.ok(v.ok);
   assert.equal(v.payload.sub, 'agent:fable@animalabs.ai');
+  assert.equal(v.payload.cnf, agentKey.id, 'an agent token names its key');
 });
 
 test('unenrolled key is refused', () => {
