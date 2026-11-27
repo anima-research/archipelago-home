@@ -430,20 +430,22 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, invites: InviteS
       };
       // A Discord person who never needed a row is still someone: the row they would have.
       const person = (arg: string): { sub: string; row: HumanAccount | undefined; used: string } => {
+        // a Discord id names that Discord account, even where someone took the same digits as a username
         const id = /^(?:human:discord:)?(\d{15,22})$/.exec(arg)?.[1];
-        const row = accounts.byUsername(arg) ?? accounts.bySub(arg) ?? (id ? accounts.byDiscord(id) : undefined);
+        const row = id ? accounts.byDiscord(id) : (accounts.byUsername(arg) ?? accounts.bySub(arg));
         const who = row?.sub ?? (id ? `human:discord:${id}` : die(`no account "${arg}"`));
-        const used = usedAt(who);
-        if (!row && !used) die(`nobody has signed in here as ${who}`);
-        return { sub: who, row, used };
+        if (!row && mintLog.has(who) !== true) die(`nobody has signed in here as ${who}`);
+        return { sub: who, row, used: usedAt(who) };
       };
       const from = person(fromArg);
       const into = person(intoArg);
       const now = new Date().toISOString();
       const rowless = (who: string): HumanAccount => ({ sub: who, discord: { id: who.slice('human:discord:'.length) }, createdAt: now });
       // a row that was there when we looked and isn't under the lock: someone changed it meanwhile
-      const live = (p: typeof from, row: HumanAccount | undefined): HumanAccount =>
-        row ?? (p.row ? die(`${p.sub} changed under us — run it again`) : rowless(p.sub));
+      const live = (p: typeof from, row: HumanAccount | undefined): HumanAccount => {
+        if (!row && p.row) throw new Error(`${p.sub} changed under us — run it again`); // thrown, not exit: the store's lock is held
+        return row ?? rowless(p.sub);
+      };
       const fold = (f: HumanAccount | undefined, i: HumanAccount | undefined) => mergeAccounts(live(from, f), live(into, i), now.slice(0, 10));
       const plan = fold(from.row, into.row);
       if (typeof plan === 'string') die(`can't merge ${from.sub} into ${into.sub}: ${plan}`);
@@ -461,16 +463,23 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, invites: InviteS
         console.error(`[hn] nothing changed. To do it: hn user merge ${fromArg} ${intoArg} --yes`);
         return;
       }
-      const next = accounts.fold(from.sub, into.sub, (f, i) => {
-        const m = fold(f, i); // against both rows as they are under the lock
-        if (typeof m === 'string') throw new Error(m);
-        return m.next;
-      });
+      // What names <from> elsewhere moves first and the accounts last: if this stops part-way, <from> is still
+      // there, and the same command finishes the job.
       for (const p of agents) principals.update(p.sub, (x) => ({ ...x, claims: { ...x.claims, sponsor: into.sub } }));
       invites.reassign(from.sub, into.sub);
       new CodeStore(join(cfg.dataDir, 'codes.json')).reassign(from.sub, into.sub);
       if (from.row?.ticket && !into.row?.ticket) new TicketStore(join(cfg.dataDir, 'tickets.json')).reassign(from.sub, into.sub);
-      console.error(`[hn] merged: ${from.sub} is gone, and every way it signed in now opens ${next.sub}. Signed-in sessions it has at services last until they end.`);
+      let next: HumanAccount;
+      try {
+        next = accounts.fold(from.sub, into.sub, (f, i) => {
+          const m = fold(f, i); // against both rows as they are under the lock
+          if (typeof m === 'string') throw new Error(m);
+          return m.next;
+        });
+      } catch (err) {
+        die(`not merged: ${(err as Error).message}. Both accounts are as they were; what ${from.sub} sponsored or redeemed already names ${into.sub}, and running this again finishes it.`);
+      }
+      console.error(`[hn] merged: ${from.sub} is gone, and its ways in now open ${next.sub}${plan.left.length ? ' — except what is listed above as left behind' : ''}. They sign in again here; sessions they have at services last until they end.`);
       console.log(describe(next));
       return;
     }

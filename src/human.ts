@@ -278,7 +278,7 @@ export class HumanAuth {
   >();
   private totpSetups = new Pending<{ secret: string; exp: number }>();
   /** Google accounts this node had never seen, shown the first-time page and not answered yet. */
-  private newcomers = new Pending<{ google: GoogleIdentity; audience: string; code?: string; exp: number }>();
+  private newcomers = new Pending<{ google: GoogleIdentity; audience: string; code?: string; /** the account the page offered to add it to */ addTo?: string; exp: number }>();
   /** One-time email codes, keyed `<purpose>:<emailKey>`. While one is
    *  pending, a new request re-sends IT (same code, same expiry): nobody
    *  can knock out a holder's live code by asking for another. `decoy`: an
@@ -690,7 +690,11 @@ export class HumanAuth {
     // The address Discord vouches for now (none, or unverified, forgets the last one): how a Google
     // account with the same address is recognised as this person (same-person.ts).
     const address = user.verified && user.email ? user.email : null;
-    this.d.discordAddresses.record(user.id, address);
+    try {
+      this.d.discordAddresses.record(user.id, address);
+    } catch (err) {
+      console.error(`[hn] address of discord:${user.id} not recorded: ${(err as Error).message}`); // an aid, never a reason to refuse a sign-in
+    }
     // Roles the operator set aside for this person don't count (accounts.ts).
     const target = st.intent === 'link' ? this.d.accounts.bySub(st.sub) : this.d.accounts.byDiscord(user.id);
     const discordGrant = member ? grantForRoles(effectiveRoles(member.roles, target), this.d.roles.get()) : null;
@@ -1701,7 +1705,9 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // A row keyed on this Google account that no longer links it: Google
       // was unlinked there, which took it away as a way in — codes and open
       // audiences don't bring it back.
-      const keyed = this.d.accounts.bySub(`human:google:${g.sub}`);
+      // The same for a row folded into another since (hn user merge): its id is retired, not free to be made again.
+      const own = `human:google:${g.sub}`;
+      const keyed = this.d.accounts.bySub(own) ?? this.d.accounts.all().find((a) => a.was?.includes(own));
       if (keyed) {
         console.error(`[hn] login refused: google:${g.sub} (${label}) — no longer linked to ${keyed.sub}`);
         return html(res, 403, page('not linked', `<p>Hi <b>${esc(label)}</b> — this Google account was unlinked from its account here, so it doesn’t sign in any more. Sign in another way, and link it again under <a href="/login?audience=account">sign-in settings</a> if you want it back.</p>`));
@@ -1765,7 +1771,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       const addTo = sess && !sess.google?.sub ? sess : undefined;
       if (here && (this.discordOn || addTo)) {
         const id = randomBytes(24).toString('base64url');
-        this.newcomers.set(id, { google: g, audience: st.audience, ...(st.code ? { code: st.code } : {}), exp: Date.now() + STATE_TTL_MS });
+        this.newcomers.set(id, { google: g, audience: st.audience, ...(st.code ? { code: st.code } : {}), ...(addTo ? { addTo: addTo.sub } : {}), exp: Date.now() + STATE_TTL_MS });
         return securePage(res, 200, (nonce) =>
           firstGooglePage(this.at(), {
             id, google: label, discord: this.discordOn, ...(addTo ? { addTo: displayName(addTo) } : {}),
@@ -1858,12 +1864,13 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     const now = new Date().toISOString();
     let acct: HumanAccount | undefined;
     if (b.as === 'session') {
+      // the account the page named, not whoever this browser has signed in as since
       const sess = this.sessionAccount(req);
       try {
-        acct = sess && this.d.accounts.update(sess.sub, (a) => {
+        acct = sess && sess.sub === p.addTo ? this.d.accounts.update(sess.sub, (a) => {
           if (a.disabled || a.google?.sub) throw new Error('account changed');
           return { ...a, google: googleLink(g, now, a.google?.email) };
-        });
+        }) : undefined;
       } catch {
         acct = undefined;
       }
@@ -1898,10 +1905,12 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     const rows = this.d.accounts.all().filter((a) => a.google?.sub && a.google.verified && emailKey(a.google.email) === key);
     const row = rows.length === 1 ? rows[0]! : undefined;
     if (!row || row.disabled || row.discord || byHandOnly(row, mergeGrants(snapshot.grant, operatorGrant(row)))) return undefined;
-    if (this.d.mintLog.forSub(`human:discord:${snapshot.id}`).length) return undefined;
+    // Used here on its own before? Only a clear "no" joins: a log that is missing or can't be read is not a no.
+    if (this.d.mintLog.has(`human:discord:${snapshot.id}`) !== false) return undefined;
     try {
       const acct = this.d.accounts.update(row.sub, (a) => {
-        if (a.disabled || a.discord) throw new Error('account changed');
+        // as the row is NOW: a restriction or grant set meanwhile holds
+        if (a.disabled || a.discord || byHandOnly(a, mergeGrants(snapshot.grant, operatorGrant(a)))) throw new Error('account changed');
         return { ...a, discord: snapshot };
       });
       if (acct) console.error(`[hn] account: ${acct.sub} linked discord:${snapshot.id} (${snapshot.name ?? ''}) — the same address as its Google account`);
@@ -1944,7 +1953,8 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     try {
       const acct = row
         ? this.d.accounts.update(row.sub, (a) => {
-            if (a.disabled || a.google) throw new Error('account changed');
+            // as the row is NOW: a restriction or grant set while the bot call was out holds
+            if (a.disabled || a.google || byHandOnly(a, mergeGrants(seen.grant, operatorGrant(a)))) throw new Error('account changed');
             return { ...a, google: googleLink(g, now) };
           })
         : this.d.accounts.add({ sub: `human:discord:${id}`, discord: seen, google: googleLink(g, now), createdAt: now });

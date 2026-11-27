@@ -8,8 +8,12 @@
  *    mailbox it is the same person, and the second provider to show up
  *    becomes another way into the account the first one has — not a second
  *    account (human.ts). To recognise a Google account that arrives later,
- *    the node remembers which address each Discord account last vouched
- *    for: a hash of it, in data/discord-addresses.json, not the address.
+ *    the node remembers which address each Discord account vouched for at
+ *    its last Discord sign-in: a hash of it, in data/discord-addresses.json,
+ *    not the address. Before a Google account joins a Discord identity the
+ *    node reads what that identity holds: live with a bot token; without
+ *    one, from its row's recent snapshot — so a Discord person with no row
+ *    is then asked (2) instead of joined.
  *    (A plain hash: it keeps addresses out of sight, and whoever can read
  *    the file can still test a guess against it.)
  *

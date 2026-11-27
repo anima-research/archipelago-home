@@ -14,6 +14,7 @@ import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HomeNode } from '../src/server.js';
+import { MintLog } from '../src/stores.js';
 import { verifyToken, type Aid1Payload } from '../src/token.js';
 import { hashPassword, type HumanAccount } from '../src/accounts.js';
 import { addressHash, mergeAccounts, sameAddress } from '../src/same-person.js';
@@ -215,6 +216,16 @@ test('same address: by hand only for the node’s own powers and for restricted 
   discord({ id: '100000000000000018', username: 'tom', email: 'tom@gmail.com', verified: true }, ['r-team']);
   assert.equal(tokenFrom((await discordLogin('eidoverse')).location!, 'eidoverse').sub, 'human:discord:100000000000000018');
   assert.equal(node.accounts.bySub('human:google:g-tom')!.discord, undefined);
+  // nor does an ordinary Discord account land by itself on a Google account that is an admin's, or restricted
+  const at = new Date().toISOString();
+  node.accounts.add({ sub: 'human:google:g-ann', google: { sub: 'g-ann', email: 'ann@gmail.com', verified: true }, scopes: ['hn:admin'], createdAt: at });
+  discord({ id: '100000000000000019', username: 'ann', email: 'ann@gmail.com', verified: true });
+  assert.equal(tokenFrom((await discordLogin('eidoverse')).location!, 'eidoverse').sub, 'human:discord:100000000000000019');
+  assert.equal(node.accounts.bySub('human:google:g-ann')!.discord, undefined);
+  node.accounts.add({ sub: 'human:google:g-bea', google: { sub: 'g-bea', email: 'bea@gmail.com', verified: true }, withhold: ['orrery:use'], createdAt: at });
+  discord({ id: '100000000000000020', username: 'bea', email: 'bea@gmail.com', verified: true });
+  assert.equal(tokenFrom((await discordLogin('eidoverse')).location!, 'eidoverse').sub, 'human:discord:100000000000000020');
+  assert.equal(node.accounts.bySub('human:google:g-bea')!.discord, undefined);
   // …but the operator is shown the pair
   assert.ok(sameAddress(node.accounts.all(), node.discordAddresses.all()).some((p) => p.discordId === '100000000000000018' && p.google.sub === 'human:google:g-tom'));
 });
@@ -283,6 +294,14 @@ test('first time: signed in here already — "Add this Google account to …" pu
   assert.match(first.text, /Add this Google account to lena/);
   // the answer counts only with that session
   assert.equal((await post('/login/new', { id: (await googleLogin('eidoverse', session)).id, as: 'session' })).status, 400);
+  assert.equal(node.accounts.byGoogle('g-lena'), undefined);
+  // …and only for the account the page named: signed in as someone else since (another tab), the button doesn't follow
+  node.accounts.add({ sub: 'human:local:otto', username: 'otto', password: await hashPassword('otto password 1'), scopes: ['worlds:join'], createdAt: new Date().toISOString() });
+  const named = await googleLogin('eidoverse', session);
+  assert.match(named.text, /Add this Google account to lena/);
+  const page2 = await get('/login?audience=eidoverse');
+  const otto = (await post('/login/password', { state: /"state":"([^"]+)"/.exec(page2.text)![1], username: 'otto', password: 'otto password 1' })).cookies;
+  assert.equal((await post('/login/new', { id: named.id, as: 'session' }, otto)).status, 400);
   assert.equal(node.accounts.byGoogle('g-lena'), undefined);
   const r = await post('/login/new', { id: first.id, as: 'session' }, session);
   assert.equal(r.status, 200, JSON.stringify(r.body));
@@ -385,6 +404,42 @@ test('two accounts already: a Discord identity used here on its own is listed, n
   assert.equal(tokenFrom(viaGoogle.location!, 'notes').sub, 'human:discord:100000000000000031');
   assert.equal(tokenFrom((await discordLogin('eidoverse')).location!, 'eidoverse').sub, 'human:discord:100000000000000031');
   assert.doesNotMatch(hn('dupes').out, /g-fay/);
+
+  // the folded id is retired: with its Google login taken off the account, that Google account is refused as an
+  // unlinked one is — it does not come back as a new human:google:g-fay
+  assert.equal(hn('set', 'human:discord:100000000000000031', '--google', 'none').status, 0);
+  const gone = await googleLogin('notes');
+  assert.equal(gone.status, 403);
+  assert.match(gone.text, /was unlinked from its account here/);
+  assert.equal(node.accounts.bySub('human:google:g-fay'), undefined);
+});
+
+test('merge: a Discord id names that Discord account, even where someone took the same digits as a username', async () => {
+  discord({ id: '100000000000000041', username: 'kim', email: null });
+  await discordLogin('eidoverse'); // used here, no row
+  const at = new Date().toISOString();
+  node.accounts.add({ sub: 'human:local:100000000000000041', username: '100000000000000041', createdAt: at });
+  node.accounts.add({ sub: 'human:google:g-kim', google: { sub: 'g-kim', email: 'kim@gmail.com', verified: true }, createdAt: at });
+  const show = hn('merge', 'human:google:g-kim', '100000000000000041');
+  assert.equal(show.status, 0, show.out);
+  assert.match(show.out, /into {2}human:discord:100000000000000041 \(no row: Discord only\)/);
+  assert.doesNotMatch(show.out, /human:local:100000000000000041/);
+});
+
+test('mint log: "has this id been used" — a torn line can’t hide a record, and no log is not a no', () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'hn-mint-')), 'minted.jsonl');
+  const log = new MintLog(file);
+  assert.equal(log.has('human:discord:1'), undefined); // can't tell: never taken for "unused"
+  // a record cut short by a crash, and the next one appended straight onto it
+  writeFileSync(file, '{"at":"2026-01-01T00:00:00Z","sub":"human:discord:2","aud":"a"{"at":"2026-01-02T00:00:00Z","sub":"human:discord:1","aud":"a","scopes":[],"exp":1,"by":"oauth"}\n');
+  assert.equal(log.has('human:discord:1'), true);
+  assert.equal(log.has('human:discord:2'), true);
+  assert.equal(log.has('human:discord:11'), false);
+});
+
+test('browser cookie: what a browser needs to take a __Host- cookie and send it back from a provider', async () => {
+  const r = await fetch(`${base}/login?audience=eidoverse`, { headers: hdrs() });
+  assert.match(r.headers.getSetCookie().join('\n'), /^__Host-hn_browser=[A-Za-z0-9_-]{32}; Path=\/; Max-Age=600; HttpOnly; SameSite=Lax; Secure$/m);
 });
 
 test('dupes: says so when there is nothing to see', () => {

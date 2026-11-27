@@ -275,7 +275,14 @@ const S = ${scriptJson({ id: o.id })};
 const choices = document.querySelectorAll('button[data-as]');
 choices.forEach((b) => (b.onclick = async () => {
   choices.forEach((x) => (x.disabled = true));
-  const r = await post('/login/new', { id: S.id, as: b.dataset.as });
+  let r;
+  try { r = await post('/login/new', { id: S.id, as: b.dataset.as }); }
+  catch {
+    // it never reached the node, so the answer isn't spent: they can try again
+    $('err').textContent = 'That didn’t reach the server — check your connection and try again.';
+    choices.forEach((x) => (x.disabled = false));
+    return;
+  }
   if (r.body && r.body.redirect) { location.assign(r.body.redirect); return; }
   $('err').textContent = r.body.error || 'That didn’t go through — start again from the service.';
   if (r.status === 403) $('hint').hidden = false;

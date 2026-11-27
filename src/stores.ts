@@ -557,7 +557,9 @@ export function grantForRoles(roles: string[], cfg: RolesConfig): RoleGrant | nu
 }
 
 // ---------------------------------------------------------------------------
-// Mint audit log — append-only JSONL, never consulted at verify time
+// Mint audit log — append-only JSONL, never consulted at verify time.
+// Read at runtime for one question only: has this sub ever been given a token
+// here (same-person.ts)? So it has to stay whole: don't rotate or trim it.
 // ---------------------------------------------------------------------------
 
 export interface MintRecord {
@@ -582,7 +584,17 @@ export class MintLog {
     }
   }
 
-  /** Every token this sub was ever given here — "has this identity been used?" and "where?". Reads the whole log. */
+  /** Has this sub ever been given a token here? `undefined` = can't tell (no log yet, or it can't be read):
+   *  never to be taken for "no". A plain search for the sub, so a torn line can't hide a record. Reads the whole log. */
+  has(sub: string): boolean | undefined {
+    try {
+      return readFileSync(this.path, 'utf8').includes(`"sub":${JSON.stringify(sub)}`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every token this sub was given here that the log still shows whole — where it has signed in (hn user merge). */
   forSub(sub: string): MintRecord[] {
     let text: string;
     try {

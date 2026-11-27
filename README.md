@@ -100,11 +100,15 @@ them on one account (`src/same-person.ts`):
 - **The same address on both sides.** When Discord vouches for an account's address (the
   account's verified email) and Google is authoritative for the same one (Gmail or Workspace),
   the second provider to show up becomes another way into the account the first one has. A
-  Google account arriving later joins the Discord identity (`human:discord:<id>`, its roles read
-  live); a Discord account nobody has used here joins the account its Google address made. To
-  recognise the Google side later, the node keeps a hash of the address each Discord account
-  last vouched for (`data/discord-addresses.json`, 0600) — so this starts working for a Discord
-  person at their first Discord sign-in after it is deployed.
+  Google account arriving later joins the Discord identity (`human:discord:<id>`); a Discord
+  account nobody has used here joins the account its Google address made. To recognise the
+  Google side later, the node keeps a hash of the address each Discord account vouched for at
+  its last Discord sign-in (`data/discord-addresses.json`, 0600) — so this starts working for a
+  Discord person at their first Discord sign-in after it is deployed, and goes by the address
+  they had then. What the Discord identity holds is read before a Google account joins it: live
+  with `HN_BOT_TOKEN`; without one, from its row's recent snapshot, so a Discord person with no
+  row is asked (next point) instead of joined. "Nobody has used here" is read from
+  `data/minted.jsonl`: keep that log whole — trimmed, it reads as "never used".
   **Never automatic** for anyone holding `hn:admin` or `id:anchor`, or under `hn user restrict`:
   for them a second provider would be a second way in that nobody chose. They link by hand at
   `/account`. A recycled Workspace address is the one thing this trusts that it can't check: if
@@ -114,7 +118,9 @@ them on one account (`src/same-person.ts`):
   page before any account is made: **I’ve signed in here with Discord** (one Discord sign-in,
   in the same browser, and the Google account joins that account), **Add this Google account to
   …** (when the browser is signed in here already), or **I’m new here** (a new account, as
-  before). Shown only where Discord sign-in is on or the browser has a session — and only in the
+  before). Shown when the node would otherwise make them an account (something here is open to
+  everyone, or they carry an access code), where Discord sign-in is on or the browser has a
+  session — and only in the
   browser that started the sign-in (a cookie set at `/login`): the page offers to put that Google
   account on whoever is looking at it, so a return link opened in someone else's browser gets the
   old behaviour, never the page.
@@ -122,7 +128,10 @@ them on one account (`src/same-person.ts`):
   address on a Discord account and on another account's Google). `hn user merge <from> <into>`
   shows what each holds and where each has signed in, and with `--yes` folds `<from>` into
   `<into>`: `<into>` keeps its id and name and takes `<from>`'s ways in, grants, codes, sponsored
-  agents and invites; restrictions add up; `<from>`'s id is recorded on the row (`was`). Either
+  agents and invites; restrictions add up; what can't come along (a second password, passkeys
+  made for the other account) is listed first. `<from>`'s id is recorded on the row (`was`) and
+  is retired: it is not made again by a later sign-in. If the command stops part-way, running it
+  again finishes it. Either
   side may be a Discord person with no row (give the Discord id). **Services keep what they hold
   under `<from>`'s id** — documents, shares, comments — so pick as `<into>` the id that holds
   more out there.
