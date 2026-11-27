@@ -2,19 +2,23 @@
  * Discord OAuth2 (auth-code flow) — the human leg (docs/home-node.md §3).
  * Cribbed from portal-relay src/admin/oauth.ts. Role lookup has two paths:
  *
- *  - bot token configured (preferred): OAuth asks only `identify`; the
+ *  - bot token configured (preferred): OAuth asks `identify email`; the
  *    server reads the member's roles itself via
  *    GET /guilds/<id>/members/<userId> with Bot auth. Smallest consent
  *    screen.
- *  - no bot token: OAuth asks `identify guilds.members.read` and reads
+ *  - no bot token: OAuth asks `identify email guilds.members.read` and reads
  *    GET /users/@me/guilds/<id>/member with the user's own token.
+ *
+ * `email` is asked for one thing: to recognise the person behind a Google
+ * account with the same address (same-person.ts). The address itself is
+ * not kept — only a hash of it.
  *
  * Either way the user's Discord token is used once and discarded — never
  * stored.
  */
 
 export function oauthScopes(hasBotToken: boolean): string {
-  return hasBotToken ? 'identify' : 'identify guilds.members.read';
+  return hasBotToken ? 'identify email' : 'identify email guilds.members.read';
 }
 const AUTHORIZE_URL = 'https://discord.com/oauth2/authorize';
 const TOKEN_URL = 'https://discord.com/api/oauth2/token';
@@ -24,6 +28,9 @@ export interface DiscordUser {
   id: string;
   username: string;
   global_name?: string | null;
+  /** With the `email` scope: the account's address, and whether Discord checked it (a mailed link). */
+  email?: string | null;
+  verified?: boolean;
 }
 
 export interface GuildMember {
@@ -57,7 +64,7 @@ export async function completeOAuth(
     redirectUri: string;
     code: string;
     guildId: string;
-    /** When set, roles are read bot-side and OAuth needs only `identify`. */
+    /** When set, roles are read bot-side and OAuth needs only `identify email`. */
     botToken?: string;
   },
   fetchImpl: FetchLike = fetch,

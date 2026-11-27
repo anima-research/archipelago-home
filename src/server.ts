@@ -29,6 +29,7 @@ import { emailSenderFromConfig, type EmailSender } from './email.js';
 import type { FetchLike } from './oauth.js';
 import { consoleMovedPage, enrollPage, homePage, siteStore, type SiteInfo } from './site.js';
 import { SessionStore } from './sessions.js';
+import { DiscordAddressStore } from './same-person.js';
 import { esc, html, json, page, readJson } from './http.js';
 import {
   audiencesStore,
@@ -52,7 +53,7 @@ export interface ServerConfig {
   configDir: string;
   discordClientId?: string;
   discordClientSecret?: string;
-  /** Bot token for server-side role lookup (shrinks OAuth to `identify`). */
+  /** Bot token for server-side role lookup (shrinks OAuth to `identify email`). */
   discordBotToken?: string;
   googleClientId?: string;
   googleClientSecret?: string;
@@ -141,6 +142,8 @@ export class HomeNode {
   readonly site: JsonStore<SiteInfo>;
   /** Sign-in sessions (sessions.ts). */
   readonly sessions: SessionStore;
+  /** Which address each Discord account last vouched for (same-person.ts). */
+  readonly discordAddresses: DiscordAddressStore;
   /** Null = email sign-in off. */
   readonly email: EmailSender | null;
   readonly human: HumanAuth;
@@ -163,6 +166,7 @@ export class HomeNode {
     this.ticketDefaults = ticketDefaultsStore(join(cfg.configDir, 'ticket-defaults.json'));
     this.site = siteStore(join(cfg.configDir, 'site.json'));
     this.sessions = new SessionStore(join(cfg.dataDir, 'sessions.json'));
+    this.discordAddresses = new DiscordAddressStore(join(cfg.dataDir, 'discord-addresses.json'));
     if (cfg.ticketsToken !== undefined && cfg.ticketsToken.length < 32) {
       throw new Error('HN_TICKETS_TOKEN must be at least 32 characters (e.g. openssl rand -base64 32)');
     }
@@ -185,6 +189,7 @@ export class HomeNode {
       site: this.site,
       invites: this.invites,
       sessions: this.sessions,
+      discordAddresses: this.discordAddresses,
     });
   }
 

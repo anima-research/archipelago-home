@@ -99,8 +99,10 @@ for attempt in 1 2 3 4 5; do
 done
 [ -n "$stable" ] || { log "state files kept changing across 5 attempts — no consistent snapshot, nothing uploaded"; exit 1; }
 
-# 1b. The mint log is append-only and never read at runtime (an audit
-# trail), so it needs no agreement with the state files, only whole lines:
+# 1b. The mint log is append-only, and read at runtime only to ask whether
+# an id was ever given a token (same-person.ts). Taken AFTER the state files,
+# it is never behind them, which is all that question needs; beyond that it
+# needs no agreement with the state files, only whole lines:
 # the lines complete at one instant. Lines already written never change, so
 # `head -n` of that count is exact even while appends go on. It joins the
 # snapshot under its own path with the live file's owner, group and mode,

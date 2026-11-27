@@ -17,6 +17,8 @@
  *   hn user disable <username>     hn user enable <username>
  *   hn user restrict <username | sub | discord-id> [--ignore-roles <role id>,…] [--withhold a,b] [--clear]
  *                                  roles that don't count for this person / scopes they never hold
+ *   hn user dupes                  one person, two accounts: the pairs the node can see (same-person.ts)
+ *   hn user merge <from> <into> [--yes]   fold <from> into <into>, which keeps its id; without --yes it only shows
  *
  *   hn code add --aud curation [--scopes x,y] [--label "…"] [--max-uses 50] [--expires 14d]  → the code (shown once)
  *   hn code ls                      who redeemed what
@@ -38,6 +40,7 @@ import { clean, noDefaultsMessage, takeBackTicket, ticketDefaultsStore, ticketGr
 import { configFromEnv, HomeNode, type ServerConfig } from './server.js';
 import { AccountStore, displayName, nameProblem, newSetupCode, normalizeUsername, usernameProblem, type HumanAccount } from './accounts.js';
 import { emailKey, looksLikeEmail } from './google.js';
+import { DiscordAddressStore, mergeAccounts, sameAddress } from './same-person.js';
 
 function flags(args: string[]): { flag: Map<string, string>; pos: string[] } {
   const flag = new Map<string, string>();
@@ -83,7 +86,7 @@ function main(): void {
 
   switch (cmd) {
     case 'user':
-      return userCmd(cfg, principals, pos, flag);
+      return userCmd(cfg, principals, invites, mintLog, pos, flag);
     case 'code':
       return codeCmd(cfg, pos, flag);
     case 'ticket':
@@ -202,7 +205,7 @@ function userInfoName(uid: number): string {
 }
 
 /** `hn user …` — human accounts (username / password / 2FA / passkeys). */
-function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], flag: Map<string, string>): void {
+function userCmd(cfg: ServerConfig, principals: PrincipalStore, invites: InviteStore, mintLog: MintLog, pos: string[], flag: Map<string, string>): void {
   // accounts.json is 0600: written by root, the service user could no longer
   // read it and every non-Discord sign-in would fail.
   try {
@@ -227,6 +230,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
     `${a.email ? `  email:${a.email.address}` : ''}${a.ticket ? `  ticket:${a.ticket.audiences.join(',') || '-'}[${a.ticket.scopes.join(' ')}]` : ''}` +
     `${a.scopes?.length ? `  [${a.scopes.join(' ')}]` : ''}` +
     `${a.ignoreRoles?.length ? `  ignore-roles:${a.ignoreRoles.join(',')}` : ''}${a.withhold?.length ? `  withhold:${a.withhold.join(',')}` : ''}` +
+    `${a.was?.length ? `  was:${a.was.join(',')}` : ''}` +
     `${a.setup ? `  setup-link-until:${a.setup.exp.slice(0, 16)}` : ''}${a.disabled ? '  [DISABLED]' : ''}`;
 
   /** A row a Google sign-in made by itself (an open audience, or a code) —
@@ -397,6 +401,88 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       console.log(describe(next));
       return;
     }
+    case 'dupes': {
+      const pairs = sameAddress(accounts.all(), new DiscordAddressStore(join(cfg.dataDir, 'discord-addresses.json')).all());
+      if (!pairs.length) {
+        console.log('no two accounts here share an address that Discord and Google both vouch for');
+        console.log('(a Discord account is only known by its address once it has signed in after addresses began to be recorded)');
+        return;
+      }
+      console.log(`one person, two accounts (${pairs.length}) — the same address on a Discord account and on another account's Google:`);
+      for (const p of pairs) {
+        const row = accounts.byDiscord(p.discordId);
+        const d = row?.sub ?? `human:discord:${p.discordId}`;
+        console.log(`  ${d}${row ? ` "${displayName(row)}"` : ' (no row: Discord only)'}   and   ${p.google.sub} "${displayName(p.google)}" google:${p.google.google!.email}`);
+        console.log(`      hn user merge ${p.google.sub} ${d}      (or the other way round: <into> is the id that stays)`);
+      }
+      return;
+    }
+    case 'merge': {
+      const [, fromArg, intoArg] = pos;
+      if (!fromArg || !intoArg) die('usage: hn user merge <from> <into> [--yes]   each: username | sub | discord id. <into> keeps its id; <from> is folded into it');
+      const usedAt = (who: string): string => {
+        const by = new Map<string, { n: number; last: string }>();
+        for (const r of mintLog.forSub(who)) {
+          const e = by.get(r.aud) ?? { n: 0, last: '' };
+          by.set(r.aud, { n: e.n + 1, last: r.at > e.last ? r.at : e.last });
+        }
+        return [...by].map(([aud, e]) => `${aud} ×${e.n} (last ${e.last.slice(0, 10)})`).join(', ');
+      };
+      // A Discord person who never needed a row is still someone: the row they would have.
+      const person = (arg: string): { sub: string; row: HumanAccount | undefined; used: string } => {
+        // a Discord id names that Discord account, even where someone took the same digits as a username
+        const id = /^(?:human:discord:)?(\d{15,22})$/.exec(arg)?.[1];
+        const row = id ? accounts.byDiscord(id) : (accounts.byUsername(arg) ?? accounts.bySub(arg));
+        const who = row?.sub ?? (id ? `human:discord:${id}` : die(`no account "${arg}"`));
+        if (!row && mintLog.has(who) !== true) die(`nobody has signed in here as ${who}`);
+        return { sub: who, row, used: usedAt(who) };
+      };
+      const from = person(fromArg);
+      const into = person(intoArg);
+      const now = new Date().toISOString();
+      const rowless = (who: string): HumanAccount => ({ sub: who, discord: { id: who.slice('human:discord:'.length) }, createdAt: now });
+      // a row that was there when we looked and isn't under the lock: someone changed it meanwhile
+      const live = (p: typeof from, row: HumanAccount | undefined): HumanAccount => {
+        if (!row && p.row) throw new Error(`${p.sub} changed under us — run it again`); // thrown, not exit: the store's lock is held
+        return row ?? rowless(p.sub);
+      };
+      const fold = (f: HumanAccount | undefined, i: HumanAccount | undefined) => mergeAccounts(live(from, f), live(into, i), now.slice(0, 10));
+      const plan = fold(from.row, into.row);
+      if (typeof plan === 'string') die(`can't merge ${from.sub} into ${into.sub}: ${plan}`);
+      const agents = principals.all().filter((p) => p.claims?.sponsor === from.sub);
+      const made = invites.all().filter((i) => i.sponsor === from.sub).length;
+      console.error(`from  ${from.row ? describe(from.row).trim() : `${from.sub} (no row: Discord only)`}`);
+      console.error(`      signed in to: ${from.used || 'nothing yet'}`);
+      console.error(`into  ${into.row ? describe(into.row).trim() : `${into.sub} (no row: Discord only)`}`);
+      console.error(`      signed in to: ${into.used || 'nothing yet'}`);
+      console.error(`after ${describe(plan.next).trim()}`);
+      for (const l of plan.left) console.error(`      left behind: ${l}`);
+      if (agents.length || made) console.error(`      ${agents.length} agent(s) and ${made} invite(s) sponsored by ${from.sub} pass to ${into.sub}`);
+      console.error(`      services keep what they hold under ${from.sub} (documents, shares, comments): nothing there moves — it is no longer anyone's sign-in`);
+      if (!flag.has('yes')) {
+        console.error(`[hn] nothing changed. To do it: hn user merge ${fromArg} ${intoArg} --yes`);
+        return;
+      }
+      // What names <from> elsewhere moves first and the accounts last: if this stops part-way, <from> is still
+      // there, and the same command finishes the job.
+      for (const p of agents) principals.update(p.sub, (x) => ({ ...x, claims: { ...x.claims, sponsor: into.sub } }));
+      invites.reassign(from.sub, into.sub);
+      new CodeStore(join(cfg.dataDir, 'codes.json')).reassign(from.sub, into.sub);
+      if (from.row?.ticket && !into.row?.ticket) new TicketStore(join(cfg.dataDir, 'tickets.json')).reassign(from.sub, into.sub);
+      let next: HumanAccount;
+      try {
+        next = accounts.fold(from.sub, into.sub, (f, i) => {
+          const m = fold(f, i); // against both rows as they are under the lock
+          if (typeof m === 'string') throw new Error(m);
+          return m.next;
+        });
+      } catch (err) {
+        die(`not merged: ${(err as Error).message}. Both accounts are as they were; what ${from.sub} sponsored or redeemed already names ${into.sub}, and running this again finishes it.`);
+      }
+      console.error(`[hn] merged: ${from.sub} is gone, and its ways in now open ${next.sub}${plan.left.length ? ' — except what is listed above as left behind' : ''}. They sign in again here; sessions they have at services last until they end.`);
+      console.log(describe(next));
+      return;
+    }
     case 'disable':
     case 'enable': {
       const a = find();
@@ -405,7 +491,7 @@ function userCmd(cfg: ServerConfig, principals: PrincipalStore, pos: string[], f
       return;
     }
     default:
-      die('usage: hn user add | ls | reset | set | restrict | disable | enable');
+      die('usage: hn user add | ls | reset | set | restrict | dupes | merge | disable | enable');
   }
 }
 

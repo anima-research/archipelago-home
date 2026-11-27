@@ -7,6 +7,9 @@
  *   GET  /oauth/callback          Discord's return leg (also: linking Discord to an account)
  *   GET  /login/google?state=…    → Google OIDC (`?via=google` skips the chooser)
  *   GET  /oauth/google/callback   Google's return leg (also: linking Google; claiming an invite)
+ *   POST /login/new               {id, as} → a Google account's first time here: "discord" (it joins
+ *                                 the account their Discord signs in to), "session" (the account
+ *                                 this browser is signed in as) or "new" (same-person.ts)
  *   POST /login/code              {state, code} → the code rides this sign-in: redeemed by
  *                                 whichever method finishes it, and with Google or Discord
  *                                 it also signs a newcomer up (codes.ts)
@@ -89,9 +92,10 @@ import { qrSvg } from './qr.js';
 import { clientDataChallenge, COSE_ALGS, verifyAssertion, verifyRegistration, type RelyingParty } from './webauthn.js';
 import { esc, html, json, page, readJson, redirect, securePage } from './http.js';
 import { consoleRequiredScopes, type InvitePolicy } from './policy.js';
-import { accountPage, loginPage, setupPage, type PageSite } from './pages.js';
+import { accountPage, firstGooglePage, loginPage, setupPage, type PageSite } from './pages.js';
 import type { SiteInfo } from './site.js';
 import { SESSION_COOKIE, type SessionStore } from './sessions.js';
+import type { DiscordAddressStore } from './same-person.js';
 
 const LOGIN_TOKEN_TTL_MS = 10 * 60_000;
 const STATE_TTL_MS = 10 * 60_000;
@@ -150,6 +154,8 @@ export interface HumanDeps {
   invites: InviteStore;
   /** Sign-in sessions: sign in once, continue as that account (sessions.ts). */
   sessions: SessionStore;
+  /** Which address each Discord account last vouched for (same-person.ts). */
+  discordAddresses: DiscordAddressStore;
 }
 
 /** A link state is bound to the browser that asked for it (`nonce`, also in
@@ -157,12 +163,22 @@ export interface HumanDeps {
  *  THEIR Discord or Google to the sender's account. `pkce` is the Google
  *  leg's code verifier, set when that leg starts. */
 type LoginState = { audience: string; exp: number; pkce?: string } & (
-  /** `code`: an access code entered on the sign-in page, redeemed when the sign-in finishes. */
-  | { intent: 'login'; code?: string }
+  /** `code`: an access code entered on the sign-in page, redeemed when the sign-in finishes.
+   *  `browser`: the value in the cookie of the browser that opened the sign-in page (BROWSER_COOKIE). */
+  | { intent: 'login'; code?: string; browser: string }
   | { intent: 'link'; provider: 'discord' | 'google'; sub: string; nonce: string }
+  /** A Google account this node had never seen, on its way to Discord: it joins the account that Discord
+   *  identity signs in to (same-person.ts). Finishes only in the browser that answered the first-time page. */
+  | { intent: 'join'; google: GoogleIdentity; code?: string; browser: string }
 );
 type FactorCheck = 'ok' | 'bad' | 'locked';
 const LINK_COOKIE = 'hn_link';
+/** A random value this browser holds while it signs in. A sign-in state remembers the one it was
+ *  started with, so the node can tell whether a provider's return came back to the same browser —
+ *  which is what the first-time page (same-person.ts) needs to know before it offers to put a Google
+ *  account on whoever is looking at it. */
+const BROWSER_COOKIE = 'hn_browser';
+const BROWSER_VALUE = /^[A-Za-z0-9_-]{32}$/;
 type Who = { sub: string; name: string; grant: RoleGrant | null; account?: HumanAccount; note?: string };
 type Outcome = { ok: true; redirect: string } | { ok: false; status: number; error: string };
 
@@ -234,6 +250,11 @@ function googleLink(g: GoogleIdentity, now: string, fallback = ''): NonNullable<
 
 /** Holding this scope (an operator grant) makes someone one of this node's admins on the account page. */
 export const ADMIN_SCOPE = 'hn:admin';
+
+/** Whose ways in are never joined without their asking (same-person.ts): anyone under operator
+ *  restrictions, or holding one of the node's own powers. They link by hand on the account page. */
+const byHandOnly = (a: HumanAccount | undefined, g: RoleGrant | null): boolean =>
+  Boolean((a && restricted(a)) || g?.scopes.some((s) => s === ADMIN_SCOPE || s === ANCHOR_SCOPE));
 /** The node's own audiences: never edited from the admin page. */
 const BUILT_IN_AUDIENCES = new Set(['account', 'console']);
 const AUDIENCE_ID = /^[a-z][a-z0-9-]{0,39}$/;
@@ -256,6 +277,8 @@ export class HumanAuth {
     | { kind: 'register'; sub: string; userId: string; exp: number }
   >();
   private totpSetups = new Pending<{ secret: string; exp: number }>();
+  /** Google accounts this node had never seen, shown the first-time page and not answered yet. */
+  private newcomers = new Pending<{ google: GoogleIdentity; audience: string; code?: string; /** the account the page offered to add it to */ addTo?: string; exp: number }>();
   /** One-time email codes, keyed `<purpose>:<emailKey>`. While one is
    *  pending, a new request re-sends IT (same code, same expiry): nobody
    *  can knock out a holder's live code by asking for another. `decoy`: an
@@ -380,6 +403,7 @@ export class HumanAuth {
     '/login/email/begin': (_q, res, b, ip) => this.emailLoginBegin(res, b, ip),
     '/login/email/finish': (_q, res, b, ip) => this.emailLoginFinish(res, b, ip),
     '/login/session': (q, res, b) => this.loginSession(q, res, b),
+    '/login/new': (q, res, b) => this.newcomer(q, res, b),
     '/account/signout': (q, res) => this.signOut(q, res),
     '/account/email/begin': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkBegin(res, t, b, ip)),
     '/account/email/finish': (q, res, b, ip) => this.withAccount(q, res, (t) => this.emailLinkFinish(res, t, b, ip)),
@@ -595,7 +619,7 @@ export class HumanAuth {
       const out = this.issue('account', await this.resolve(sess), 'session');
       if (out.ok) return redirect(res, out.redirect);
     }
-    const state = this.newState({ intent: 'login', audience, exp: Date.now() + STATE_TTL_MS });
+    const state = this.newState({ intent: 'login', audience, browser: this.browserValue(req, res), exp: Date.now() + STATE_TTL_MS });
     if (url.searchParams.get('via') === 'discord' && this.discordOn) return this.toDiscord(res, state);
     if (url.searchParams.get('via') === 'google' && this.googleOn) return this.toGoogle(res, state);
     // `?email=` prefills the email field, so a ticket seller's "you're in"
@@ -643,6 +667,11 @@ export class HumanAuth {
         return html(res, 403, page('link refused', '<p>Linking Discord has to finish in the same browser that started it. Start again from your <a href="/login?audience=account">sign-in settings</a>.</p>'));
       }
     }
+    if (st.intent === 'join' && !this.returnedHere(req, st)) {
+      // Whoever finishes this gets the Google account in the state put on THEIR Discord identity's account.
+      console.error(`[hn] join refused for google:${st.google.sub}: finished in a browser that didn't start it`);
+      return html(res, 403, page('not linked', '<p>This has to finish in the same browser that started it. Start again from the service.</p>'));
+    }
     if (!code || !this.discordOn) {
       return html(res, 400, page('login failed', '<p>Discord did not complete the login.</p>'));
     }
@@ -658,6 +687,14 @@ export class HumanAuth {
       this.d.fetchImpl,
     );
     const discordName = displayNameOf(user, member);
+    // The address Discord vouches for now (none, or unverified, forgets the last one): how a Google
+    // account with the same address is recognised as this person (same-person.ts).
+    const address = user.verified && user.email ? user.email : null;
+    try {
+      this.d.discordAddresses.record(user.id, address);
+    } catch (err) {
+      console.error(`[hn] address of discord:${user.id} not recorded: ${(err as Error).message}`); // an aid, never a reason to refuse a sign-in
+    }
     // Roles the operator set aside for this person don't count (accounts.ts).
     const target = st.intent === 'link' ? this.d.accounts.bySub(st.sub) : this.d.accounts.byDiscord(user.id);
     const discordGrant = member ? grantForRoles(effectiveRoles(member.roles, target), this.d.roles.get()) : null;
@@ -685,9 +722,30 @@ export class HumanAuth {
 
     let acct = this.d.accounts.byDiscord(user.id);
     if (acct) acct = this.d.accounts.update(acct.sub, (a) => ({ ...a, discord: snapshot }));
+    else if (st.intent === 'login' && address) acct = this.joinDiscordByAddress(snapshot, address);
     if (acct?.disabled) {
       console.error(`[hn] login refused: ${acct.sub} via discord — account disabled`);
       return html(res, 403, page('account disabled', '<p>This account is disabled. Ask an operator.</p>'));
+    }
+    if (st.intent === 'join') {
+      // They came with a Google account this node had never seen and said "I've signed in here with
+      // Discord": that Google account becomes another way into this Discord identity's account.
+      const g = st.google;
+      if (acct?.google?.sub) {
+        return html(res, 409, page('already linked', `<p>The account <b>${esc(discordName)}</b> signs in to here already has a Google account (<b>${esc(maskEmail(acct.google.email))}</b>). Sign in with that one — or start again from the service and choose “I’m new here”.</p>`));
+      }
+      try {
+        acct = acct
+          ? this.d.accounts.update(acct.sub, (a) => {
+              if (a.disabled || a.google?.sub) throw new Error('account changed');
+              return { ...a, google: googleLink(g, snapshot.checkedAt, a.google?.email) };
+            })
+          : this.d.accounts.add({ sub: `human:discord:${user.id}`, discord: snapshot, google: googleLink(g, snapshot.checkedAt), createdAt: snapshot.checkedAt });
+      } catch {
+        acct = undefined; // that Google account got an account of its own meanwhile
+      }
+      if (!acct) return html(res, 409, page('not linked', '<p>That didn’t go through. Start again from the service.</p>'));
+      console.error(`[hn] account: ${acct.sub} linked google:${g.sub} (${g.email ?? g.name ?? 'no address'}) — they signed in with Discord to join them`);
     }
     if (st.code) {
       // A code rides this sign-in: redeemed into the row, made now if this
@@ -976,6 +1034,28 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
   private addCookie(res: ServerResponse, c: string): void {
     const prev = res.getHeader('set-cookie');
     res.setHeader('set-cookie', [...(Array.isArray(prev) ? prev : prev ? [String(prev)] : []), c]);
+  }
+
+  /** `__Host-` under https: the browser then takes the cookie only with Secure, Path=/ and no Domain,
+   *  so a page on a sibling domain can't plant one. */
+  private get browserCookie(): string {
+    return this.d.cfg.publicUrl.startsWith('https:') ? `__Host-${BROWSER_COOKIE}` : BROWSER_COOKIE;
+  }
+
+  /** This browser's value: the one its cookie holds, or a new one; renewed either way (one value
+   *  serves every tab, so two sign-ins in one browser both finish). Lax, since a provider's return
+   *  is a top-level navigation from another site. */
+  private browserValue(req: IncomingMessage, res: ServerResponse): string {
+    const had = cookie(req, this.browserCookie);
+    const value = BROWSER_VALUE.test(had) ? had : randomBytes(24).toString('base64url');
+    const secure = this.d.cfg.publicUrl.startsWith('https:') ? '; Secure' : '';
+    this.addCookie(res, `${this.browserCookie}=${value}; Path=/; Max-Age=${STATE_TTL_MS / 1000}; HttpOnly; SameSite=Lax${secure}`);
+    return value;
+  }
+
+  /** Did this provider return come back to the browser that started it? */
+  private returnedHere(req: IncomingMessage, st: { browser: string }): boolean {
+    return safeEqual(cookie(req, this.browserCookie), st.browser);
   }
 
   private startSession(res: ServerResponse, sub: string, by: string): void {
@@ -1576,7 +1656,7 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       }
     }
     const code = url.searchParams.get('code') ?? '';
-    if (!code || !st.pkce || !this.googleOn) {
+    if (!code || !st.pkce || !this.googleOn || st.intent === 'join') {
       const cancelled = url.searchParams.get('error') === 'access_denied';
       return html(res, 400, page('login failed', `<p>${cancelled ? 'Google sign-in was cancelled.' : 'Google did not complete the sign-in.'} Start again from the service.</p>`));
     }
@@ -1625,7 +1705,9 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
       // A row keyed on this Google account that no longer links it: Google
       // was unlinked there, which took it away as a way in — codes and open
       // audiences don't bring it back.
-      const keyed = this.d.accounts.bySub(`human:google:${g.sub}`);
+      // The same for a row folded into another since (hn user merge): its id is retired, not free to be made again.
+      const own = `human:google:${g.sub}`;
+      const keyed = this.d.accounts.bySub(own) ?? this.d.accounts.all().find((a) => a.was?.includes(own));
       if (keyed) {
         console.error(`[hn] login refused: google:${g.sub} (${label}) — no longer linked to ${keyed.sub}`);
         return html(res, 403, page('not linked', `<p>Hi <b>${esc(label)}</b> — this Google account was unlinked from its account here, so it doesn’t sign in any more. Sign in another way, and link it again under <a href="/login?audience=account">sign-in settings</a> if you want it back.</p>`));
@@ -1676,31 +1758,31 @@ doesn't have a role that grants access to <b>${esc(st.audience)}</b>${member ? '
         }
       }
     }
-    if (!acct && !st.code && g.emailVerified && anyOpen(this.d.audiences.get())) {
-      // This node is open to newcomers somewhere: a Google account we don't
-      // know gets its row on first sign-in, wherever it started. The row
-      // holds nothing — an open audience lets it in, everywhere else it is
-      // refused with a pointer to what IS open (issue() decides, as for anyone).
-      // Verified addresses only: a row keyed on this Google account would
-      // shadow an operator invite to that address before it could be claimed.
-      try {
-        acct = this.d.accounts.add({
-          sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${st.audience}`,
-          google: googleLink(g, now),
-        });
-        console.error(`[hn] account: human:google:${g.sub} (${label}) signed up at ${st.audience}`);
-      } catch {
-        // another tab made it a moment ago — only if it really is this Google account's
-        acct = this.d.accounts.byGoogle(g.sub);
+    // The same address as a Discord account this node knows: the same person (same-person.ts).
+    if (!acct && g.email && g.emailAuthoritative) acct = await this.joinGoogleByAddress(g, now);
+    if (!acct && (st.code || (g.emailVerified && anyOpen(this.d.audiences.get())))) {
+      // A Google account we don't know, about to get an account of its own. If there is another way
+      // it could already be known here, ask before making one (same-person.ts) — but only the browser
+      // that started this sign-in is asked. The page offers to put this Google account on whoever is
+      // looking at it, and a return link finished in someone else's browser would be offering them
+      // the sender's Google account as a way into their own.
+      const here = st.intent === 'login' && this.returnedHere(req, st);
+      const sess = here ? this.sessionAccount(req) : undefined;
+      const addTo = sess && !sess.google?.sub ? sess : undefined;
+      if (here && (this.discordOn || addTo)) {
+        const id = randomBytes(24).toString('base64url');
+        this.newcomers.set(id, { google: g, audience: st.audience, ...(st.code ? { code: st.code } : {}), ...(addTo ? { addTo: addTo.sub } : {}), exp: Date.now() + STATE_TTL_MS });
+        return securePage(res, 200, (nonce) =>
+          firstGooglePage(this.at(), {
+            id, google: label, discord: this.discordOn, ...(addTo ? { addTo: displayName(addTo) } : {}),
+            hint: ACCOUNT_HINT + this.openHint(st.audience), nonce,
+          }),
+        );
       }
-      fresh = true;
-    }
-    if (!acct && st.code) {
-      // Signing up: a Google account we don't know, with an access code.
-      const r = this.signUp(`human:google:${g.sub}`, st.code, { google: googleLink(g, now) });
-      if (typeof r === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(r)))}.</p>`));
-      if (r.account.google?.sub !== g.sub) return html(res, 403, page('not linked', '<p>That account no longer signs in with this Google account.</p>'));
-      acct = r.account;
+      const made = this.newGoogleAccount(g, st.audience, st.code, now);
+      if (made === 'not linked') return html(res, 403, page('not linked', '<p>That account no longer signs in with this Google account.</p>'));
+      if (typeof made === 'string') return html(res, 403, page('code not accepted', `<p>${esc(cap(rejectionText(made)))}.</p>`));
+      acct = made;
       fresh = true;
     }
     if (!acct) {
@@ -1746,6 +1828,141 @@ If you were given an access code, enter it on the sign-in page first. If you hav
     }
     console.error(`[hn] login refused: ${acct.sub} via google at ${st.audience} — ${out.error}`);
     return html(res, out.status, page('no access', `<p>Hi <b>${esc(who.name)}</b> — you’re signed in, but this account doesn’t have access to <b>${esc(st.audience)}</b> (${esc(out.error)}). Ask an operator for access, then try again.</p>${ACCOUNT_HINT}${this.openHint(st.audience)}`));
+  }
+
+  /**
+   * The account a Google newcomer gets for itself: by an access code, or because something here is
+   * open to everyone. The open row holds nothing — an open audience lets it in, everywhere else it
+   * is refused with a pointer to what IS open (issue() decides, as for anyone).
+   */
+  private newGoogleAccount(g: GoogleIdentity, audience: string, code: string | undefined, now: string): HumanAccount | CodeRejection | 'not linked' | undefined {
+    if (code) {
+      const r = this.signUp(`human:google:${g.sub}`, code, { google: googleLink(g, now) });
+      if (typeof r === 'string') return r;
+      return r.account.google?.sub === g.sub ? r.account : 'not linked';
+    }
+    try {
+      const acct = this.d.accounts.add({ sub: `human:google:${g.sub}`, createdAt: now, notes: `signed up at ${audience}`, google: googleLink(g, now) });
+      console.error(`[hn] account: human:google:${g.sub} (${g.email ?? g.name ?? `Google account ${g.sub}`}) signed up at ${audience}`);
+      return acct;
+    } catch {
+      return this.d.accounts.byGoogle(g.sub); // another tab made it a moment ago — only if it really is this Google account's
+    }
+  }
+
+  /** The first-time page's answer (pages.ts firstGooglePage): what becomes of a Google account this node had never seen. */
+  private async newcomer(req: IncomingMessage, res: ServerResponse, b: Record<string, unknown>): Promise<void> {
+    if (b.as !== 'new' && b.as !== 'discord' && b.as !== 'session') return json(res, 400, { error: 'pick one of the answers on the page' });
+    const p = this.newcomers.take(String(b.id ?? '')); // single-use, whatever the answer
+    if (!p) return json(res, 400, { error: 'this page expired — start again from the service' });
+    const g = p.google;
+    if (b.as === 'discord') {
+      // On to Discord, bound to this browser: the Discord identity that comes back takes this Google account.
+      const state = this.newState({ intent: 'join', audience: p.audience, google: g, ...(p.code ? { code: p.code } : {}), browser: this.browserValue(req, res), exp: Date.now() + STATE_TTL_MS });
+      return json(res, 200, { redirect: `${this.d.cfg.publicUrl}/login/discord?state=${state}` });
+    }
+    const now = new Date().toISOString();
+    let acct: HumanAccount | undefined;
+    if (b.as === 'session') {
+      // the account the page named, not whoever this browser has signed in as since
+      const sess = this.sessionAccount(req);
+      try {
+        acct = sess && sess.sub === p.addTo ? this.d.accounts.update(sess.sub, (a) => {
+          if (a.disabled || a.google?.sub) throw new Error('account changed');
+          return { ...a, google: googleLink(g, now, a.google?.email) };
+        }) : undefined;
+      } catch {
+        acct = undefined;
+      }
+      if (!acct) return json(res, 400, { error: 'that didn’t go through — start again from the service' });
+      console.error(`[hn] account: ${acct.sub} linked google:${g.sub} (${g.email ?? g.name ?? 'no address'}) — added from its own session`);
+      if (p.code) {
+        const r = this.redeemInto(acct.sub, p.code);
+        if (typeof r === 'string') return json(res, 400, { error: rejectionText(r) });
+        acct = r.account;
+      }
+    } else {
+      const made = this.newGoogleAccount(g, p.audience, p.code, now);
+      if (!made || made === 'not linked') return json(res, 403, { error: 'this Google account isn’t linked to an account here' });
+      if (typeof made === 'string') return json(res, 400, { error: rejectionText(made) });
+      acct = made;
+    }
+    const who = await this.resolve(acct);
+    if (this.d.accounts.bySub(acct.sub)?.disabled) return json(res, 403, { error: 'this account is disabled' });
+    const out = this.issue(p.audience, who, 'google');
+    if (!out.ok) console.error(`[hn] login refused: ${acct.sub} via google at ${p.audience} — ${out.error}`);
+    this.respondSignedIn(res, out, acct.sub, 'google');
+  }
+
+  /**
+   * A Discord account nobody has used here, whose address Discord vouches for, and exactly one account
+   * whose Google address — Google vouching too — is the same mailbox: the same person. Discord becomes
+   * another way into that account, and its roles add to it. A Discord identity that HAS been used here on
+   * its own is two accounts already, and stays that way until an operator merges them (hn user merge).
+   */
+  private joinDiscordByAddress(snapshot: NonNullable<HumanAccount['discord']> & { grant: RoleGrant | null }, address: string): HumanAccount | undefined {
+    const key = emailKey(address);
+    const rows = this.d.accounts.all().filter((a) => a.google?.sub && a.google.verified && emailKey(a.google.email) === key);
+    const row = rows.length === 1 ? rows[0]! : undefined;
+    if (!row || row.disabled || row.discord || byHandOnly(row, mergeGrants(snapshot.grant, operatorGrant(row)))) return undefined;
+    // Used here on its own before? Only a clear "no" joins: a log that is missing or can't be read is not a no.
+    if (this.d.mintLog.has(`human:discord:${snapshot.id}`) !== false) return undefined;
+    try {
+      const acct = this.d.accounts.update(row.sub, (a) => {
+        // as the row is NOW: a restriction or grant set meanwhile holds
+        if (a.disabled || a.discord || byHandOnly(a, mergeGrants(snapshot.grant, operatorGrant(a)))) throw new Error('account changed');
+        return { ...a, discord: snapshot };
+      });
+      if (acct) console.error(`[hn] account: ${acct.sub} linked discord:${snapshot.id} (${snapshot.name ?? ''}) — the same address as its Google account`);
+      return acct;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * A Google account this node has never seen, whose address Google vouches for, and exactly one
+   * Discord account that last vouched for the same address: the same person. Google becomes another
+   * way into that Discord identity's account, made now if it never needed one. What the Discord
+   * identity holds is read first (live by bot token, else its recent snapshot): when that can't be
+   * told, or it is someone joined by hand only, nothing happens here.
+   */
+  private async joinGoogleByAddress(g: GoogleIdentity, now: string): Promise<HumanAccount | undefined> {
+    const ids = this.d.discordAddresses.idsFor(g.email!);
+    if (ids.length !== 1) return undefined;
+    const id = ids[0]!;
+    const row = this.d.accounts.byDiscord(id);
+    if (row && (row.disabled || row.google)) return undefined;
+    let discord: NonNullable<HumanAccount['discord']> | undefined;
+    if (this.d.cfg.discordBotToken && this.d.roles.get().guildId) {
+      try {
+        const m = await botGuildMember(this.d.cfg.discordBotToken, this.d.roles.get().guildId, id, this.d.fetchImpl);
+        const name = m?.user ? displayNameOf(m.user, m) : row?.discord?.name;
+        discord = { id, ...(name ? { name } : {}), grant: m ? grantForRoles(effectiveRoles(m.roles, row), this.d.roles.get()) : null, checkedAt: now };
+      } catch (err) {
+        console.error(`[hn] discord role check failed for discord:${id}: ${(err as Error).message}`);
+      }
+    }
+    if (!discord) {
+      const dc = row?.discord;
+      if (!dc?.checkedAt || Date.now() - Date.parse(dc.checkedAt) > DISCORD_SNAPSHOT_MAX_AGE_MS) return undefined;
+      discord = dc;
+    }
+    if (byHandOnly(row, mergeGrants(discord.grant, operatorGrant(row)))) return undefined;
+    const seen = discord;
+    try {
+      const acct = row
+        ? this.d.accounts.update(row.sub, (a) => {
+            // as the row is NOW: a restriction or grant set while the bot call was out holds
+            if (a.disabled || a.google || byHandOnly(a, mergeGrants(seen.grant, operatorGrant(a)))) throw new Error('account changed');
+            return { ...a, google: googleLink(g, now) };
+          })
+        : this.d.accounts.add({ sub: `human:discord:${id}`, discord: seen, google: googleLink(g, now), createdAt: now });
+      if (acct) console.error(`[hn] account: ${acct.sub} linked google:${g.sub} (${g.email}) — the same address as its Discord account`);
+      return acct;
+    } catch {
+      return undefined;
+    }
   }
 
   private googleLink(res: ServerResponse, t: Aid1Payload): void {

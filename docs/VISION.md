@@ -52,8 +52,10 @@ at login. Ten or ten thousand guild members cost us nothing; membership and
 role administration stay in Discord where communities already do that
 work. A row (`data/accounts.json`) exists only for someone who asked for
 another way in — a password, a passkey, a TOTP code — or whom the operator
-created with no Discord at all; see "the home's own login" below. The `minted.jsonl` audit log grows linearly and is never consulted
-at runtime.
+created with no Discord at all; see "the home's own login" below. The `minted.jsonl` audit log grows linearly and is consulted at
+runtime for one question only: whether a Discord identity has been used here
+on its own, before it is joined to another account (`src/same-person.ts`).
+Keep it whole — a trimmed log reads as "never used".
 
 **Steps when needed:** multiple guilds (key `roles.json` by guild id —
 small, mechanical); other auth anchors (any OIDC upstream — Google,

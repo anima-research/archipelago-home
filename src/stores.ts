@@ -375,6 +375,17 @@ export class InviteStore {
     this.store.set({ invites: after });
     return true;
   }
+
+  /** The invites one person made become another's (their accounts were merged). Returns how many. */
+  reassign(from: string, to: string): number {
+    const mine = this.all().filter((i) => i.sponsor === from);
+    if (mine.length) {
+      this.store.set({
+        invites: this.all().map((i) => (i.sponsor === from ? { ...i, sponsor: to, ...(i.claims?.sponsor === from ? { claims: { ...i.claims, sponsor: to } } : {}) } : i)),
+      });
+    }
+    return mine.length;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +557,9 @@ export function grantForRoles(roles: string[], cfg: RolesConfig): RoleGrant | nu
 }
 
 // ---------------------------------------------------------------------------
-// Mint audit log — append-only JSONL, never consulted at verify time
+// Mint audit log — append-only JSONL, never consulted at verify time.
+// Read at runtime for one question only: has this sub ever been given a token
+// here (same-person.ts)? So it has to stay whole: don't rotate or trim it.
 // ---------------------------------------------------------------------------
 
 export interface MintRecord {
@@ -569,5 +582,37 @@ export class MintLog {
     } catch (err) {
       console.error(`[hn] mint log write failed: ${(err as Error).message}`);
     }
+  }
+
+  /** Has this sub ever been given a token here? `undefined` = can't tell (no log yet, or it can't be read):
+   *  never to be taken for "no". A plain search for the sub, so a torn line can't hide a record. Reads the whole log. */
+  has(sub: string): boolean | undefined {
+    try {
+      return readFileSync(this.path, 'utf8').includes(`"sub":${JSON.stringify(sub)}`);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Every token this sub was given here that the log still shows whole — where it has signed in (hn user merge). */
+  forSub(sub: string): MintRecord[] {
+    let text: string;
+    try {
+      text = readFileSync(this.path, 'utf8');
+    } catch {
+      return [];
+    }
+    const needle = `"sub":${JSON.stringify(sub)}`;
+    const out: MintRecord[] = [];
+    for (const line of text.split('\n')) {
+      if (!line.includes(needle)) continue;
+      try {
+        const r = JSON.parse(line) as MintRecord;
+        if (r.sub === sub) out.push(r);
+      } catch {
+        /* a torn line */
+      }
+    }
+    return out;
   }
 }

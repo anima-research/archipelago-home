@@ -155,6 +155,20 @@ export class CodeStore {
     return out;
   }
 
+  /** What one account redeemed is another's now (their accounts were merged): no second use is counted. */
+  reassign(from: string, to: string): void {
+    this.store.update((f) =>
+      f.codes.some((c) => c.redeemed.some((r) => r.sub === from))
+        ? {
+            codes: f.codes.map((c) => {
+              const had = c.redeemed.some((r) => r.sub === to);
+              return { ...c, redeemed: c.redeemed.flatMap((r) => (r.sub !== from ? [r] : had ? [] : [{ ...r, sub: to }])) };
+            }),
+          }
+        : f,
+    );
+  }
+
   /** What the codes an account redeemed grant for this one audience (null = nothing). */
   grantFor(redeemed: Array<{ id: string }> | undefined, audience: string): RoleGrant | null {
     if (!redeemed?.length) return null;

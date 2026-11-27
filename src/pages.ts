@@ -251,6 +251,45 @@ if ($('em')) {
   return shell('Sign in', o.nonce, body, script, o);
 }
 
+// ── a Google account's first time here (same-person.ts) ──
+
+/** Asked before a Google account the node has never seen gets an account of its own: is it someone
+ *  the node already knows another way? `hint` (trusted HTML) is shown if the answer ends in "no access". */
+export function firstGooglePage(at: PageSite, o: { id: string; google: string; discord: boolean; addTo?: string; hint: string; nonce: string }): string {
+  const body = `
+<h1>First time here?</h1>
+<p><b>${esc(o.google)}</b> hasn’t signed in here before.</p>
+<p id="err" class="err" role="alert"></p>
+<div id="hint" hidden>${o.hint}</div>
+${o.addTo ? `<div class="card">
+  <p class="dim small">You’re signed in here as</p>
+  <p><b>${esc(o.addTo)}</b></p>
+  <button data-as="session" class="btn primary block" type="button">Add this Google account to ${esc(o.addTo)}</button>
+</div>` : ''}
+${o.discord ? `<button data-as="discord" class="btn discord block" type="button">I’ve signed in here with Discord</button>
+<p class="dim small">Sign in with Discord once more, and this Google account becomes a second way into that same account.</p>` : ''}
+<button data-as="new" class="btn block" type="button">I’m new here</button>
+<p class="dim small">A new account is made for this Google account.</p>`;
+  const script = `
+const S = ${scriptJson({ id: o.id })};
+const choices = document.querySelectorAll('button[data-as]');
+choices.forEach((b) => (b.onclick = async () => {
+  choices.forEach((x) => (x.disabled = true));
+  let r;
+  try { r = await post('/login/new', { id: S.id, as: b.dataset.as }); }
+  catch {
+    // it never reached the node, so the answer isn't spent: they can try again
+    $('err').textContent = 'That didn’t reach the server — check your connection and try again.';
+    choices.forEach((x) => (x.disabled = false));
+    return;
+  }
+  if (r.body && r.body.redirect) { location.assign(r.body.redirect); return; }
+  $('err').textContent = r.body.error || 'That didn’t go through — start again from the service.';
+  if (r.status === 403) $('hint').hidden = false;
+}));`;
+  return shell('First time here', o.nonce, body, script, at);
+}
+
 // ── /account ──
 
 export function accountPage(at: PageSite, nonce: string): string {
